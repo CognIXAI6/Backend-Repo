@@ -6,6 +6,7 @@ export enum UploadFolder {
   LICENSES = 'cognix/licenses',
   VOICE_SAMPLES = 'cognix/voice-samples',
   AVATARS = 'cognix/avatars',
+  RESOURCES = 'cognix/resources',
 }
 
 @Injectable()

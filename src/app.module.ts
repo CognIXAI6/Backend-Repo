@@ -33,6 +33,8 @@ import { SpeakersModule } from './modules/speakers/speakers.module';
 import { VoiceModule } from './modules/voice/voice.module';
 import { OnboardingModule } from './modules/onboarding/onboarding.module';
 import { HealthModule } from './modules/health/health.module';
+import { SettingsModule } from './modules/settings/settings.module';
+import { ResourcesModule } from './modules/resources/resources.module';
 
 @Module({
   imports: [
@@ -61,6 +63,8 @@ import { HealthModule } from './modules/health/health.module';
     VoiceModule,
     OnboardingModule,
     HealthModule,
+    SettingsModule,
+    ResourcesModule,
   ],
   providers: [
     {
