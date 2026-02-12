@@ -24,6 +24,60 @@ export class FieldsService {
     return this.knex('fields').where('is_active', true).orderBy('name');
   }
 
+  async findAllWithCustomFields(userId?: string): Promise<Field[]> {
+    // Get system fields
+    const systemFields = await this.knex('fields')
+      .select(
+        'id',
+        'name',
+        'slug',
+        'description',
+        'icon',
+        'requires_verification'
+      )
+      .where('is_active', true);
+    // Format system fields
+    const formattedSystemFields = systemFields.map((field) => ({
+      ...field,
+      is_custom: false,
+    }));
+    // If no userId, return only system fields
+    if (!userId) {
+      return formattedSystemFields.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    // Get user's custom fields
+    const customFields = await this.knex('custom_fields')
+      .where('user_id', userId);
+    // Format custom fields to match system fields structure
+    const formattedCustomFields = customFields.map((field) => ({
+      id: field.id,
+      name: field.name,
+      slug: this.generateSlug(field.name),
+      description: field.description,
+      icon: 'custom', // Default icon for custom fields
+      requires_verification: false,
+      // is_system: false,
+      // is_free: true,
+      // is_active: true,
+      is_custom: true,
+      // user_id: field.user_id,
+      // created_at: field.created_at,
+    }));
+    // Combine and sort by name
+    const allFields = [...formattedSystemFields, ...formattedCustomFields];
+    return allFields.sort((a, b) => a.name.localeCompare(b.name));
+  }
+  /**
+   * Generate slug from name
+   */
+  private generateSlug(name: string): string {
+    return name
+      .toLowerCase()
+      .trim()
+      .replace(/[^\w\s-]/g, '')
+      .replace(/\s+/g, '-');
+  }
+
   async findById(id: string): Promise<Field | null> {
     return this.knex('fields').where('id', id).first();
   }
@@ -112,7 +166,22 @@ export class FieldsService {
       .first();
   }
 
-  async getAppSetting(key: string) {
+  async getMedicalSpecialties() {
+    const setting = await this.knex('app_settings').where('key', 'medical_specialties').first();
+    return setting?.value;
+  }
+
+  async getMedicalLicenseTypes() {
+    const setting = await this.knex('app_settings').where('key', 'medical_license_types').first();
+    return setting?.value;
+  }
+
+  async getLegalPracticeTypes() {
+    const setting = await this.knex('app_settings').where('key', 'legal_practice_types').first();
+    return setting?.value;
+  }
+
+    async getAppSetting(key: string) {
     const setting = await this.knex('app_settings').where('key', key).first();
     return setting?.value;
   }

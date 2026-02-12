@@ -14,8 +14,27 @@ export class FieldsController {
   constructor(private fieldsService: FieldsService) {}
 
   @Get()
-  async getAllFields() {
-    return this.fieldsService.findAll();
+  @UseGuards(JwtAuthGuard)
+  async getAllFields(
+    @CurrentUser('id') userId: string,
+  ) {
+    console.log('Fetching all fields for user:', userId);
+    return this.fieldsService.findAllWithCustomFields(userId);
+  }
+
+    @Get('/medical_specialties')
+  async getMedicalSpecialties() {
+    return this.fieldsService.getMedicalSpecialties();
+  }
+
+    @Get('/medical_license_types')
+  async getMedicalLicenseTypes() {
+    return this.fieldsService.getMedicalLicenseTypes();
+  }
+
+    @Get('/legal_practice_types')
+  async getLegalPracticeTypes() {
+    return this.fieldsService.getLegalPracticeTypes();
   }
 
   @Get('settings/:key')

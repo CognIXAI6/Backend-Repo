@@ -152,6 +152,11 @@ export class PaymentService {
     this.logger.warn(`Payment failed for invoice ${invoice.id}`);
   }
 
+  async getSubscriptionPrices() {
+    const setting = await this.knex('app_settings').where('key', 'subscription_prices').first();
+    return setting?.value;
+  }
+
   private getPriceId(billingCycle: BillingCycle): string | null {
     const prices = this.configService.get('stripe.prices');
     return prices[billingCycle] || null;

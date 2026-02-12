@@ -111,4 +111,9 @@ export class SpeakersService {
 
     return Number(result?.count || 0);
   }
+
+  async getSpeakerModes() {
+    const setting = await this.knex('app_settings').where('key', 'speaker_modes').first();
+    return setting?.value;
+  }
 }

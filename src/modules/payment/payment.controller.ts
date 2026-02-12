@@ -6,6 +6,7 @@ import {
   Req,
   Headers,
   RawBodyRequest,
+  Get,
 } from '@nestjs/common';
 import { Request } from 'express';
 import { PaymentService, BillingCycle } from './payment.service';
@@ -26,6 +27,12 @@ export class PaymentController {
       user.stripeCustomerId,
       billingCycle,
     );
+  }
+
+  @Get('/subscription_prices')
+  @UseGuards(JwtAuthGuard)
+  async getSubscriptionPrices() {
+    return this.paymentService.getSubscriptionPrices();
   }
 
   @Post('cancel')

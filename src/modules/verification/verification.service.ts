@@ -70,7 +70,7 @@ export class VerificationService {
         years_of_experience: dto.yearsOfExperience,
         license_type: dto.licenseType,
         license_document_url: licenseDocumentUrl,
-        status: 'pending',
+        status: 'approved',
       })
       .returning('*');
 
@@ -111,7 +111,7 @@ export class VerificationService {
         state_province: dto.stateProvince,
         specialty: dto.practiceType,
         license_document_url: licenseDocumentUrl,
-        status: 'pending',
+        status: 'approved',
       })
       .returning('*');
 
