@@ -72,6 +72,7 @@ export class AuthService {
       return {
         message: 'Account created. Please check your email to verify your account.',
         userId: user.id,
+        token
       };
     });
   }
