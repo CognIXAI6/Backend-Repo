@@ -34,12 +34,39 @@ export class VerificationService {
     private uploadService: UploadService,
   ) {}
 
-  async createHealthcareVerification(
+async createHealthcareVerification(
     userId: string,
     fieldId: string,
     dto: CreateHealthcareVerificationDto,
     file?: Express.Multer.File,
   ): Promise<ProfessionalVerification> {
+    // CRITICAL DEBUG: Log the complete file object
+    console.log('FILE OBJECT KEYS:', Object.keys(file || {}));
+    console.log('FILE DETAILS:', {
+      fieldname: file?.fieldname,
+      originalname: file?.originalname,
+      encoding: file?.encoding,
+      mimetype: file?.mimetype,
+      size: file?.size,
+      hasBuffer: !!file?.buffer,
+      bufferType: file?.buffer ? file.buffer.constructor.name : 'none',
+      bufferLength: file?.buffer?.length,
+      destination: file?.destination,
+      filename: file?.filename,
+      path: file?.path,
+    });
+
+    // Check if file.buffer exists and is valid
+    if (file && !file.buffer) {
+      console.log('WARNING: File has no buffer!');
+      // If using disk storage, you might need to read from path
+      if (file.path) {
+        const fs = require('fs');
+        file.buffer = fs.readFileSync(file.path);
+        console.log('Read file from path, new buffer length:', file.buffer.length);
+      }
+    }
+
     // Check if verification already exists
     const existing = await this.knex('professional_verifications')
       .where('user_id', userId)
@@ -53,11 +80,18 @@ export class VerificationService {
     let licenseDocumentUrl = dto.licenseDocumentUrl;
 
     if (file) {
-      const uploadResult = await this.uploadService.uploadFile(
-        file,
-        UploadFolder.LICENSES,
-      );
-      licenseDocumentUrl = uploadResult.secure_url;
+      console.log('Attempting to upload file...');
+      try {
+        const uploadResult = await this.uploadService.uploadFile(
+          file,
+          UploadFolder.LICENSES,
+        );
+        console.log('Upload successful:', uploadResult.secure_url);
+        licenseDocumentUrl = uploadResult.secure_url;
+      } catch (uploadError) {
+        console.error('Upload failed in service:', uploadError);
+        throw uploadError;
+      }
     }
 
     const [verification] = await this.knex('professional_verifications')
@@ -77,6 +111,7 @@ export class VerificationService {
     return verification;
   }
 
+  
   async createLegalVerification(
     userId: string,
     fieldId: string,

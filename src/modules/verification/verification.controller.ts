@@ -10,6 +10,7 @@ import {
   ParseFilePipe,
   MaxFileSizeValidator,
   FileTypeValidator,
+  BadRequestException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { VerificationService } from './verification.service';
@@ -18,6 +19,7 @@ import {
   CreateHealthcareVerificationDto,
   CreateLegalVerificationDto,
 } from './dto/verification.dto';
+import { memoryStorage } from 'multer';
 
 @Controller('verification')
 @UseGuards(JwtAuthGuard)
@@ -44,7 +46,19 @@ export class VerificationController {
 
  // controller
 @Post('healthcare')
-@UseInterceptors(FileInterceptor('license'))
+@UseInterceptors(FileInterceptor('license', {
+  storage: memoryStorage(), // Explicitly use memory storage
+  limits: {
+    fileSize: 15 * 1024 * 1024, // 15MB
+  },
+  fileFilter: (req, file, cb) => {
+    console.log('File filter - received file:', file);
+    if (!file.mimetype.match(/\/(jpg|jpeg|png|pdf)$/i)) {
+      return cb(new BadRequestException('Only image and PDF files are allowed'), false);
+    }
+    cb(null, true);
+  },
+}))
 async createHealthcareVerification(
   @CurrentUser('id') userId: string,
   @Body() dto: CreateHealthcareVerificationDto,
