@@ -221,7 +221,11 @@ async forgotPassword(dto: ForgotPasswordDto) {
     if (!user) {
       throw new BadRequestException('Invalid request');
     }
-
+    // Check if new password matches the old password
+    const isSamePassword = await bcrypt.compare(dto.password, user.password);
+    if (isSamePassword) {
+      throw new BadRequestException('New password must be different from your current password');
+    }
     const resetRecord = await this.knex('password_resets')
       .where('user_id', user.id)
       .andWhere('used', false)

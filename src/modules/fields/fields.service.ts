@@ -110,45 +110,52 @@ export class FieldsService {
     return field;
   }
 
+  async getUserCustomFieldById(userId: string, fieldId: string) {
+    return this.knex('custom_fields').where('user_id', userId).andWhere('id', fieldId).first();
+  }
+
   async getUserCustomFields(userId: string) {
     return this.knex('custom_fields').where('user_id', userId);
   }
 
-  async assignFieldToUser(userId: string, fieldId: string, isPrimary = false) {
-    return this.knex.transaction(async (trx) => {
-      // If setting as primary, unset other primary fields
-      if (isPrimary) {
-        await trx('user_fields')
-          .where('user_id', userId)
-          .update({ is_primary: false });
-      }
-
-      // Check if already assigned
-      const existing = await trx('user_fields')
+ async assignFieldToUser(userId: string, fieldId: string, isPrimary = false, isCustom = false) {
+  return this.knex.transaction(async (trx) => {
+    // If setting as primary, unset other primary fields
+    if (isPrimary) {
+      await trx('user_fields')
         .where('user_id', userId)
-        .andWhere('field_id', fieldId)
-        .first();
+        .update({ is_primary: false });
+    }
 
-      if (existing) {
-        // Update existing
-        await trx('user_fields')
-          .where('id', existing.id)
-          .update({ is_primary: isPrimary });
-        return existing;
-      }
+    // Build the where clause based on field type
+    const fieldWhere = isCustom
+      ? { user_id: userId, custom_field_id: fieldId }
+      : { user_id: userId, field_id: fieldId };
 
-      // Create new assignment
-      const [assignment] = await trx('user_fields')
-        .insert({
-          user_id: userId,
-          field_id: fieldId,
-          is_primary: isPrimary,
-        })
-        .returning('*');
+    // Check if already assigned
+    const existing = await trx('user_fields')
+      .where(fieldWhere)
+      .first();
 
-      return assignment;
-    });
-  }
+    if (existing) {
+      await trx('user_fields')
+        .where('id', existing.id)
+        .update({ is_primary: isPrimary });
+      return existing;
+    }
+
+    // Build insert payload based on field type
+    const insertPayload = isCustom
+      ? { user_id: userId, custom_field_id: fieldId, is_primary: isPrimary }
+      : { user_id: userId, field_id: fieldId, is_primary: isPrimary };
+
+    const [assignment] = await trx('user_fields')
+      .insert(insertPayload)
+      .returning('*');
+
+    return assignment;
+  });
+}
 
   async getUserFields(userId: string) {
     return this.knex('user_fields')

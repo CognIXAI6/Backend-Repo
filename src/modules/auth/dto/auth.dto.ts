@@ -1,4 +1,4 @@
-import { IsEmail, IsString, MinLength, IsOptional, Length, IsNumberString } from 'class-validator';
+import { IsEmail, IsString, MinLength, IsOptional, Length, IsNumberString, Matches } from 'class-validator';
 
 export class SignupDto {
   @IsEmail()
@@ -6,6 +6,13 @@ export class SignupDto {
 
   @IsString()
   @MinLength(8)
+  @Matches(
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*#?&])[A-Za-z\d@$!%*#?&]{8,}$/,
+    {
+      message: 
+        'Password must contain at least one lowercase letter, one uppercase letter, one number, and one special character (@$!%*#?&)',
+    }
+  )
   password: string;
 }
 
@@ -14,6 +21,14 @@ export class LoginDto {
   email: string;
 
   @IsString()
+  @MinLength(8)
+  @Matches(
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*#?&])[A-Za-z\d@$!%*#?&]{8,}$/,
+    {
+      message: 
+        'Password must contain at least one lowercase letter, one uppercase letter, one number, and one special character (@$!%*#?&)',
+    }
+  )
   password: string;
 }
 
@@ -46,6 +61,13 @@ export class ResetPasswordDto {
 
   @IsString()
   @MinLength(8)
+  @Matches(
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*#?&])[A-Za-z\d@$!%*#?&]{8,}$/,
+    {
+      message: 
+        'Password must contain at least one lowercase letter, one uppercase letter, one number, and one special character (@$!%*#?&)',
+    }
+  )
   password: string;
 }
 

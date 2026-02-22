@@ -106,21 +106,27 @@ export class OnboardingService {
 
   async selectField(userId: string, fieldId: string) {
     const field = await this.fieldsService.findById(fieldId);
-    if (!field) {
+    const custom_field = await this.fieldsService.getUserCustomFieldById(
+      userId,
+      fieldId,
+    );
+
+    if (!field && !custom_field) {
       throw new BadRequestException("Invalid field");
     }
 
-    await this.fieldsService.assignFieldToUser(userId, fieldId, true);
+    const isCustom = !field && !!custom_field;
 
-    // If field is free (General Knowledge), user can use for free
-    if (field.is_free) {
+    await this.fieldsService.assignFieldToUser(userId, fieldId, true, isCustom);
+
+    if (field?.is_free) {
       await this.usersService.update(userId, { subscription_tier: "free" });
     }
 
     return {
       message: "Field selected",
-      requiresVerification: field.requires_verification,
-      fieldName: field.name,
+      requiresVerification: field?.requires_verification,
+      fieldName: field?.name ?? custom_field?.name,
     };
   }
 
