@@ -1,4 +1,5 @@
-import { IsString, IsOptional, IsEnum, IsArray, IsUrl, IsUUID } from 'class-validator';
+import { Transform } from 'class-transformer';
+import { IsString, IsOptional, IsEnum, IsArray, IsUrl, IsUUID, IsNotEmpty } from 'class-validator';
 
 export enum ResourceType {
   TEXTBOOK = 'textbook',
@@ -9,28 +10,66 @@ export enum ResourceType {
   IMAGE = 'image',
 }
 
+// export class CreateResourceDto {
+//   @IsEnum(ResourceType)
+//   type: ResourceType;
+
+//   @IsString()
+//   title: string;
+
+//   @IsOptional()
+//   @IsString()
+//   description?: string;
+
+//   @IsOptional()
+//   @IsUUID()
+//   fieldId?: string;
+
+//   @IsOptional()
+//   // @IsUrl()
+//   externalUrl?: string;
+
+//   @IsOptional()
+//   @IsArray()
+//   @IsString({ each: true })
+//   tags?: string[];
+// }
+
 export class CreateResourceDto {
+  @IsUUID()
+  @IsOptional()
+  fieldId?: string;
+
   @IsEnum(ResourceType)
   type: ResourceType;
 
   @IsString()
+  @IsNotEmpty()
   title: string;
 
-  @IsOptional()
   @IsString()
+  @IsOptional()
   description?: string;
 
+  @IsString()
   @IsOptional()
-  @IsUUID()
-  fieldId?: string;
-
-  @IsOptional()
-  @IsUrl()
   externalUrl?: string;
 
-  @IsOptional()
+  @Transform(({ value }) => {
+    if (!value) return [];
+
+    if (Array.isArray(value)) return value;
+
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [value];
+    }
+  })
   @IsArray()
   @IsString({ each: true })
+  @IsOptional()
   tags?: string[];
 }
 

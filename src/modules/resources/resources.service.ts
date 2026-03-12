@@ -77,73 +77,78 @@ export class ResourcesService {
   }
 
   async findAll(userId: string, query: ResourceQueryDto) {
-    const page = query.page || 1;
-    const limit = query.limit || 10;
-    const offset = (page - 1) * limit;
+  const page = Number(query.page) || 1;
+  const limit = Number(query.limit) || 10;
+  const offset = (page - 1) * limit;
 
-    let queryBuilder = this.knex('resources')
-      .select('resources.*')
-      .where('resources.user_id', userId);
+  const baseQuery = this.knex('resources')
+    .where('resources.user_id', userId);
 
-    // Filter by type
-    if (query.type) {
-      queryBuilder = queryBuilder.where('resources.type', query.type);
-    }
+  if (query.type) {
+    baseQuery.where('resources.type', query.type);
+  }
 
-    // Filter by field
-    if (query.fieldId) {
-      queryBuilder = queryBuilder.where('resources.field_id', query.fieldId);
-    }
+  if (query.fieldId) {
+    baseQuery.where('resources.field_id', query.fieldId);
+  }
 
-    // Search by title or description
-    if (query.search) {
-      queryBuilder = queryBuilder.where(function () {
-        this.whereILike('resources.title', `%${query.search}%`)
-          .orWhereILike('resources.description', `%${query.search}%`);
-      });
-    }
+  if (query.search) {
+    baseQuery.where(function () {
+      this.whereILike('resources.title', `%${query.search}%`)
+        .orWhereILike('resources.description', `%${query.search}%`);
+    });
+  }
 
-    // Filter by tag
-    if (query.tag) {
-      queryBuilder = queryBuilder
-        .join('resource_tags', 'resources.id', 'resource_tags.resource_id')
-        .where('resource_tags.tag', query.tag.toLowerCase());
-    }
+  if (query.tag) {
+    baseQuery
+      .join('resource_tags', 'resources.id', 'resource_tags.resource_id')
+      .where('resource_tags.tag', query.tag.toLowerCase());
+  }
 
-    // Get total count
-    const [{ count }] = await queryBuilder.clone().count('resources.id as count');
+  const countQuery = baseQuery
+    .clone()
+    .clearSelect()
+    .clearOrder()
+    .countDistinct('resources.id as count');
 
-    // Get paginated results
-    const resources = await queryBuilder
-      .orderBy('resources.created_at', 'desc')
-      .limit(limit)
-      .offset(offset);
+  const [{ count }] = await countQuery;
 
-    // Get tags for each resource
-    const resourceIds = resources.map((r) => r.id);
+  const resources = await baseQuery
+    .clone()
+    .select('resources.*')
+    .orderBy('resources.created_at', 'desc')
+    .limit(limit)
+    .offset(offset);
+
+  const resourceIds = resources.map((r) => r.id);
+
+  let tagsByResource: Record<string, string[]> = {};
+
+  if (resourceIds.length) {
     const allTags = await this.knex('resource_tags')
       .whereIn('resource_id', resourceIds);
 
-    const tagsByResource = allTags.reduce((acc, tag) => {
+    tagsByResource = allTags.reduce((acc, tag) => {
       if (!acc[tag.resource_id]) acc[tag.resource_id] = [];
       acc[tag.resource_id].push(tag.tag);
       return acc;
-    }, {});
-
-    const formattedResources = resources.map((r) =>
-      this.formatResource(r, tagsByResource[r.id] || []),
-    );
-
-    return {
-      data: formattedResources,
-      pagination: {
-        page,
-        limit,
-        total: Number(count),
-        totalPages: Math.ceil(Number(count) / limit),
-      },
-    };
+    }, {} as Record<string, string[]>);
   }
+
+  const formattedResources = resources.map((r) =>
+    this.formatResource(r, tagsByResource[r.id] || []),
+  );
+
+  return {
+    data: formattedResources,
+    pagination: {
+      page,
+      limit,
+      total: Number(count),
+      totalPages: Math.ceil(Number(count) / limit),
+    },
+  };
+}
 
   async findOne(userId: string, resourceId: string) {
     const resource = await this.knex('resources')
@@ -297,9 +302,20 @@ export class ResourcesService {
   }
 
   private getUploadFolder(type: ResourceType): UploadFolder {
-    // All resources go to a general folder, you could create specific folders
-    return UploadFolder.LICENSES; // Reuse or create new folder constant
+  switch (type) {
+    case ResourceType.IMAGE:
+      return UploadFolder.RESOURCES;
+    case ResourceType.VIDEO:
+      return UploadFolder.RESOURCES;
+    case ResourceType.AUDIO:
+      return UploadFolder.RESOURCES;
+    case ResourceType.DOCUMENT:
+    case ResourceType.TEXTBOOK:
+      return UploadFolder.RESOURCES;
+    default:
+      return UploadFolder.RESOURCES;
   }
+}
 
   private formatResource(resource: any, tags: string[]) {
     return {

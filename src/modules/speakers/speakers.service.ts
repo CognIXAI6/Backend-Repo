@@ -1,6 +1,7 @@
 import { Injectable, Inject, NotFoundException, BadRequestException } from '@nestjs/common';
 import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
+import { UploadFolder, UploadService } from '../upload/upload.service';
 
 export interface Speaker {
   id: string;
@@ -13,14 +14,46 @@ export interface Speaker {
 
 @Injectable()
 export class SpeakersService {
-  constructor(@Inject(KNEX_CONNECTION) private knex: Knex) {}
+  constructor(
+    @Inject(KNEX_CONNECTION) private knex: Knex,
+    private uploadService: UploadService,
+  ) {}
 
-  async createSpeaker(
+  // async createSpeaker(
+  //   userId: string,
+  //   name: string,
+  //   isOwner = false,
+  //   avatarUrl?: string,
+  // ): Promise<Speaker> {
+  //   const [speaker] = await this.knex('speakers')
+  //     .insert({
+  //       user_id: userId,
+  //       name,
+  //       is_owner: isOwner,
+  //       avatar_url: avatarUrl,
+  //     })
+  //     .returning('*');
+
+  //   return speaker;
+  // }
+
+   async createSpeaker(
     userId: string,
     name: string,
     isOwner = false,
-    avatarUrl?: string,
+    file?: Express.Multer.File,
   ): Promise<Speaker> {
+    let avatarUrl: string | undefined;
+
+    if (file) {
+      const uploadResult = await this.uploadService.uploadFile(
+        file,
+        UploadFolder.AVATARS,
+        'image',
+      );
+      avatarUrl = uploadResult.secure_url;
+    }
+
     const [speaker] = await this.knex('speakers')
       .insert({
         user_id: userId,
@@ -66,20 +99,51 @@ export class SpeakersService {
       .first();
   }
 
+  // async updateSpeaker(
+  //   userId: string,
+  //   speakerId: string,
+  //   name: string,
+  //   avatarUrl?: string,
+  // ): Promise<Speaker> {
+  //   const speaker = await this.getSpeakerById(userId, speakerId);
+  //   if (!speaker) {
+  //     throw new NotFoundException('Speaker not found');
+  //   }
+
+  //   const updateData: Partial<Speaker> = { name };
+  //   if (avatarUrl !== undefined) {
+  //     updateData.avatar_url = avatarUrl;
+  //   }
+
+  //   const [updated] = await this.knex('speakers')
+  //     .where('id', speakerId)
+  //     .update(updateData)
+  //     .returning('*');
+
+  //   return updated;
+  // }
+
   async updateSpeaker(
     userId: string,
     speakerId: string,
     name: string,
-    avatarUrl?: string,
+    file?: Express.Multer.File,
   ): Promise<Speaker> {
     const speaker = await this.getSpeakerById(userId, speakerId);
+
     if (!speaker) {
       throw new NotFoundException('Speaker not found');
     }
 
     const updateData: Partial<Speaker> = { name };
-    if (avatarUrl !== undefined) {
-      updateData.avatar_url = avatarUrl;
+
+    if (file) {
+      const uploadResult = await this.uploadService.uploadFile(
+        file,
+        UploadFolder.AVATARS,
+        'image',
+      );
+      updateData.avatar_url = uploadResult.secure_url;
     }
 
     const [updated] = await this.knex('speakers')

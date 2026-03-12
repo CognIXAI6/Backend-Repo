@@ -62,9 +62,4 @@ export class SettingsController {
   ) {
     return this.settingsService.updateAiPreferences(userId, dto);
   }
-
-//   @Get('ai-preferences/prompt-context')
-//   async getAiPromptContext(@CurrentUser('id') userId: string) {
-//     return this.settingsService.getAiPromptContext(userId);
-//   }
 }
