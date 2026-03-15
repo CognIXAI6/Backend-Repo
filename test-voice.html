@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CognIX AI — Voice Tester</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap" rel="stylesheet" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:#0c0c0c; --bg1:#0e0e0e; --bg2:#141414; --bg3:#1a1a1a;
+    --border:#1e1e1e; --border2:#2a2a2a;
+    --text:#d4d4d4; --muted:#555; --muted2:#333;
+    --accent:#e8ff5a; --green:#4caf7d; --blue:#7b8cde; --red:#e05555; --amber:#f0a500;
+  }
+  body { background:var(--bg); color:var(--text); font-family:'DM Mono',monospace; height:100vh; overflow:hidden; }
+
+  .page { display:grid; grid-template-columns:320px 1fr; grid-template-rows:52px 1fr; height:100vh; }
+
+  /* Header */
+  .header { grid-column:1/-1; display:flex; align-items:center; justify-content:space-between; padding:0 24px; border-bottom:1px solid var(--border); }
+  .brand { font-family:'Syne',sans-serif; font-weight:800; font-size:15px; color:#fff; letter-spacing:-0.02em; }
+  .brand em { color:var(--accent); font-style:normal; }
+  .brand small { font-family:'DM Mono',monospace; font-weight:400; font-size:10px; color:var(--muted); margin-left:10px; }
+  .header-right { display:flex; align-items:center; gap:12px; }
+  .pill { display:flex; align-items:center; gap:6px; font-size:11px; color:#888; background:var(--bg2); border:1px solid var(--border); padding:4px 11px; border-radius:20px; }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--muted); transition:background .3s; }
+  .latency-tag { font-size:10px; background:var(--bg2); border:1px solid var(--border); border-radius:4px; padding:3px 9px; color:var(--muted); display:none; }
+  .latency-tag b { color:var(--green); font-weight:500; }
+
+  /* Sidebar */
+  .sidebar { border-right:1px solid var(--border); background:var(--bg1); padding:18px 14px; display:flex; flex-direction:column; gap:16px; overflow-y:auto; }
+  .slabel { font-size:9px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin-bottom:6px; }
+  .field { display:flex; flex-direction:column; gap:3px; margin-bottom:6px; }
+  .field label { font-size:9px; color:var(--muted); letter-spacing:.1em; text-transform:uppercase; }
+  .field input { background:var(--bg2); border:1px solid var(--border); border-radius:6px; padding:7px 9px; font-family:'DM Mono',monospace; font-size:11px; color:#ccc; outline:none; width:100%; transition:border-color .2s; }
+  .field input:focus { border-color:#e8ff5a33; }
+  .field input:disabled { opacity:.4; }
+
+  .btn-row { display:flex; gap:6px; }
+  .btn { flex:1; padding:8px 10px; border-radius:6px; font-family:'DM Mono',monospace; font-size:11px; font-weight:500; cursor:pointer; border:none; transition:all .15s; }
+  .btn:disabled { opacity:.3; cursor:not-allowed; }
+  .btn-primary { background:var(--accent); color:#0c0c0c; }
+  .btn-primary:hover:not(:disabled) { background:#f4ff7e; }
+  .btn-ghost { background:transparent; border:1px solid var(--border2); color:var(--muted); }
+  .btn-ghost:hover:not(:disabled) { border-color:var(--red); color:var(--red); }
+  .btn-sm { width:100%; padding:6px 10px; font-size:10px; background:transparent; border:1px solid var(--border); color:var(--muted); border-radius:5px; cursor:pointer; font-family:'DM Mono',monospace; transition:all .15s; }
+  .btn-sm:hover { border-color:var(--border2); color:#888; }
+
+  .conv-tag { background:var(--bg2); border:1px solid var(--border); border-radius:6px; padding:8px 9px; font-size:9px; color:var(--muted); word-break:break-all; line-height:1.6; display:none; }
+  .conv-tag b { color:var(--accent); display:block; font-weight:500; margin-bottom:2px; letter-spacing:.08em; }
+
+  /* Log */
+  .log-wrap { flex:1; display:flex; flex-direction:column; min-height:0; }
+  .log-legend { display:flex; gap:10px; font-size:9px; margin-bottom:6px; }
+  .log-box { flex:1; background:#0a0a0a; border:1px solid var(--border); border-radius:7px; padding:7px 8px; overflow-y:auto; min-height:140px; max-height:300px; }
+  .log-line { font-size:10px; line-height:1.8; display:grid; grid-template-columns:58px 14px 1fr; gap:4px; }
+  .log-ts { color:#2a2a2a; }
+  .c-in { color:var(--blue); } .c-out { color:var(--green); } .c-sys { color:#3a3a3a; } .c-warn { color:var(--amber); }
+  .log-body { color:#666; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .log-empty { font-size:10px; color:#252525; padding:4px 0; }
+
+  /* Chunk counter badge */
+  .chunk-badge { font-size:9px; background:var(--bg2); border:1px solid var(--border); border-radius:4px; padding:2px 8px; color:var(--muted); display:none; margin-top:4px; }
+  .chunk-badge b { color:var(--accent); }
+
+  /* Main */
+  .main { display:flex; flex-direction:column; overflow:hidden; background:var(--bg); }
+  .msgs { flex:1; overflow-y:auto; padding:28px 30px; display:flex; flex-direction:column; gap:18px; }
+  .empty { margin:auto; text-align:center; }
+  .empty-icon { font-size:40px; margin-bottom:10px; filter:grayscale(1) brightness(.25); }
+  .empty p { font-size:12px; color:#2a2a2a; line-height:1.7; }
+
+  .msg { display:flex; flex-direction:column; gap:4px; max-width:640px; animation:fadeUp .2s ease; }
+  .msg-user  { align-self:flex-end;   align-items:flex-end; }
+  .msg-ai    { align-self:flex-start; align-items:flex-start; }
+  .bubble { padding:10px 14px; border-radius:11px; font-size:13px; line-height:1.65; white-space:pre-wrap; word-break:break-word; }
+  .msg-user .bubble  { background:var(--accent); color:#0c0c0c; border-bottom-right-radius:3px; }
+  .msg-ai   .bubble  { background:#161616; border:1px solid var(--border); color:var(--text); border-bottom-left-radius:3px; }
+  .msg-meta { font-size:9px; color:var(--muted2); display:flex; gap:8px; }
+
+  #streaming-bubble { align-self:flex-start; max-width:640px; padding:10px 14px; background:#161616; border:1px solid var(--border); border-radius:11px; border-bottom-left-radius:3px; font-size:13px; line-height:1.65; color:var(--text); animation:fadeUp .2s ease; display:none; white-space:pre-wrap; word-break:break-word; }
+  .cursor { display:inline-block; width:2px; height:13px; background:var(--accent); margin-left:2px; vertical-align:middle; animation:blink .75s step-end infinite; }
+
+  #transcript-bar { margin:0 30px 12px; padding:9px 13px; background:#111; border:1px solid var(--border); border-radius:7px; font-size:12px; color:var(--muted); min-height:36px; font-style:italic; display:none; }
+  #transcript-bar.live { color:#aaa; border-color:var(--border2); }
+
+  #error-banner { margin:0 30px 10px; padding:8px 13px; background:#180a0a; border:1px solid #3a1515; border-radius:6px; font-size:11px; color:var(--red); display:none; }
+
+  /* Bottom */
+  .bottom { border-top:1px solid var(--border); padding:14px 30px; display:flex; align-items:center; gap:18px; background:var(--bg); }
+  .mic { width:50px; height:50px; border-radius:50%; border:1px solid var(--border2); cursor:pointer; display:flex; align-items:center; justify-content:center; flex-shrink:0; transition:all .2s; background:var(--bg3); color:var(--muted); }
+  .mic:hover:not(:disabled) { border-color:#e8ff5a44; color:var(--accent); }
+  .mic:disabled { opacity:.2; cursor:not-allowed; }
+  .mic.recording { background:var(--accent); border-color:var(--accent); color:#0c0c0c; animation:mic-pulse 1.4s ease-out infinite; }
+  @keyframes mic-pulse { 0%{box-shadow:0 0 0 0 #e8ff5a55} 70%{box-shadow:0 0 0 14px #e8ff5a00} 100%{box-shadow:0 0 0 0 #e8ff5a00} }
+
+  .waveform { display:flex; align-items:center; gap:3px; height:36px; flex:1; }
+  .bar { width:3px; border-radius:2px; background:var(--bg3); height:4px; transition:background .3s,height .3s; }
+  .bar.active { background:var(--accent); animation:wave var(--spd,.8s) ease-in-out infinite alternate; }
+  @keyframes wave { from{transform:scaleY(.3)} to{transform:scaleY(1)} }
+  .hint { font-size:11px; color:var(--muted2); margin-top:5px; }
+
+  @keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+  ::-webkit-scrollbar { width:3px; } ::-webkit-scrollbar-track { background:transparent; } ::-webkit-scrollbar-thumb { background:#222; border-radius:2px; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="header">
+    <div class="brand">Cogni<em>X</em> AI <small>voice tester</small></div>
+    <div class="header-right">
+      <div class="latency-tag" id="latency-tag">first token <b id="latency-val">—</b></div>
+      <div class="pill"><div class="dot" id="status-dot"></div><span id="status-label">Disconnected</span></div>
+    </div>
+  </header>
+
+  <aside class="sidebar">
+    <div>
+      <div class="slabel">Connection</div>
+      <div class="field"><label>Server URL</label><input id="cfg-url" value="http://localhost:6040" /></div>
+      <div class="field"><label>User ID</label><input id="cfg-user" value="test-user-001" /></div>
+      <div class="field"><label>Field name</label><input id="cfg-field" value="Medicine" /></div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btn-connect">Connect</button>
+        <button class="btn btn-ghost"   id="btn-disconnect" disabled>Disc.</button>
+      </div>
+    </div>
+
+    <div class="conv-tag" id="conv-tag"><b>conversation id</b><span id="conv-id-val"></span></div>
+
+    <!-- Chunk counter — shows audio IS flowing -->
+    <div class="chunk-badge" id="chunk-badge">chunks sent: <b id="chunk-count">0</b></div>
+
+    <div class="log-wrap">
+      <div class="slabel" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>WebSocket events</span>
+        <span class="log-legend">
+          <span class="c-in">← in</span><span class="c-out">→ out</span><span class="c-sys">· sys</span>
+        </span>
+      </div>
+      <div class="log-box" id="log-box"><div class="log-empty">No events yet.</div></div>
+    </div>
+
+    <button class="btn-sm" id="btn-clear">Clear all</button>
+  </aside>
+
+  <main class="main">
+    <div class="msgs" id="msgs">
+      <div class="empty" id="empty-state">
+        <div class="empty-icon">🎙️</div>
+        <p>Connect then click the mic to start speaking.<br>Your conversation appears here in real time.</p>
+      </div>
+      <div id="streaming-bubble"></div>
+    </div>
+    <div id="transcript-bar"></div>
+    <div id="error-banner"></div>
+    <div class="bottom">
+      <button class="mic" id="btn-mic" disabled>
+        <svg id="icon-mic"  width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4zm6 10a1 1 0 0 1 2 0 8 8 0 0 1-7 7.94V21h2a1 1 0 0 1 0 2H9a1 1 0 0 1 0-2h2v-2.06A8 8 0 0 1 4 11a1 1 0 0 1 2 0 6 6 0 0 0 12 0z"/></svg>
+        <svg id="icon-stop" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+      </button>
+      <div style="flex:1">
+        <div class="waveform" id="waveform"></div>
+        <div class="hint" id="hint">Connect to begin</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────────
+let socket = null, mediaRecorder = null, audioStream = null;
+let isRecording = false, streamBuf = '', recStart = null, chunkCount = 0;
+
+const STATUS_COLOR = { idle:'#444', connecting:'#f0a500', ready:'#4caf7d', recording:'#e8ff5a', thinking:'#7b8cde', error:'#e05555' };
+const STATUS_LABEL = { idle:'Disconnected', connecting:'Connecting…', ready:'Ready', recording:'Recording', thinking:'AI thinking…', error:'Error' };
+const HINTS = { idle:'Connect to begin', connecting:'Establishing WebSocket…', ready:'Click mic to start speaking', recording:'Speaking — click to stop & send', thinking:'Claude is responding…', error:'Check connection settings above' };
+
+const $ = id => document.getElementById(id);
+
+// ─── Waveform ─────────────────────────────────────────────────────────────────
+for (let i = 0; i < 26; i++) {
+  const b = document.createElement('div');
+  b.className = 'bar';
+  b.style.cssText = `--spd:${(0.75+(i%5)*0.11)}s; animation-delay:${i*0.04}s`;
+  $('waveform').appendChild(b);
+}
+const setWave = on => $('waveform').querySelectorAll('.bar').forEach((b,i) => {
+  b.classList.toggle('active', on);
+  b.style.height = on ? (20 + Math.sin(i*.85)*13)+'px' : '4px';
+});
+
+// ─── Status ───────────────────────────────────────────────────────────────────
+function setStatus(s) {
+  $('status-dot').style.background = STATUS_COLOR[s]||'#444';
+  $('status-label').textContent    = STATUS_LABEL[s]||s;
+  $('hint').textContent            = HINTS[s]||'';
+  const on = !['idle','connecting','error'].includes(s);
+  $('btn-connect').disabled    = on || s==='connecting';
+  $('btn-disconnect').disabled = !on;
+  $('btn-mic').disabled        = s!=='ready' && s!=='recording';
+  ['cfg-url','cfg-user','cfg-field'].forEach(id => $(id).disabled = on);
+  const rec = s==='recording';
+  $('btn-mic').classList.toggle('recording', rec);
+  $('icon-mic').style.display  = rec ? 'none' : '';
+  $('icon-stop').style.display = rec ? '' : 'none';
+  setWave(rec);
+}
+
+// ─── Log ──────────────────────────────────────────────────────────────────────
+function ts() { return new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+function addLog(dir, event, payload) {
+  const box = $('log-box');
+  const empty = box.querySelector('.log-empty');
+  if (empty) empty.remove();
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  const arrow = {in:'←',out:'→',sys:'·',warn:'⚠'}[dir]||'·';
+  const cls   = {in:'c-in',out:'c-out',sys:'c-sys',warn:'c-warn'}[dir]||'c-sys';
+  const body  = payload ? `${event}  ${JSON.stringify(payload).slice(0,100)}` : event;
+  line.innerHTML = `<span class="log-ts">${ts()}</span><span class="${cls}">${arrow}</span><span class="log-body">${body}</span>`;
+  box.appendChild(line);
+  const lines = box.querySelectorAll('.log-line');
+  if (lines.length > 150) lines[0].remove();
+  box.scrollTop = box.scrollHeight;
+}
+
+// ─── Messages ─────────────────────────────────────────────────────────────────
+function addMessage(role, content, meta) {
+  $('empty-state').style.display = 'none';
+  const wrap = document.createElement('div');
+  wrap.className = `msg msg-${role==='user'?'user':'ai'}`;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = content;
+  wrap.appendChild(bubble);
+  if (meta) {
+    const m = document.createElement('div');
+    m.className = 'msg-meta';
+    m.textContent = [new Date().toLocaleTimeString('en-US',{hour12:false}), meta.latencyMs?`${meta.latencyMs}ms`:'', meta.tokensUsed?`${meta.tokensUsed} tok`:''].filter(Boolean).join(' · ');
+    wrap.appendChild(m);
+  }
+  $('msgs').insertBefore(wrap, $('streaming-bubble'));
+  $('streaming-bubble').scrollIntoView({behavior:'smooth',block:'end'});
+}
+function setTranscript(text, active) {
+  const bar = $('transcript-bar');
+  if (!text && !active) { bar.style.display='none'; return; }
+  bar.style.display = 'block';
+  bar.textContent   = text || 'Listening…';
+  bar.className     = active ? 'live' : '';
+}
+function showError(msg) {
+  const b = $('error-banner');
+  b.style.display = msg ? 'block' : 'none';
+  b.textContent   = msg||'';
+}
+
+// ─── Connect ──────────────────────────────────────────────────────────────────
+$('btn-connect').addEventListener('click', () => {
+  if (socket) socket.disconnect();
+  showError(''); setStatus('connecting');
+  addLog('out','socket.connect',{url:$('cfg-url').value});
+
+  socket = io($('cfg-url').value + '/voice', { transports:['websocket'], auth:{token:'dev-bypass'} });
+
+  socket.on('connect', () => {
+    addLog('sys','connected id='+socket.id);
+    const p = { userId:$('cfg-user').value, fieldName:$('cfg-field').value, mode:'single' };
+    addLog('out','session:start',p);
+    socket.emit('session:start', p);
+  });
+
+  socket.on('session:ready', d => {
+    $('conv-id-val').textContent = d.conversationId;
+    $('conv-tag').style.display  = 'block';
+    setStatus('ready');
+    addLog('in','session:ready',{conversationId:d.conversationId});
+  });
+
+  socket.on('transcript:update', d => {
+    setTranscript(d.transcript, true);
+    if (d.isFinal) addLog('in','transcript:update (final)',{text:d.transcript.slice(0,60),conf:d.confidence?.toFixed(2)});
+  });
+
+  socket.on('transcript:confirmed', d => {
+    addLog('in','transcript:confirmed',{text:d.transcript.slice(0,60)});
+    addMessage('user', d.transcript);
+    setTranscript('',false);
+  });
+
+  socket.on('ai:start', () => {
+    streamBuf='';
+    $('streaming-bubble').style.display='block';
+    $('streaming-bubble').innerHTML='<span class="cursor"></span>';
+    addLog('in','ai:start');
+  });
+
+  socket.on('ai:latency', d => {
+    $('latency-val').textContent  = d.latencyMs+'ms';
+    $('latency-tag').style.display= 'block';
+    addLog('in','ai:latency',d);
+  });
+
+  socket.on('ai:token', d => {
+    streamBuf += d.token;
+    $('streaming-bubble').textContent = streamBuf;
+    $('streaming-bubble').innerHTML  += '<span class="cursor"></span>';
+    $('streaming-bubble').scrollIntoView({behavior:'smooth',block:'end'});
+  });
+
+  socket.on('ai:done', d => {
+    $('streaming-bubble').style.display='none';
+    $('streaming-bubble').textContent='';
+    addMessage('assistant', d.response, {latencyMs:d.latencyMs, tokensUsed:d.tokensUsed});
+    setStatus('ready');
+    addLog('in','ai:done',{tokens:d.tokensUsed, latency:d.latencyMs});
+  });
+
+  socket.on('ai:skipped', d => {
+    setStatus('ready');
+    // ai:skipped with empty_transcript = audio sent but Deepgram returned nothing
+    // Most likely cause: encoding mismatch. See console for debug logs.
+    addLog('warn','ai:skipped — '+d.reason+(d.reason==='empty_transcript'?' (check server logs for Deepgram debug output)':''));
+  });
+
+  socket.on('error', d => {
+    showError(`[${d.code}] ${d.message}`);
+    setStatus('error');
+    addLog('in','error',d);
+  });
+
+  socket.on('disconnect', reason => {
+    setStatus('idle');
+    $('conv-tag').style.display='none';
+    $('chunk-badge').style.display='none';
+    chunkCount=0;
+    addLog('sys','disconnected',{reason});
+  });
+
+  socket.on('connect_error', err => {
+    showError(err.message); setStatus('error');
+    addLog('sys','connect_error',{message:err.message});
+  });
+});
+
+$('btn-disconnect').addEventListener('click', () => {
+  stopRecording();
+  socket?.emit('session:end');
+  socket?.disconnect();
+  setStatus('idle');
+  $('conv-tag').style.display='none';
+});
+
+// ─── Recording ────────────────────────────────────────────────────────────────
+async function startRecording() {
+  try {
+    // Request mic — browser will send audio/webm;codecs=opus
+    // The backend must NOT specify encoding:linear16 or it won't match
+    audioStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation:true, noiseSuppression:true, sampleRate:16000, channelCount:1 },
+    });
+
+    // Check what MIME type the browser will actually use
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm')
+      ? 'audio/webm'
+      : ''; // let browser choose
+
+    addLog('sys', 'MediaRecorder mimeType: ' + (mimeType||'(browser default)'));
+
+    mediaRecorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
+
+    chunkCount = 0;
+    $('chunk-count').textContent = '0';
+    $('chunk-badge').style.display = 'block';
+
+    mediaRecorder.ondataavailable = async e => {
+      if (e.data.size > 0 && socket?.connected) {
+        chunkCount++;
+        $('chunk-count').textContent = chunkCount;
+        const buf = await e.data.arrayBuffer();
+        socket.emit('audio:chunk', { chunk: buf });
+      }
+    };
+
+    mediaRecorder.start(250); // 250ms chunks
+    recStart = Date.now();
+    isRecording = true;
+    setStatus('recording');
+    setTranscript('',true);
+    addLog('out','recording started — audio:chunk @ 250ms');
+  } catch (err) {
+    showError('Microphone error: ' + err.message);
+    setStatus('error');
+    addLog('warn','mic error: '+err.message);
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder) { mediaRecorder.stop(); mediaRecorder=null; }
+  if (audioStream)   { audioStream.getTracks().forEach(t=>t.stop()); audioStream=null; }
+  if (isRecording && socket?.connected) {
+    const dur = recStart ? ((Date.now()-recStart)/1000).toFixed(1)+'s' : '';
+    addLog('out',`audio:stop  (${dur}, ${chunkCount} chunks sent)`);
+    socket.emit('audio:stop');
+    setStatus('thinking');
+  }
+  isRecording = false;
+}
+
+$('btn-mic').addEventListener('click', () => { if (isRecording) stopRecording(); else startRecording(); });
+
+$('btn-clear').addEventListener('click', () => {
+  [...$('msgs').children].forEach(el => { if (el!==$('empty-state') && el!==$('streaming-bubble')) el.remove(); });
+  $('empty-state').style.display='';
+  $('log-box').innerHTML='<div class="log-empty">No events yet.</div>';
+  setTranscript('',false); showError('');
+  $('latency-tag').style.display='none';
+  $('streaming-bubble').style.display='none'; streamBuf='';
+  chunkCount=0; $('chunk-count').textContent='0';
+});
+
+setStatus('idle');
+</script>
+</body>
+</html>

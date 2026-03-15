@@ -132,9 +132,9 @@ export class SettingsService {
     if (dto.language !== undefined) {
       updateData.language = dto.language;
     }
-    if (dto.customInstructions !== undefined) {
-      updateData.custom_instructions = dto.customInstructions;
-    }
+    // if (dto.customInstructions !== undefined) {
+    //   updateData.custom_instructions = dto.customInstructions;
+    // }
 
     let preferences;
 

@@ -10,7 +10,7 @@ import {
   UploadedFile,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { VoiceService } from './voice.service';
+import { VoiceService } from '../services/voice.service';
 import { JwtAuthGuard, CurrentUser } from '@/common';
 
 @Controller('voice')

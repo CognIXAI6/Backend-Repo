@@ -37,6 +37,8 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       onboardingStatus: user.onboarding_status,
       subscriptionTier: user.subscription_tier,
       stripeCustomerId: user.stripe_customer_id,
+      avatar: user.avatar_url,
+      voiceSampleSkipped: user.voice_sample_skipped,
     };
   }
 }

@@ -35,7 +35,7 @@ export class UpdateAiPreferencesDto {
   @IsString()
   language?: string;
 
-  @IsOptional()
-  @IsObject()
-  customInstructions?: Record<string, any>;
+  // @IsOptional()
+  // @IsObject()
+  // customInstructions?: Record<string, any>;
 }

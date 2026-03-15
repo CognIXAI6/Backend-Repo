@@ -4,7 +4,7 @@ import { KNEX_CONNECTION } from "@/database/database.module";
 import { UsersService } from "@/modules/users/users.service";
 import { FieldsService } from "@/modules/fields/fields.service";
 import { SpeakersService } from "@/modules/speakers/speakers.service";
-import { VoiceSample, VoiceService } from "@/modules/voice/voice.service";
+import { VoiceSample, VoiceService } from "@/modules/voice/services/voice.service";
 import { VerificationService } from "@/modules/verification/verification.service";
 import { UploadFolder, UploadService } from "../upload/upload.service";
 

@@ -44,7 +44,6 @@ export class AuthService {
     const hashedPassword = await bcrypt.hash(dto.password, 12);
 
     return this.knex.transaction(async (trx) => {
-      // Create user
       const [user] = await trx('users')
         .insert({
           email: dto.email.toLowerCase(),
@@ -52,13 +51,11 @@ export class AuthService {
         })
         .returning('*');
 
-      // Create Stripe customer
       // const customer = await this.paymentService.createCustomer(user.email);
       // await trx('users')
       //   .where('id', user.id)
       //   .update({ stripe_customer_id: customer.id });
 
-      // Create verification token
       const token = generateToken();
       await trx('email_verifications').insert({
         user_id: user.id,
@@ -66,18 +63,18 @@ export class AuthService {
         expires_at: addHours(new Date(), 24),
       });
 
-      // Send verification email
       await this.emailService.sendVerificationEmail(user.email, token);
 
       return {
         message: 'Account created. Please check your email to verify your account.',
         userId: user.id,
-        token
+        token,
       };
     });
   }
 
   async login(dto: LoginDto) {
+    // findByEmail already filters deleted_at via UsersService
     const user = await this.usersService.findByEmail(dto.email);
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
@@ -117,6 +114,7 @@ export class AuthService {
     await this.knex.transaction(async (trx) => {
       await trx('users')
         .where('id', verification.user_id)
+        .whereNull('deleted_at')
         .update({ email_verified: true, updated_at: new Date() });
 
       await trx('email_verifications')
@@ -128,9 +126,9 @@ export class AuthService {
   }
 
   async resendVerificationEmail(email: string) {
+    // findByEmail already filters deleted_at via UsersService
     const user = await this.usersService.findByEmail(email);
     if (!user) {
-      // Don't reveal if user exists
       return { message: 'If an account exists, a verification email has been sent' };
     }
 
@@ -138,12 +136,10 @@ export class AuthService {
       throw new BadRequestException('Email is already verified');
     }
 
-    // Invalidate old tokens
     await this.knex('email_verifications')
       .where('user_id', user.id)
       .update({ used: true });
 
-    // Create new token
     const token = generateToken();
     await this.knex('email_verifications').insert({
       user_id: user.id,
@@ -156,38 +152,34 @@ export class AuthService {
     return { message: 'Verification email sent' };
   }
 
-async forgotPassword(dto: ForgotPasswordDto) {
+  async forgotPassword(dto: ForgotPasswordDto) {
+    // findByEmail already filters deleted_at via UsersService
     const user = await this.usersService.findByEmail(dto.email);
-    
-    // Always return success to prevent email enumeration
+
     if (!user) {
       return { message: 'If an account exists, a password reset OTP has been sent' };
     }
 
-    // Invalidate old OTPs
     await this.knex('password_resets')
       .where('user_id', user.id)
       .update({ used: true });
 
-    // Generate 6-digit OTP
     const otp = generateOtp(6);
-    
-    // Hash the OTP before storing (for security)
     const hashedOtp = await bcrypt.hash(otp, 10);
-    
+
     await this.knex('password_resets').insert({
       user_id: user.id,
       token: hashedOtp,
-      expires_at: addMinutes(new Date(), 10), // OTP valid for 10 minutes
+      expires_at: addMinutes(new Date(), 10),
     });
 
-    // Send OTP email
     await this.emailService.sendPasswordResetOtpEmail(user.email, otp);
 
     return { message: 'If an account exists, a password reset OTP has been sent' };
   }
 
   async verifyResetOtp(dto: VerifyOtpDto) {
+    // findByEmail already filters deleted_at via UsersService
     const user = await this.usersService.findByEmail(dto.email);
     if (!user) {
       throw new BadRequestException('Invalid OTP');
@@ -207,7 +199,6 @@ async forgotPassword(dto: ForgotPasswordDto) {
       throw new BadRequestException('OTP has expired');
     }
 
-    // Verify OTP
     const isValidOtp = await bcrypt.compare(dto.otp, resetRecord.token);
     if (!isValidOtp) {
       throw new BadRequestException('Invalid OTP');
@@ -217,15 +208,17 @@ async forgotPassword(dto: ForgotPasswordDto) {
   }
 
   async resetPassword(dto: ResetPasswordDto) {
+    // findByEmail already filters deleted_at via UsersService
     const user = await this.usersService.findByEmail(dto.email);
     if (!user) {
       throw new BadRequestException('Invalid request');
     }
-    // Check if new password matches the old password
+
     const isSamePassword = await bcrypt.compare(dto.password, user.password);
     if (isSamePassword) {
       throw new BadRequestException('New password must be different from your current password');
     }
+
     const resetRecord = await this.knex('password_resets')
       .where('user_id', user.id)
       .andWhere('used', false)
@@ -240,7 +233,6 @@ async forgotPassword(dto: ForgotPasswordDto) {
       throw new BadRequestException('OTP has expired');
     }
 
-    // Verify OTP
     const isValidOtp = await bcrypt.compare(dto.otp, resetRecord.token);
     if (!isValidOtp) {
       throw new BadRequestException('Invalid OTP');
@@ -249,17 +241,15 @@ async forgotPassword(dto: ForgotPasswordDto) {
     const hashedPassword = await bcrypt.hash(dto.password, 12);
 
     await this.knex.transaction(async (trx) => {
-      // Update password
       await trx('users')
         .where('id', user.id)
+        .whereNull('deleted_at')
         .update({ password: hashedPassword, updated_at: new Date() });
 
-      // Mark OTP as used
       await trx('password_resets')
         .where('id', resetRecord.id)
         .update({ used: true });
 
-      // Revoke all refresh tokens
       await trx('refresh_tokens')
         .where('user_id', user.id)
         .update({ revoked: true });
@@ -269,7 +259,6 @@ async forgotPassword(dto: ForgotPasswordDto) {
   }
 
   async resendResetOtp(dto: ForgotPasswordDto) {
-    // Reuse forgotPassword logic
     return this.forgotPassword(dto);
   }
 
@@ -287,17 +276,17 @@ async forgotPassword(dto: ForgotPasswordDto) {
       throw new UnauthorizedException('Refresh token has expired');
     }
 
+    // findById already filters deleted_at via UsersService —
+    // soft-deleted users cannot refresh their session
     const user = await this.usersService.findById(storedToken.user_id);
     if (!user) {
       throw new UnauthorizedException('User not found');
     }
 
-    // Revoke old token
     await this.knex('refresh_tokens')
       .where('id', storedToken.id)
       .update({ revoked: true });
 
-    // Generate new tokens
     return this.generateTokens(user);
   }
 
