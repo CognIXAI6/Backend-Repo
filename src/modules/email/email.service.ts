@@ -144,6 +144,76 @@ async sendEmail(options: EmailOptions): Promise<void> {
     });
   }
 
+  async sendRegistrationOtpEmail(email: string, otp: string): Promise<void> {
+    await this.sendEmail({
+      to: email,
+      subject: 'Your CognIX AI Verification Code',
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; background-color: #f4f4f4; }
+            .container { max-width: 600px; margin: 0 auto; padding: 20px; background-color: #ffffff; border-radius: 8px; }
+            .otp-box { background-color: #f0f7ff; border: 2px dashed #2563eb; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0; }
+            .otp-code { font-size: 36px; font-weight: bold; letter-spacing: 10px; color: #2563eb; font-family: 'Courier New', monospace; }
+            .footer { margin-top: 30px; font-size: 12px; color: #666; }
+            .warning { color: #dc2626; font-weight: 500; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>Welcome to CognIX AI!</h1>
+            <p>Use the code below to verify your email and create your account.</p>
+            <div class="otp-box">
+              <p style="margin: 0 0 8px 0; color: #666;">Your verification code:</p>
+              <p class="otp-code">${otp}</p>
+            </div>
+            <p class="warning">⚠️ This code expires in 10 minutes.</p>
+            <p>If you didn't request this, you can safely ignore this email.</p>
+            <div class="footer"><p>— The CognIX AI Team</p></div>
+          </div>
+        </body>
+        </html>
+      `,
+    });
+  }
+
+  async sendLoginOtpEmail(email: string, otp: string, name?: string): Promise<void> {
+    await this.sendEmail({
+      to: email,
+      subject: 'Your CognIX AI Login Code',
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; background-color: #f4f4f4; }
+            .container { max-width: 600px; margin: 0 auto; padding: 20px; background-color: #ffffff; border-radius: 8px; }
+            .otp-box { background-color: #f0f7ff; border: 2px dashed #2563eb; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0; }
+            .otp-code { font-size: 36px; font-weight: bold; letter-spacing: 10px; color: #2563eb; font-family: 'Courier New', monospace; }
+            .footer { margin-top: 30px; font-size: 12px; color: #666; }
+            .warning { color: #dc2626; font-weight: 500; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>Welcome back${name ? `, ${name}` : ''}!</h1>
+            <p>Here is your one-time sign-in code for CognIX AI.</p>
+            <div class="otp-box">
+              <p style="margin: 0 0 8px 0; color: #666;">Your sign-in code:</p>
+              <p class="otp-code">${otp}</p>
+            </div>
+            <p class="warning">⚠️ This code expires in 10 minutes.</p>
+            <p>If you didn't request this, please secure your account.</p>
+            <div class="footer"><p>— The CognIX AI Team</p></div>
+          </div>
+        </body>
+        </html>
+      `,
+    });
+  }
+
   async sendPasswordResetOtpEmail(email: string, otp: string): Promise<void> {
     await this.sendEmail({
       to: email,

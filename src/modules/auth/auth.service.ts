@@ -8,258 +8,242 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcryptjs';
+import { createClerkClient, verifyToken as verifyClerkToken } from '@clerk/backend';
 import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { UsersService, User } from '@/modules/users/users.service';
 import { EmailService } from '@/modules/email/email.service';
-import { PaymentService } from '@/modules/payment/payment.service';
-import { generateToken, addHours, addDays, isExpired, generateOtp, addMinutes } from '@/common';
-import {
-  SignupDto,
-  LoginDto,
-  VerifyEmailDto,
-  ForgotPasswordDto,
-  ResetPasswordDto,
-  RefreshTokenDto,
-  VerifyOtpDto,
-} from './dto/auth.dto';
+import { generateToken, addDays, isExpired, generateOtp, addMinutes } from '@/common';
+import { SendOtpDto, VerifyOtpDto, ClerkSyncDto, RefreshTokenDto } from './dto/auth.dto';
 
 @Injectable()
 export class AuthService {
+  private clerkClient: ReturnType<typeof createClerkClient> | null = null;
+  private clerkSecretKey: string | undefined;
+
   constructor(
     @Inject(KNEX_CONNECTION) private knex: Knex,
     private usersService: UsersService,
     private jwtService: JwtService,
     private configService: ConfigService,
     private emailService: EmailService,
-    private paymentService: PaymentService,
-  ) {}
-
-  async signup(dto: SignupDto) {
-    const existingUser = await this.usersService.findByEmail(dto.email);
-    if (existingUser) {
-      throw new ConflictException('Email already registered');
+  ) {
+    this.clerkSecretKey = this.configService.get<string>('clerk.secretKey');
+    if (this.clerkSecretKey) {
+      this.clerkClient = createClerkClient({ secretKey: this.clerkSecretKey });
     }
-
-    const hashedPassword = await bcrypt.hash(dto.password, 12);
-
-    return this.knex.transaction(async (trx) => {
-      const [user] = await trx('users')
-        .insert({
-          email: dto.email.toLowerCase(),
-          password: hashedPassword,
-        })
-        .returning('*');
-
-      // const customer = await this.paymentService.createCustomer(user.email);
-      // await trx('users')
-      //   .where('id', user.id)
-      //   .update({ stripe_customer_id: customer.id });
-
-      const token = generateToken();
-      await trx('email_verifications').insert({
-        user_id: user.id,
-        token,
-        expires_at: addHours(new Date(), 24),
-      });
-
-      await this.emailService.sendVerificationEmail(user.email, token);
-
-      return {
-        message: 'Account created. Please check your email to verify your account.',
-        userId: user.id,
-        token,
-      };
-    });
   }
 
-  async login(dto: LoginDto) {
-    // findByEmail already filters deleted_at via UsersService
-    const user = await this.usersService.findByEmail(dto.email);
-    if (!user) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
+  /**
+   * Step 1: Send a 6-digit OTP to the provided email.
+   *
+   * Works for both new users (registration) and existing users (passwordless login).
+   * If the user already exists we simply send a fresh OTP — no separate "login vs register"
+   * distinction needed on the client.
+   */
+  async sendOtp(dto: SendOtpDto) {
+    const email = dto.email.toLowerCase();
 
-    const isPasswordValid = await bcrypt.compare(dto.password, user.password);
-    if (!isPasswordValid) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
-
-    if (!user.email_verified) {
-      throw new BadRequestException('Please verify your email before logging in');
-    }
-
-    const tokens = await this.generateTokens(user);
-
-    return {
-      user: this.usersService.sanitizeUser(user),
-      ...tokens,
-    };
-  }
-
-  async verifyEmail(dto: VerifyEmailDto) {
-    const verification = await this.knex('email_verifications')
-      .where('token', dto.token)
+    // Invalidate any previous unused OTPs for this address
+    await this.knex('registration_otps')
+      .where('email', email)
       .andWhere('used', false)
-      .first();
-
-    if (!verification) {
-      throw new BadRequestException('Invalid verification token');
-    }
-
-    if (isExpired(verification.expires_at)) {
-      throw new BadRequestException('Verification token has expired');
-    }
-
-    await this.knex.transaction(async (trx) => {
-      await trx('users')
-        .where('id', verification.user_id)
-        .whereNull('deleted_at')
-        .update({ email_verified: true, updated_at: new Date() });
-
-      await trx('email_verifications')
-        .where('id', verification.id)
-        .update({ used: true });
-    });
-
-    return { message: 'Email verified successfully' };
-  }
-
-  async resendVerificationEmail(email: string) {
-    // findByEmail already filters deleted_at via UsersService
-    const user = await this.usersService.findByEmail(email);
-    if (!user) {
-      return { message: 'If an account exists, a verification email has been sent' };
-    }
-
-    if (user.email_verified) {
-      throw new BadRequestException('Email is already verified');
-    }
-
-    await this.knex('email_verifications')
-      .where('user_id', user.id)
-      .update({ used: true });
-
-    const token = generateToken();
-    await this.knex('email_verifications').insert({
-      user_id: user.id,
-      token,
-      expires_at: addHours(new Date(), 24),
-    });
-
-    await this.emailService.sendVerificationEmail(user.email, token);
-
-    return { message: 'Verification email sent' };
-  }
-
-  async forgotPassword(dto: ForgotPasswordDto) {
-    // findByEmail already filters deleted_at via UsersService
-    const user = await this.usersService.findByEmail(dto.email);
-
-    if (!user) {
-      return { message: 'If an account exists, a password reset OTP has been sent' };
-    }
-
-    await this.knex('password_resets')
-      .where('user_id', user.id)
       .update({ used: true });
 
     const otp = generateOtp(6);
     const hashedOtp = await bcrypt.hash(otp, 10);
 
-    await this.knex('password_resets').insert({
-      user_id: user.id,
+    await this.knex('registration_otps').insert({
+      email,
       token: hashedOtp,
+      niche_id: dto.niche_id ?? null,
       expires_at: addMinutes(new Date(), 10),
     });
 
-    await this.emailService.sendPasswordResetOtpEmail(user.email, otp);
-
-    return { message: 'If an account exists, a password reset OTP has been sent' };
-  }
-
-  async verifyResetOtp(dto: VerifyOtpDto) {
-    // findByEmail already filters deleted_at via UsersService
-    const user = await this.usersService.findByEmail(dto.email);
-    if (!user) {
-      throw new BadRequestException('Invalid OTP');
+    const existingUser = await this.usersService.findByEmail(email);
+    if (existingUser) {
+      await this.emailService.sendLoginOtpEmail(email, otp, existingUser.name ?? undefined);
+    } else {
+      await this.emailService.sendRegistrationOtpEmail(email, otp);
     }
 
-    const resetRecord = await this.knex('password_resets')
-      .where('user_id', user.id)
+    return {
+      message: 'A 6-digit verification code has been sent to your email.',
+      isNewUser: !existingUser,
+    };
+  }
+
+  /**
+   * Step 2: Verify the OTP.
+   *
+   * - If the user does not exist yet → create account, save niche, return tokens.
+   * - If the user already exists → mark email verified (if not already), return tokens.
+   */
+  async verifyOtp(dto: VerifyOtpDto) {
+    const email = dto.email.toLowerCase();
+
+    const record = await this.knex('registration_otps')
+      .where('email', email)
       .andWhere('used', false)
       .orderBy('created_at', 'desc')
       .first();
 
-    if (!resetRecord) {
-      throw new BadRequestException('Invalid OTP');
+    if (!record) {
+      throw new BadRequestException('Invalid or expired verification code');
     }
 
-    if (isExpired(resetRecord.expires_at)) {
-      throw new BadRequestException('OTP has expired');
+    if (isExpired(record.expires_at)) {
+      throw new BadRequestException('Verification code has expired. Please request a new one.');
     }
 
-    const isValidOtp = await bcrypt.compare(dto.otp, resetRecord.token);
-    if (!isValidOtp) {
-      throw new BadRequestException('Invalid OTP');
+    const isValid = await bcrypt.compare(dto.otp, record.token);
+    if (!isValid) {
+      throw new BadRequestException('Invalid verification code');
     }
 
-    return { message: 'OTP verified successfully', verified: true };
-  }
+    // Invalidate the used OTP
+    await this.knex('registration_otps').where('id', record.id).update({ used: true });
 
-  async resetPassword(dto: ResetPasswordDto) {
-    // findByEmail already filters deleted_at via UsersService
-    const user = await this.usersService.findByEmail(dto.email);
+    // Resolve niche: prefer the one on the VerifyOtpDto, fall back to the one stored with the OTP
+    const resolvedNicheId = dto.niche_id ?? record.niche_id ?? null;
+
+    let user = await this.usersService.findByEmail(email);
+
     if (!user) {
-      throw new BadRequestException('Invalid request');
+      // New user — create account
+      user = await this.knex.transaction(async (trx) => {
+        const [newUser] = await trx('users')
+          .insert({
+            email,
+            password: null,
+            auth_provider: 'email_otp',
+            email_verified: true,
+          })
+          .returning('*');
+
+        if (resolvedNicheId) {
+          await trx('user_fields').insert({
+            user_id: newUser.id,
+            field_id: resolvedNicheId,
+            is_primary: true,
+          });
+        }
+
+        return newUser;
+      });
+    } else {
+      // Returning user — ensure email is verified
+      if (!user.email_verified) {
+        await this.usersService.update(user.id, { email_verified: true });
+        user = (await this.usersService.findById(user.id))!;
+      }
+
+      // Attach niche if not already set
+      if (resolvedNicheId) {
+        const existingField = await this.knex('user_fields')
+          .where('user_id', user.id)
+          .andWhere('is_primary', true)
+          .first();
+
+        if (!existingField) {
+          await this.knex('user_fields').insert({
+            user_id: user.id,
+            field_id: resolvedNicheId,
+            is_primary: true,
+          });
+        }
+      }
     }
 
-    const isSamePassword = await bcrypt.compare(dto.password, user.password);
-    if (isSamePassword) {
-      throw new BadRequestException('New password must be different from your current password');
-    }
+    const tokens = await this.generateTokens(user!);
 
-    const resetRecord = await this.knex('password_resets')
-      .where('user_id', user.id)
-      .andWhere('used', false)
-      .orderBy('created_at', 'desc')
-      .first();
-
-    if (!resetRecord) {
-      throw new BadRequestException('Invalid or expired OTP');
-    }
-
-    if (isExpired(resetRecord.expires_at)) {
-      throw new BadRequestException('OTP has expired');
-    }
-
-    const isValidOtp = await bcrypt.compare(dto.otp, resetRecord.token);
-    if (!isValidOtp) {
-      throw new BadRequestException('Invalid OTP');
-    }
-
-    const hashedPassword = await bcrypt.hash(dto.password, 12);
-
-    await this.knex.transaction(async (trx) => {
-      await trx('users')
-        .where('id', user.id)
-        .whereNull('deleted_at')
-        .update({ password: hashedPassword, updated_at: new Date() });
-
-      await trx('password_resets')
-        .where('id', resetRecord.id)
-        .update({ used: true });
-
-      await trx('refresh_tokens')
-        .where('user_id', user.id)
-        .update({ revoked: true });
-    });
-
-    return { message: 'Password reset successfully' };
+    return {
+      user: this.usersService.sanitizeUser(user!),
+      ...tokens,
+    };
   }
 
-  async resendResetOtp(dto: ForgotPasswordDto) {
-    return this.forgotPassword(dto);
+  /**
+   * Clerk OAuth sync — called by the frontend after the user completes Clerk's
+   * OAuth flow.  We verify the Clerk session token, then find-or-create the
+   * matching user in our own database and issue our own JWT pair.
+   *
+   * This ensures a single "user" record regardless of whether someone signed in
+   * via Clerk OAuth or the email-OTP flow.
+   */
+  async clerkSync(dto: ClerkSyncDto) {
+    if (!this.clerkClient) {
+      throw new BadRequestException('Clerk integration is not configured on this server');
+    }
+
+    let clerkPayload: { sub: string };
+    try {
+      clerkPayload = await verifyClerkToken(dto.clerkToken, { secretKey: this.clerkSecretKey! }) as { sub: string };
+    } catch {
+      throw new UnauthorizedException('Invalid Clerk session token');
+    }
+
+    const clerkUserId = clerkPayload.sub;
+
+    // Fetch the full user profile from Clerk so we have email + name
+    const clerkUser = await this.clerkClient.users.getUser(clerkUserId);
+    const primaryEmail = clerkUser.emailAddresses.find(
+      (e) => e.id === clerkUser.primaryEmailAddressId,
+    )?.emailAddress?.toLowerCase();
+
+    if (!primaryEmail) {
+      throw new BadRequestException('Clerk account has no verified email address');
+    }
+
+    // 1. Try to find by clerk_user_id first (fastest path for returning OAuth users)
+    let user = await this.usersService.findByClerkId(clerkUserId);
+
+    if (!user) {
+      // 2. Try to find by email (merges with an existing email-OTP account)
+      user = await this.usersService.findByEmail(primaryEmail);
+
+      if (user) {
+        // Link the Clerk ID to the existing account
+        user = await this.usersService.update(user.id, {
+          clerk_user_id: clerkUserId,
+          auth_provider: 'clerk_oauth',
+          email_verified: true,
+          avatar_url: user.avatar_url ?? (clerkUser.imageUrl || undefined),
+        });
+      } else {
+        // 3. Brand-new user via OAuth
+        user = await this.knex.transaction(async (trx) => {
+          const [newUser] = await trx('users')
+            .insert({
+              email: primaryEmail,
+              password: null,
+              name: `${clerkUser.firstName ?? ''} ${clerkUser.lastName ?? ''}`.trim() || null,
+              auth_provider: 'clerk_oauth',
+              clerk_user_id: clerkUserId,
+              avatar_url: clerkUser.imageUrl || null,
+              email_verified: true,
+            })
+            .returning('*');
+
+          if (dto.niche_id) {
+            await trx('user_fields').insert({
+              user_id: newUser.id,
+              field_id: dto.niche_id,
+              is_primary: true,
+            });
+          }
+
+          return newUser;
+        });
+      }
+    }
+
+    const tokens = await this.generateTokens(user!);
+
+    return {
+      user: this.usersService.sanitizeUser(user!),
+      ...tokens,
+    };
   }
 
   async refreshToken(dto: RefreshTokenDto) {
@@ -276,8 +260,6 @@ export class AuthService {
       throw new UnauthorizedException('Refresh token has expired');
     }
 
-    // findById already filters deleted_at via UsersService —
-    // soft-deleted users cannot refresh their session
     const user = await this.usersService.findById(storedToken.user_id);
     if (!user) {
       throw new UnauthorizedException('User not found');

@@ -9,73 +9,66 @@ import {
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard, CurrentUser } from '@/common';
-import {
-  SignupDto,
-  LoginDto,
-  VerifyEmailDto,
-  ForgotPasswordDto,
-  ResetPasswordDto,
-  RefreshTokenDto,
-  VerifyOtpDto,
-} from './dto/auth.dto';
+import { SendOtpDto, VerifyOtpDto, ClerkSyncDto, RefreshTokenDto } from './dto/auth.dto';
 
 @Controller('auth')
 export class AuthController {
   constructor(private authService: AuthService) {}
 
-  @Post('signup')
-  async signup(@Body() dto: SignupDto) {
-    return this.authService.signup(dto);
-  }
-
-  @Post('login')
+  /**
+   * Step 1 — Request an OTP.
+   * Works for both new users (registration) and existing users (login).
+   * Optionally accepts a niche_id if the user selected one on the guest screen.
+   *
+   * POST /api/v1/auth/otp/send
+   */
+  @Post('otp/send')
   @HttpCode(HttpStatus.OK)
-  async login(@Body() dto: LoginDto) {
-    return this.authService.login(dto);
+  async sendOtp(@Body() dto: SendOtpDto) {
+    return this.authService.sendOtp(dto);
   }
 
-  @Post('verify-email')
+  /**
+   * Step 2 — Verify the OTP.
+   * Creates the account (if new) or logs in (if existing), saves the niche,
+   * and returns our JWT pair.
+   *
+   * POST /api/v1/auth/otp/verify
+   */
+  @Post('otp/verify')
   @HttpCode(HttpStatus.OK)
-  async verifyEmail(@Body() dto: VerifyEmailDto) {
-    return this.authService.verifyEmail(dto);
+  async verifyOtp(@Body() dto: VerifyOtpDto) {
+    return this.authService.verifyOtp(dto);
   }
 
-  @Post('resend-verification')
+  /**
+   * Clerk OAuth sync — exchange a Clerk session token for our own JWT pair.
+   * Call this after the user completes OAuth on the frontend via Clerk.
+   *
+   * POST /api/v1/auth/clerk/sync
+   */
+  @Post('clerk/sync')
   @HttpCode(HttpStatus.OK)
-  async resendVerification(@Body('email') email: string) {
-    return this.authService.resendVerificationEmail(email);
+  async clerkSync(@Body() dto: ClerkSyncDto) {
+    return this.authService.clerkSync(dto);
   }
 
-  @Post('forgot-password')
-  @HttpCode(HttpStatus.OK)
-  async forgotPassword(@Body() dto: ForgotPasswordDto) {
-    return this.authService.forgotPassword(dto);
-  }
-
-  @Post('verify-reset-otp')
-  @HttpCode(HttpStatus.OK)
-  async verifyResetOtp(@Body() dto: VerifyOtpDto) {
-    return this.authService.verifyResetOtp(dto);
-  }
-
-  @Post('resend-reset-otp')
-  @HttpCode(HttpStatus.OK)
-  async resendResetOtp(@Body() dto: ForgotPasswordDto) {
-    return this.authService.resendResetOtp(dto);
-  }
-
-  @Post('reset-password')
-  @HttpCode(HttpStatus.OK)
-  async resetPassword(@Body() dto: ResetPasswordDto) {
-    return this.authService.resetPassword(dto);
-  }
-
+  /**
+   * Refresh the access token using a valid refresh token.
+   *
+   * POST /api/v1/auth/refresh
+   */
   @Post('refresh')
   @HttpCode(HttpStatus.OK)
   async refresh(@Body() dto: RefreshTokenDto) {
     return this.authService.refreshToken(dto);
   }
 
+  /**
+   * Revoke the current refresh token (logout).
+   *
+   * POST /api/v1/auth/logout
+   */
   @Post('logout')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
@@ -86,6 +79,11 @@ export class AuthController {
     return this.authService.logout(userId, refreshToken);
   }
 
+  /**
+   * Return the currently authenticated user's profile.
+   *
+   * GET /api/v1/auth/profile
+   */
   @Get('profile')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)

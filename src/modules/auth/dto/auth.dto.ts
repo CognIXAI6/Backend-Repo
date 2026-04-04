@@ -1,47 +1,22 @@
-import { IsEmail, IsString, MinLength, IsOptional, Length, IsNumberString, Matches } from 'class-validator';
+import { IsEmail, IsString, IsOptional, Length, IsUUID } from 'class-validator';
 
-export class SignupDto {
+/**
+ * Step 1 of OTP registration/login: send OTP to email.
+ * niche_id is optional — guest may have selected it before hitting the limit.
+ */
+export class SendOtpDto {
   @IsEmail()
   email: string;
 
-  @IsString()
-  @MinLength(8)
-  @Matches(
-    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*#?&])[A-Za-z\d@$!%*#?&]{8,}$/,
-    {
-      message: 
-        'Password must contain at least one lowercase letter, one uppercase letter, one number, and one special character (@$!%*#?&)',
-    }
-  )
-  password: string;
+  @IsOptional()
+  @IsUUID()
+  niche_id?: string;
 }
 
-export class LoginDto {
-  @IsEmail()
-  email: string;
-
-  @IsString()
-  @MinLength(8)
-  @Matches(
-    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*#?&])[A-Za-z\d@$!%*#?&]{8,}$/,
-    {
-      message: 
-        'Password must contain at least one lowercase letter, one uppercase letter, one number, and one special character (@$!%*#?&)',
-    }
-  )
-  password: string;
-}
-
-export class VerifyEmailDto {
-  @IsString()
-  token: string;
-}
-
-export class ForgotPasswordDto {
-  @IsEmail()
-  email: string;
-}
-
+/**
+ * Step 2 of OTP registration/login: verify code.
+ * niche_id is optional — can be provided here if not sent in step 1.
+ */
 export class VerifyOtpDto {
   @IsEmail()
   email: string;
@@ -49,26 +24,23 @@ export class VerifyOtpDto {
   @IsString()
   @Length(6, 6)
   otp: string;
+
+  @IsOptional()
+  @IsUUID()
+  niche_id?: string;
 }
 
-export class ResetPasswordDto {
-  @IsEmail()
-  email: string;
-
+/**
+ * Clerk OAuth sync: exchange a Clerk session token for our own JWT.
+ * The frontend authenticates with Clerk then calls this endpoint.
+ */
+export class ClerkSyncDto {
   @IsString()
-  @Length(6, 6)
-  otp: string;
+  clerkToken: string;
 
-  @IsString()
-  @MinLength(8)
-  @Matches(
-    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*#?&])[A-Za-z\d@$!%*#?&]{8,}$/,
-    {
-      message: 
-        'Password must contain at least one lowercase letter, one uppercase letter, one number, and one special character (@$!%*#?&)',
-    }
-  )
-  password: string;
+  @IsOptional()
+  @IsUUID()
+  niche_id?: string;
 }
 
 export class RefreshTokenDto {

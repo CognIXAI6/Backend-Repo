@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
+    "@clerk/backend": "^3.2.4",
     "@deepgram/sdk": "^5.0.0",
     "@nestjs/common": "^10.0.0",
     "@nestjs/config": "^3.0.0",

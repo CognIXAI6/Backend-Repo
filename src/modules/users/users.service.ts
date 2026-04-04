@@ -5,9 +5,11 @@ import { KNEX_CONNECTION } from "@/database/database.module";
 export interface User {
   id: string;
   email: string;
-  password: string;
+  password: string | null;
   name: string | null;
   email_verified: boolean;
+  auth_provider: 'email_otp' | 'clerk_oauth' | 'password';
+  clerk_user_id: string | null;
   onboarding_status: "pending" | "in_progress" | "completed";
   subscription_tier: "free" | "premium";
   stripe_customer_id: string | null;
@@ -21,7 +23,12 @@ export interface User {
 
 export interface CreateUserDto {
   email: string;
-  password: string;
+  password?: string | null;
+  name?: string | null;
+  auth_provider?: 'email_otp' | 'clerk_oauth' | 'password';
+  clerk_user_id?: string | null;
+  avatar_url?: string | null;
+  email_verified?: boolean;
 }
 
 export interface UpdateUserDto {
@@ -33,6 +40,8 @@ export interface UpdateUserDto {
   avatar_url?: string;
   voice_sample_skipped?: boolean;
   voice_sample_completed_at?: Date;
+  clerk_user_id?: string;
+  auth_provider?: 'email_otp' | 'clerk_oauth' | 'password';
 }
 
 @Injectable()
@@ -51,6 +60,13 @@ export class UsersService {
   async findByEmail(email: string): Promise<User | null> {
     return this.knex("users")
       .where("email", email.toLowerCase())
+      .whereNull("deleted_at")
+      .first();
+  }
+
+  async findByClerkId(clerkUserId: string): Promise<User | null> {
+    return this.knex("users")
+      .where("clerk_user_id", clerkUserId)
       .whereNull("deleted_at")
       .first();
   }
@@ -101,7 +117,6 @@ export class UsersService {
       .update({ deleted_at: null, updated_at: new Date() });
 
     return { message: 'Profile activated successfully' };
-
   }
 
   async getUserWithField(userId: string): Promise<any> {

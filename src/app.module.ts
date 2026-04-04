@@ -11,6 +11,7 @@ import {
   emailConfig,
   cloudinaryConfig,
   stripeConfig,
+  clerkConfig,
 } from './config';
 
 // Common
@@ -48,6 +49,7 @@ import { ResourcesModule } from './modules/resources/resources.module';
         emailConfig,
         cloudinaryConfig,
         stripeConfig,
+        clerkConfig,
       ],
     }),
     LoggerModule,

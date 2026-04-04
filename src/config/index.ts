@@ -55,3 +55,8 @@ export const stripeConfig = registerAs('stripe', () => ({
     yearly: process.env.STRIPE_PRICE_YEARLY,
   },
 }));
+
+export const clerkConfig = registerAs('clerk', () => ({
+  secretKey: process.env.CLERK_SECRET_KEY,
+  publishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+}));

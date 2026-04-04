@@ -123,7 +123,18 @@ export class DeepgramService implements OnModuleInit {
     // waitForOpen() returns a promise that resolves only when readyState === OPEN.
     // Without this, audio arrives before the socket is open → readyState=3 (CLOSED).
     const socket = rawSocket.connect();
-    await socket.waitForOpen();
+
+    // waitForOpen() can reject (TIMEOUT) when Deepgram is unreachable or the API
+    // key is invalid.  Catch it here so we can clean up and surface a proper error
+    // to the gateway rather than leaving an orphaned socket.
+    try {
+      await socket.waitForOpen();
+    } catch (err) {
+      this.logger.error(`[${sessionId}] Deepgram waitForOpen failed: ${(err as Error).message}`);
+      try { socket.close(); } catch (_) {}
+      emitter.emit('error', err instanceof Error ? err : new Error(String(err)));
+      throw err; // re-throw so handleSessionStart emits error to the WS client
+    }
 
     this.logger.log(`[${sessionId}] Deepgram socket ready (readyState=${socket.readyState})`);
 
@@ -141,10 +152,15 @@ export class DeepgramService implements OnModuleInit {
     };
 
     // ── close ─────────────────────────────────────────────────────────────────
+    // readyState: 0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED
+    // Only send the close-stream signal when the socket is actually open (1).
+    // Calling close() on state 0 or 3 is what triggers the secondary ws crash.
     const close = (): void => {
       try {
-        socket.sendCloseStream();
-        socket.close();
+        if (socket.readyState === 1) socket.sendCloseStream();
+      } catch (_) {}
+      try {
+        if (socket.readyState === 0 || socket.readyState === 1) socket.close();
       } catch (_) {}
     };
 

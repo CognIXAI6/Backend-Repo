@@ -9,19 +9,26 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Logger } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
 import { EventEmitter } from 'events';
 
 import { DeepgramService } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
-import { ConversationService, ConversationMode, MessageRole } from './services/conversation.service';
+import { ConversationService, ConversationMode } from './services/conversation.service';
+import { GuestSessionService } from './services/guest-session.service';
 
 // ─── Per-socket session state ─────────────────────────────────────────────────
 
 interface ActiveSession {
+  /** Authenticated user id OR the guest session UUID (used as pseudo user-id) */
   userId: string;
   conversationId: string;
   fieldName?: string;
+  isGuest: boolean;
+  /** Only set for guest sessions */
+  guestSessionId?: string;
   deepgramEmitter: EventEmitter;
   sendAudio: (chunk: Buffer) => void;
   closeDeepgram: () => void;
@@ -46,6 +53,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly deepgramService: DeepgramService,
     private readonly claudeService: ClaudeService,
     private readonly conversationService: ConversationService,
+    private readonly guestSessionService: GuestSessionService,
+    private readonly jwtService: JwtService,
+    private readonly configService: ConfigService,
   ) {}
 
   afterInit(): void {
@@ -62,12 +72,23 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── session:start ──────────────────────────────────────────────────────────
+  /**
+   * Starts a voice session.
+   *
+   * Authenticated:  pass `accessToken` (JWT).
+   * Guest:          pass `guestSessionId` (UUID stored in client localStorage).
+   *
+   * The backend validates which path to take based on what is present.
+   */
   @SubscribeMessage('session:start')
   async handleSessionStart(
     @ConnectedSocket() client: Socket,
     @MessageBody()
     payload: {
-      userId: string;
+      /** JWT access token for authenticated users */
+      accessToken?: string;
+      /** UUID stored in localStorage for guest users */
+      guestSessionId?: string;
       conversationId?: string;
       mode?: ConversationMode;
       fieldId?: string;
@@ -77,24 +98,73 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     try {
       this.cleanupSession(client.id);
 
-      // Create or resume conversation in DB
+      // ── Resolve identity ──────────────────────────────────────────────────
+      let userId: string;
+      let isGuest: boolean;
+      let guestSessionId: string | undefined;
+
+      if (payload.accessToken) {
+        // Authenticated path — verify JWT
+        try {
+          const decoded = this.jwtService.verify<{ sub: string }>(payload.accessToken, {
+            secret: this.configService.get<string>('jwt.secret'),
+          });
+          userId = decoded.sub;
+          isGuest = false;
+        } catch {
+          client.emit('error', { code: 'INVALID_TOKEN', message: 'Access token is invalid or expired' });
+          return;
+        }
+      } else if (payload.guestSessionId) {
+        // Guest path — use guestSessionId as pseudo userId
+        guestSessionId = payload.guestSessionId;
+        userId = guestSessionId; // conversations store this UUID as user_id
+
+        const canSend = await this.guestSessionService.canSendPrompt(guestSessionId);
+        const status = await this.guestSessionService.getPromptStatus(guestSessionId);
+
+        isGuest = true;
+
+        // Emit current prompt status so the frontend can show the counter
+        client.emit('guest:status', {
+          used: status.used,
+          limit: status.limit,
+          remaining: status.remaining,
+        });
+
+        if (!canSend) {
+          client.emit('guest:limit_reached', {
+            message: 'You have used all 5 free prompts. Sign up to continue.',
+            used: status.used,
+            limit: status.limit,
+          });
+          return;
+        }
+      } else {
+        client.emit('error', { code: 'AUTH_REQUIRED', message: 'Provide accessToken or guestSessionId' });
+        return;
+      }
+
+      // ── Create or resume conversation ─────────────────────────────────────
       let conversationId = payload.conversationId;
       if (!conversationId) {
         const conv = await this.conversationService.createConversation(
-          payload.userId,
+          userId,
           payload.mode ?? 'single',
           payload.fieldId,
         );
         conversationId = conv.id;
       }
 
-      // createLiveSession is now async in v5
+      // ── Open Deepgram live session ────────────────────────────────────────
       const { emitter, sendAudio, close } = await this.deepgramService.createLiveSession(client.id);
 
       const session: ActiveSession = {
-        userId: payload.userId,
+        userId,
         conversationId,
         fieldName: payload.fieldName,
+        isGuest,
+        guestSessionId,
         deepgramEmitter: emitter,
         sendAudio,
         closeDeepgram: close,
@@ -126,16 +196,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       client.emit('session:ready', {
         conversationId,
-        message: 'Session ready. Start speaking.',
+        isGuest,
+        message: 'Session ready. Start speaking or type a message.',
       });
 
-      this.logger.log(`Session started — user: ${payload.userId}, conv: ${conversationId}`);
+      this.logger.log(
+        `Session started — user: ${userId} (${isGuest ? 'guest' : 'auth'}), conv: ${conversationId}`,
+      );
     } catch (err) {
       this.logger.error('session:start failed', err);
-      client.emit('error', {
-        code: 'SESSION_START_FAILED',
-        message: (err as Error).message,
-      });
+      client.emit('error', { code: 'SESSION_START_FAILED', message: (err as Error).message });
     }
   }
 
@@ -159,7 +229,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── audio:stop ─────────────────────────────────────────────────────────────
-  // User releases mic → send accumulated transcript to Claude
+  /**
+   * User releases mic → check guest limit, then send accumulated transcript to Claude.
+   */
   @SubscribeMessage('audio:stop')
   async handleAudioStop(@ConnectedSocket() client: Socket): Promise<void> {
     const session = this.sessions.get(client.id);
@@ -177,8 +249,82 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    session.isProcessingAI = true;
+    // ── Guest prompt limit check ───────────────────────────────────────────
+    if (session.isGuest && session.guestSessionId) {
+      const canSend = await this.guestSessionService.canSendPrompt(session.guestSessionId);
+      if (!canSend) {
+        const status = await this.guestSessionService.getPromptStatus(session.guestSessionId);
+        client.emit('guest:limit_reached', {
+          message: 'You have used all 5 free prompts. Sign up to continue.',
+          used: status.used,
+          limit: status.limit,
+        });
+        return;
+      }
+    }
+
     session.accumulatedTranscript = '';
+    await this.processPrompt(client, session, transcript, 'voice');
+  }
+
+  // ─── text:send ──────────────────────────────────────────────────────────────
+  /**
+   * User types a text prompt — skip Deepgram, send directly to Claude.
+   */
+  @SubscribeMessage('text:send')
+  async handleTextSend(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { text: string },
+  ): Promise<void> {
+    const session = this.sessions.get(client.id);
+    if (!session) {
+      client.emit('error', { code: 'NO_SESSION', message: 'Call session:start first' });
+      return;
+    }
+
+    const text = (payload.text ?? '').trim();
+    if (!text) {
+      client.emit('ai:skipped', { reason: 'empty_text' });
+      return;
+    }
+
+    if (session.isProcessingAI) {
+      client.emit('ai:skipped', { reason: 'already_processing' });
+      return;
+    }
+
+    // ── Guest prompt limit check ───────────────────────────────────────────
+    if (session.isGuest && session.guestSessionId) {
+      const canSend = await this.guestSessionService.canSendPrompt(session.guestSessionId);
+      if (!canSend) {
+        const status = await this.guestSessionService.getPromptStatus(session.guestSessionId);
+        client.emit('guest:limit_reached', {
+          message: 'You have used all 5 free prompts. Sign up to continue.',
+          used: status.used,
+          limit: status.limit,
+        });
+        return;
+      }
+    }
+
+    await this.processPrompt(client, session, text, 'text');
+  }
+
+  // ─── session:end ─────────────────────────────────────────────────────────────
+  @SubscribeMessage('session:end')
+  handleSessionEnd(@ConnectedSocket() client: Socket): void {
+    this.cleanupSession(client.id);
+    client.emit('session:ended');
+  }
+
+  // ─── Core prompt processing (shared by voice and text paths) ─────────────────
+  private async processPrompt(
+    client: Socket,
+    session: ActiveSession,
+    userMessage: string,
+    inputType: 'voice' | 'text',
+  ): Promise<void> {
+    session.isProcessingAI = true;
     const aiStartTime = Date.now();
 
     try {
@@ -186,11 +332,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       await this.conversationService.saveMessage({
         conversationId: session.conversationId,
         role: 'user',
-        content: transcript,
-        transcript,
+        content: userMessage,
+        transcript: inputType === 'voice' ? userMessage : undefined,
       });
 
-      client.emit('transcript:confirmed', { transcript });
+      client.emit('transcript:confirmed', { transcript: userMessage, inputType });
       client.emit('ai:start');
 
       // 2. Load conversation history for Claude context
@@ -198,17 +344,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.conversationId,
         session.userId,
       );
-
-      // Remove the last user turn — we pass it as the current message directly
       const historyWithoutCurrent = history.slice(0, -1);
-
       const systemPrompt = this.claudeService.buildSystemPrompt(session.fieldName);
 
       let firstToken = true;
 
       // 3. Stream Claude response
       await this.claudeService.streamResponse(
-        transcript,
+        userMessage,
         historyWithoutCurrent,
         systemPrompt,
         {
@@ -230,6 +373,24 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               latencyMs: Date.now() - aiStartTime,
             });
 
+            // 5. Increment guest prompt count and emit updated status
+            if (session.isGuest && session.guestSessionId) {
+              const updated = await this.guestSessionService.incrementPromptCount(session.guestSessionId);
+              const remaining = Math.max(0, updated.prompt_limit - updated.prompt_count);
+              client.emit('guest:status', {
+                used: updated.prompt_count,
+                limit: updated.prompt_limit,
+                remaining,
+              });
+              if (remaining === 0) {
+                client.emit('guest:limit_reached', {
+                  message: 'You have used all 5 free prompts. Sign up to continue.',
+                  used: updated.prompt_count,
+                  limit: updated.prompt_limit,
+                });
+              }
+            }
+
             client.emit('ai:done', {
               response: fullText,
               tokensUsed: inputTokens + outputTokens,
@@ -247,17 +408,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         },
       );
     } catch (err) {
-      this.logger.error('audio:stop error:', err);
+      this.logger.error('processPrompt error:', err);
       client.emit('error', { code: 'PROCESSING_FAILED', message: (err as Error).message });
       session.isProcessingAI = false;
     }
-  }
-
-  // ─── session:end ─────────────────────────────────────────────────────────────
-  @SubscribeMessage('session:end')
-  handleSessionEnd(@ConnectedSocket() client: Socket): void {
-    this.cleanupSession(client.id);
-    client.emit('session:ended');
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────────

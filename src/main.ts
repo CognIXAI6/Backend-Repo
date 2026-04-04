@@ -6,6 +6,23 @@ import { AppModule } from './app.module';
 import * as express from 'express';
 import * as bodyParser from 'body-parser';
 
+// Prevent the Deepgram SDK's internal ws.WebSocket from crashing the process
+// when it emits an unhandled 'error' event during a connection timeout / close race.
+// NestJS's own exception filters do not cover Node.js-level EventEmitter errors.
+process.on('uncaughtException', (err: Error) => {
+  // Only suppress WebSocket-level close-before-open errors from the SDK internals.
+  // Everything else is re-thrown so genuine bugs still surface.
+  if (
+    err.message.includes('WebSocket was closed before the connection was established') ||
+    err.message.includes('WebSocket is not open')
+  ) {
+    console.error('[DeepgramSDK] Suppressed uncaught WS error:', err.message);
+    return;
+  }
+  console.error('[uncaughtException] Re-throwing fatal error:', err);
+  throw err;
+});
+
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     rawBody: true,
