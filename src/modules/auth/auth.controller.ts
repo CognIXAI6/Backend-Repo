@@ -22,7 +22,7 @@ export class AuthController {
    *
    * POST /api/v1/auth/otp/send
    */
-  @Post('otp/send')
+  @Post('/login')
   @HttpCode(HttpStatus.OK)
   async sendOtp(@Body() dto: SendOtpDto) {
     return this.authService.sendOtp(dto);
