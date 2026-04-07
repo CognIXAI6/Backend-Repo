@@ -123,6 +123,9 @@ export class OnboardingService {
       await this.usersService.update(userId, { subscription_tier: "free" });
     }
 
+    await this.usersService.update(userId, { onboarding_status: "completed" });
+
+
     return {
       message: "Field selected",
       requiresVerification: field?.requires_verification,
