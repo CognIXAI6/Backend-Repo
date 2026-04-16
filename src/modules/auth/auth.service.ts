@@ -3,7 +3,6 @@ import {
   Inject,
   BadRequestException,
   UnauthorizedException,
-  ConflictException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -118,6 +117,8 @@ export class AuthService {
             password: null,
             auth_provider: 'email_otp',
             email_verified: true,
+            // Niche provided at signup → onboarding is done immediately
+            onboarding_status: resolvedNicheId ? 'completed' : 'in_progress',
           })
           .returning('*');
 
@@ -138,7 +139,7 @@ export class AuthService {
         user = (await this.usersService.findById(user.id))!;
       }
 
-      // Attach niche if not already set
+      // Attach niche if not already set and advance onboarding status
       if (resolvedNicheId) {
         const existingField = await this.knex('user_fields')
           .where('user_id', user.id)
@@ -151,6 +152,9 @@ export class AuthService {
             field_id: resolvedNicheId,
             is_primary: true,
           });
+          // Niche just selected — mark onboarding complete
+          await this.usersService.update(user.id, { onboarding_status: 'completed' });
+          user = (await this.usersService.findById(user.id))!;
         }
       }
     }
@@ -222,6 +226,7 @@ export class AuthService {
               clerk_user_id: clerkUserId,
               avatar_url: clerkUser.imageUrl || null,
               email_verified: true,
+              onboarding_status: dto.niche_id ? 'completed' : 'in_progress',
             })
             .returning('*');
 

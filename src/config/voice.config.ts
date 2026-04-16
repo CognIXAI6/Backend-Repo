@@ -4,6 +4,7 @@ export const voiceConfig = registerAs('voice', () => ({
   deepgramApiKey: process.env.DEEPGRAM_API_KEY,
   anthropicApiKey: process.env.ANTHROPIC_API_KEY,
   claudeModel: process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514',
+  tavilyApiKey: process.env.TAVILY_API_KEY,
 }));
 
 

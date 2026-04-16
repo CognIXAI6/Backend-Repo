@@ -1,64 +1,64 @@
-import { Controller, Get, Post, Body, UseGuards, UseInterceptors, UploadedFile } from "@nestjs/common";
-import { OnboardingService } from "./onboarding.service";
-import { JwtAuthGuard, CurrentUser } from "@/common";
-import { FileInterceptor } from "@nestjs/platform-express";
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  UseGuards,
+  UseInterceptors,
+  UploadedFile,
+} from '@nestjs/common';
+import { OnboardingService } from './onboarding.service';
+import { JwtAuthGuard, CurrentUser } from '@/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 
-@Controller("onboarding")
+@Controller('onboarding')
 @UseGuards(JwtAuthGuard)
 export class OnboardingController {
   constructor(private onboardingService: OnboardingService) {}
 
-  @Get("status")
-  async getOnboardingStatus(@CurrentUser("id") userId: string) {
+  /** GET /onboarding/status */
+  @Get('status')
+  async getStatus(@CurrentUser('id') userId: string) {
     return this.onboardingService.getOnboardingStatus(userId);
   }
 
-  @Post("name")
-  async setName(@CurrentUser("id") userId: string, @Body("name") name: string) {
+  /** POST /onboarding/name — optional, set/update display name */
+  @Post('name')
+  async setName(
+    @CurrentUser('id') userId: string,
+    @Body('name') name: string,
+  ) {
     return this.onboardingService.setName(userId, name);
   }
 
-  @Post("field")
-  async selectField(
-    @CurrentUser("id") userId: string,
-    @Body("fieldId") fieldId: string,
+  /**
+   * POST /onboarding/niche — select professional niche.
+   * This is the only required onboarding step; calling it marks onboarding complete.
+   */
+  @Post('niche')
+  async selectNiche(
+    @CurrentUser('id') userId: string,
+    @Body('fieldId') fieldId: string,
   ) {
-    return this.onboardingService.selectField(userId, fieldId);
+    return this.onboardingService.selectNiche(userId, fieldId);
   }
 
-  @Post("speakers")
-  async setSpeakerMode(
-    @CurrentUser("id") userId: string,
-    @Body("mode") mode: string,
-    @Body("additionalSpeakers") additionalSpeakers?: string[],
-  ) {
-    return this.onboardingService.setSpeakerMode(
-      userId,
-      mode,
-      additionalSpeakers,
-    );
-  }
-
-  @Post("voice-sample")
-  @UseInterceptors(FileInterceptor("file"))
+  /** POST /onboarding/voice-sample — optional voice sample upload or skip */
+  @Post('voice-sample')
+  @UseInterceptors(FileInterceptor('file'))
   async voiceSample(
-    @CurrentUser("id") userId: string,
+    @CurrentUser('id') userId: string,
     @UploadedFile() file: Express.Multer.File,
-    @Body("durationSeconds") durationSeconds?: number,
-    @Body("speakerId") speakerId?: string,
-    @Body("skip") skip?: string,
+    @Body('durationSeconds') durationSeconds?: string,
+    @Body('speakerId') speakerId?: string,
+    @Body('skip') skip?: string,
   ) {
     return this.onboardingService.handleVoiceSample(
       userId,
       file,
       durationSeconds ? Number(durationSeconds) : undefined,
       speakerId,
-      skip === "true",
+      skip === 'true',
     );
-  }
-
-  @Post("complete")
-  async completeOnboarding(@CurrentUser("id") userId: string) {
-    return this.onboardingService.completeOnboarding(userId);
   }
 }
