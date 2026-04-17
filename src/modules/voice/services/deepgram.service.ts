@@ -8,6 +8,7 @@ export interface TranscriptWord {
   start: number;
   end: number;
   confidence: number;
+  speaker?: number;
 }
 
 export interface TranscriptResult {
@@ -59,7 +60,7 @@ export class DeepgramService implements OnModuleInit {
     this.logger.log('Deepgram client initialized (SDK v5)');
   }
 
-  async createLiveSession(sessionId: string): Promise<{
+  async createLiveSession(sessionId: string, options?: { diarize?: boolean }): Promise<{
     emitter: EventEmitter;
     sendAudio: (chunk: Buffer) => void;
     close: () => void;
@@ -67,8 +68,6 @@ export class DeepgramService implements OnModuleInit {
     const emitter = new EventEmitter();
 
     // ── Step 1: build the V1Socket (does NOT open the connection yet) ─────────
-    // V1Client.connect() returns a V1Socket immediately without waiting for open.
-    // The socket is in CONNECTING state, not OPEN — readyState will be 0 here.
     const rawSocket = (await this.deepgram.listen.v1.connect({
       Authorization:    `Token ${this.apiKey}`,
       model:            'nova-2',
@@ -77,7 +76,8 @@ export class DeepgramService implements OnModuleInit {
       interim_results:  'true',
       utterance_end_ms: '1000',
       vad_events:       'true',
-      // No encoding/sample_rate — let Deepgram auto-detect from webm/opus container
+      // Enable speaker diarization when requested (dual-speaker mode)
+      ...(options?.diarize ? { diarize: 'true' } : {}),
     })) as unknown as V1Socket;
 
     // ── Step 2: register event handlers BEFORE calling connect()/waitForOpen() ─

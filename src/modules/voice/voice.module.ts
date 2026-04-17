@@ -10,11 +10,12 @@ import { ConversationService } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { voiceConfig } from '@/config/voice.config';
 import { VoiceService } from './services/voice.service';
+import { UsersModule } from '@/modules/users/users.module';
 
 @Module({
   imports: [
     ConfigModule.forFeature(voiceConfig),
-    // JwtService is needed by VoiceGateway to verify access tokens
+    UsersModule,
     JwtModule.registerAsync({
       useFactory: (configService: ConfigService) => ({
         secret: configService.get('jwt.secret'),

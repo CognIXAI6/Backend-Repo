@@ -16,6 +16,8 @@ export interface User {
   avatar_url: string | null;
   voice_sample_skipped: boolean;
   voice_sample_completed_at: Date | null;
+  ai_memory: string | null;
+  ai_memory_updated_at: Date | null;
   deleted_at: Date | null;
   created_at: Date;
   updated_at: Date;
@@ -42,6 +44,8 @@ export interface UpdateUserDto {
   voice_sample_completed_at?: Date;
   clerk_user_id?: string;
   auth_provider?: 'email_otp' | 'clerk_oauth' | 'password';
+  ai_memory?: string | null;
+  ai_memory_updated_at?: Date | null;
 }
 
 @Injectable()

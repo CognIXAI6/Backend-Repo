@@ -3,7 +3,7 @@ import { Knex } from 'knex';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type ConversationMode = 'single' | 'double' | 'multi';
+export type ConversationMode = 'single' | 'double' | 'multi' | 'dual_speaker';
 export type MessageRole = 'user' | 'assistant';
 
 export interface Conversation {
