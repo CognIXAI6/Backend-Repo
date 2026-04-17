@@ -16,12 +16,15 @@ const config: { [key: string]: Knex.Config } = {
     migrations: {
       directory: './src/database/migrations',
       extension: 'ts',
+      loadExtensions: ['.ts'],
     },
     seeds: {
       directory: './src/database/seeds',
       extension: 'ts',
+      loadExtensions: ['.ts'],
     },
   },
+
   production: {
     client: 'pg',
     connection: {
@@ -30,14 +33,17 @@ const config: { [key: string]: Knex.Config } = {
       database: process.env.DATABASE_NAME,
       user: process.env.DATABASE_USER,
       password: process.env.DATABASE_PASSWORD,
-      ssl: { rejectUnauthorized: false },
     },
     pool: { min: 2, max: 10 },
     migrations: {
       directory: './dist/database/migrations',
+      extension: 'js',
+      loadExtensions: ['.js'],
     },
     seeds: {
       directory: './dist/database/seeds',
+      extension: 'js',
+      loadExtensions: ['.js'],
     },
   },
 };
