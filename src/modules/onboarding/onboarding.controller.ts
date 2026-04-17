@@ -51,6 +51,12 @@ export class OnboardingController {
     return this.onboardingService.selectNiche(userId, fieldId);
   }
 
+  /** POST /onboarding/complete — explicitly mark onboarding as complete */
+  @Post('complete')
+  async complete(@CurrentUser('id') userId: string) {
+    return this.onboardingService.completeOnboarding(userId);
+  }
+
   /** POST /onboarding/voice-sample — optional voice sample upload or skip */
   @Post('voice-sample')
   @UseInterceptors(FileInterceptor('file'))

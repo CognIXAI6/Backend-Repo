@@ -95,6 +95,17 @@ export class OnboardingService {
     };
   }
 
+  // ─── Complete onboarding ───────────────────────────────────────────────────
+
+  async completeOnboarding(userId: string) {
+    const user = await this.usersService.findById(userId);
+    if (!user) throw new BadRequestException('User not found');
+
+    await this.usersService.update(userId, { onboarding_status: 'completed' });
+
+    return { message: 'Onboarding completed', isComplete: true };
+  }
+
   // ─── Voice sample (optional feature, not an onboarding gate) ───────────────
 
   async handleVoiceSample(
