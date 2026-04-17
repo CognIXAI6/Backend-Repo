@@ -51,6 +51,16 @@ export class OnboardingController {
     return this.onboardingService.selectNiche(userId, fieldId);
   }
 
+  /** POST /onboarding/speakers — register speaker mode and additional speakers */
+  @Post('speakers')
+  async setSpeakers(
+    @CurrentUser('id') userId: string,
+    @Body('mode') mode: string,
+    @Body('additionalSpeakers') additionalSpeakers: string[],
+  ) {
+    return this.onboardingService.setSpeakers(userId, mode, additionalSpeakers ?? []);
+  }
+
   /** POST /onboarding/complete — explicitly mark onboarding as complete */
   @Post('complete')
   async complete(@CurrentUser('id') userId: string) {

@@ -95,6 +95,31 @@ export class OnboardingService {
     };
   }
 
+  // ─── Set speakers ──────────────────────────────────────────────────────────
+
+  async setSpeakers(
+    userId: string,
+    mode: string,
+    additionalSpeakers: string[],
+  ) {
+    if (!mode) throw new BadRequestException('mode is required');
+
+    const created: { name: string; id: string }[] = [];
+
+    for (const name of additionalSpeakers ?? []) {
+      const trimmed = name?.trim();
+      if (!trimmed) continue;
+      const speaker = await this.speakersService.createSpeaker(userId, trimmed, false);
+      created.push({ name: speaker.name, id: speaker.id });
+    }
+
+    return {
+      message: 'Speakers registered',
+      mode,
+      speakers: created,
+    };
+  }
+
   // ─── Complete onboarding ───────────────────────────────────────────────────
 
   async completeOnboarding(userId: string) {
