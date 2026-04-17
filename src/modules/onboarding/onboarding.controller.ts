@@ -35,6 +35,14 @@ export class OnboardingController {
    * POST /onboarding/niche — select professional niche.
    * This is the only required onboarding step; calling it marks onboarding complete.
    */
+    @Post('field')
+  async selectField(
+    @CurrentUser('id') userId: string,
+    @Body('fieldId') fieldId: string,
+  ) {
+    return this.onboardingService.selectNiche(userId, fieldId);
+  }
+
   @Post('niche')
   async selectNiche(
     @CurrentUser('id') userId: string,
