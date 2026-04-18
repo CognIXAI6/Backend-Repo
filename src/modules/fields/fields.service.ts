@@ -159,15 +159,29 @@ export class FieldsService {
 
   async getUserFields(userId: string) {
     return this.knex('user_fields')
-      .select('user_fields.*', 'fields.name', 'fields.slug', 'fields.requires_verification')
-      .join('fields', 'user_fields.field_id', 'fields.id')
+      .select(
+        'user_fields.*',
+        this.knex.raw(`COALESCE(fields.name, custom_fields.name) AS name`),
+        this.knex.raw(`COALESCE(fields.slug, '') AS slug`),
+        this.knex.raw(`COALESCE(fields.requires_verification, false) AS requires_verification`),
+        this.knex.raw(`CASE WHEN user_fields.custom_field_id IS NOT NULL THEN true ELSE false END AS is_custom`),
+      )
+      .leftJoin('fields', 'user_fields.field_id', 'fields.id')
+      .leftJoin('custom_fields', 'user_fields.custom_field_id', 'custom_fields.id')
       .where('user_fields.user_id', userId);
   }
 
   async getUserPrimaryField(userId: string) {
     return this.knex('user_fields')
-      .select('user_fields.*', 'fields.*')
-      .join('fields', 'user_fields.field_id', 'fields.id')
+      .select(
+        'user_fields.*',
+        this.knex.raw(`COALESCE(fields.name, custom_fields.name) AS name`),
+        this.knex.raw(`COALESCE(fields.slug, '') AS slug`),
+        this.knex.raw(`COALESCE(fields.requires_verification, false) AS requires_verification`),
+        this.knex.raw(`CASE WHEN user_fields.custom_field_id IS NOT NULL THEN true ELSE false END AS is_custom`),
+      )
+      .leftJoin('fields', 'user_fields.field_id', 'fields.id')
+      .leftJoin('custom_fields', 'user_fields.custom_field_id', 'custom_fields.id')
       .where('user_fields.user_id', userId)
       .andWhere('user_fields.is_primary', true)
       .first();
