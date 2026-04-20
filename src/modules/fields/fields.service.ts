@@ -118,44 +118,65 @@ export class FieldsService {
     return this.knex('custom_fields').where('user_id', userId);
   }
 
- async assignFieldToUser(userId: string, fieldId: string, isPrimary = false, isCustom = false) {
-  return this.knex.transaction(async (trx) => {
-    // If setting as primary, unset other primary fields
-    if (isPrimary) {
-      await trx('user_fields')
-        .where('user_id', userId)
-        .update({ is_primary: false });
+ async assignFieldToUser(userId: string, fieldId: string, isPrimary = false, isCustom?: boolean) {
+    // Auto-detect field type if isCustom not explicitly provided
+    let resolvedIsCustom = isCustom;
+    if (resolvedIsCustom === undefined) {
+      const systemField = await this.knex('fields').where('id', fieldId).first();
+      if (systemField) {
+        resolvedIsCustom = false;
+      } else {
+        const customField = await this.knex('custom_fields')
+          .where('id', fieldId)
+          .andWhere('user_id', userId)
+          .first();
+        if (customField) {
+          resolvedIsCustom = true;
+        } else {
+          throw new BadRequestException('Field not found');
+        }
+      }
     }
 
-    // Build the where clause based on field type
-    const fieldWhere = isCustom
-      ? { user_id: userId, custom_field_id: fieldId }
-      : { user_id: userId, field_id: fieldId };
+    try {
+      return await this.knex.transaction(async (trx) => {
+        if (isPrimary) {
+          await trx('user_fields')
+            .where('user_id', userId)
+            .update({ is_primary: false });
+        }
 
-    // Check if already assigned
-    const existing = await trx('user_fields')
-      .where(fieldWhere)
-      .first();
+        const fieldWhere = resolvedIsCustom
+          ? { user_id: userId, custom_field_id: fieldId }
+          : { user_id: userId, field_id: fieldId };
 
-    if (existing) {
-      await trx('user_fields')
-        .where('id', existing.id)
-        .update({ is_primary: isPrimary });
-      return existing;
+        const existing = await trx('user_fields').where(fieldWhere).first();
+
+        if (existing) {
+          await trx('user_fields')
+            .where('id', existing.id)
+            .update({ is_primary: isPrimary });
+          return existing;
+        }
+
+        const insertPayload = resolvedIsCustom
+          ? { user_id: userId, custom_field_id: fieldId, is_primary: isPrimary }
+          : { user_id: userId, field_id: fieldId, is_primary: isPrimary };
+
+        const [assignment] = await trx('user_fields')
+          .insert(insertPayload)
+          .returning('*');
+
+        return assignment;
+      });
+    } catch (err: any) {
+      // Translate FK / constraint DB errors into clean client-facing messages
+      if (err instanceof BadRequestException) throw err;
+      if (err?.code === '23503') throw new BadRequestException('Field not found');
+      if (err?.code === '23505') throw new BadRequestException('Field already assigned to user');
+      throw new BadRequestException('Could not assign field. Please try again.');
     }
-
-    // Build insert payload based on field type
-    const insertPayload = isCustom
-      ? { user_id: userId, custom_field_id: fieldId, is_primary: isPrimary }
-      : { user_id: userId, field_id: fieldId, is_primary: isPrimary };
-
-    const [assignment] = await trx('user_fields')
-      .insert(insertPayload)
-      .returning('*');
-
-    return assignment;
-  });
-}
+  }
 
   async getUserFields(userId: string) {
     return this.knex('user_fields')
