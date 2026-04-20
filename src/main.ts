@@ -44,10 +44,20 @@ async function bootstrap() {
   const isProduction = configService.get('app.nodeEnv') === 'production';
 
   // CORS
+  const frontendUrl = configService.get<string>('app.frontendUrl') ?? '';
+  const allowedOrigins: string[] | true = isProduction
+    ? [
+        ...new Set([
+          frontendUrl,
+          frontendUrl.startsWith('https://www.')
+            ? frontendUrl.replace('https://www.', 'https://')
+            : frontendUrl.replace('https://', 'https://www.'),
+        ].filter(Boolean)),
+      ]
+    : true;
+
   app.enableCors({
-    origin: isProduction
-      ? configService.get<string>('app.frontendUrl')
-      : true,
+    origin: allowedOrigins,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
