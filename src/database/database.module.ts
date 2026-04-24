@@ -12,6 +12,8 @@ export const KNEX_CONNECTION = 'KNEX_CONNECTION';
       useFactory: async (configService: ConfigService): Promise<Knex> => {
         const logger = new Logger('DatabaseModule');
         
+        const isProduction = configService.get('app.nodeEnv') === 'production';
+
         const connection = knex({
           client: 'pg',
           connection: {
@@ -20,8 +22,16 @@ export const KNEX_CONNECTION = 'KNEX_CONNECTION';
             database: configService.get('database.name'),
             user: configService.get('database.user'),
             password: configService.get('database.password'),
+            ssl: isProduction ? { rejectUnauthorized: false } : false,
           },
-          pool: { min: 0, max: 10 },
+          pool: {
+            min: 2,
+            max: 50,
+            // Kill idle connections after 30s to avoid stale socket errors
+            idleTimeoutMillis: 30000,
+            // Reap connections that have been checked out for > 60s (hung queries)
+            reapIntervalMillis: 1000,
+          },
           acquireConnectionTimeout: 10000,
         });
 

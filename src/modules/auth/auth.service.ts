@@ -3,6 +3,7 @@ import {
   Inject,
   BadRequestException,
   UnauthorizedException,
+  Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -17,6 +18,7 @@ import { SendOtpDto, VerifyOtpDto, ClerkSyncDto, RefreshTokenDto } from './dto/a
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
   private clerkClient: ReturnType<typeof createClerkClient> | null = null;
   private clerkSecretKey: string | undefined;
 
@@ -60,11 +62,16 @@ export class AuthService {
     });
 
     const existingUser = await this.usersService.findByEmail(email);
-    if (existingUser) {
-      await this.emailService.sendLoginOtpEmail(email, otp, existingUser.name ?? undefined);
-    } else {
-      await this.emailService.sendRegistrationOtpEmail(email, otp);
-    }
+
+    // Send email in the background — do not await so the client gets an
+    // immediate response. The OTP is already persisted in the DB.
+    const emailPromise = existingUser
+      ? this.emailService.sendLoginOtpEmail(email, otp, existingUser.name ?? undefined)
+      : this.emailService.sendRegistrationOtpEmail(email, otp);
+
+    emailPromise.catch((err) =>
+      this.logger.error(`Failed to send OTP email to ${email}:`, err),
+    );
 
     return {
       message: 'A 6-digit verification code has been sent to your email.',
