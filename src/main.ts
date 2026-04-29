@@ -41,20 +41,18 @@ async function bootstrap() {
   const port = configService.get('app.port');
   const apiPrefix = configService.get('app.apiPrefix');
   const apiVersion = configService.get('app.apiVersion');
-  const isProduction = configService.get('app.nodeEnv') === 'production';
-
   // CORS
   const frontendUrl = configService.get<string>('app.frontendUrl') ?? '';
-  const allowedOrigins: string[] | true = isProduction
-    ? [
-        ...new Set([
-          frontendUrl,
-          frontendUrl.startsWith('https://www.')
-            ? frontendUrl.replace('https://www.', 'https://')
-            : frontendUrl.replace('https://', 'https://www.'),
-        ].filter(Boolean)),
-      ]
-    : true;
+  const allowedOrigins: string[] = [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    ...new Set([
+      frontendUrl,
+      frontendUrl.startsWith('https://www.')
+        ? frontendUrl.replace('https://www.', 'https://')
+        : frontendUrl.replace('https://', 'https://www.'),
+    ].filter(Boolean)),
+  ];
 
   app.enableCors({
     origin: allowedOrigins,
