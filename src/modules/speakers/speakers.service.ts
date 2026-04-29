@@ -37,12 +37,21 @@ export class SpeakersService {
   //   return speaker;
   // }
 
-   async createSpeaker(
+  async createSpeaker(
     userId: string,
     name: string,
     isOwner = false,
     file?: Express.Multer.File,
   ): Promise<Speaker> {
+    // Prevent duplicate speakers with the same name for the same user
+    const existing = await this.knex('speakers')
+      .where('user_id', userId)
+      .whereRaw('LOWER(name) = LOWER(?)', [name.trim()])
+      .andWhere('is_owner', isOwner)
+      .first();
+
+    if (existing) return existing;
+
     let avatarUrl: string | undefined;
 
     if (file) {
@@ -57,9 +66,9 @@ export class SpeakersService {
     const [speaker] = await this.knex('speakers')
       .insert({
         user_id: userId,
-        name,
+        name: name.trim(),
         is_owner: isOwner,
-        avatar_url: avatarUrl,
+        avatar_url: avatarUrl ?? null,
       })
       .returning('*');
 

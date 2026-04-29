@@ -106,10 +106,17 @@ export class OnboardingService {
 
     const created: { name: string; id: string }[] = [];
 
-    for (const name of additionalSpeakers ?? []) {
-      const trimmed = name?.trim();
-      if (!trimmed) continue;
-      const speaker = await this.speakersService.createSpeaker(userId, trimmed, false);
+    // Deduplicate the incoming list (case-insensitive) before touching the DB
+    const seen = new Set<string>();
+    const uniqueNames = (additionalSpeakers ?? []).filter((name) => {
+      const key = name?.trim().toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    for (const name of uniqueNames) {
+      const speaker = await this.speakersService.createSpeaker(userId, name.trim(), false);
       created.push({ name: speaker.name, id: speaker.id });
     }
 
