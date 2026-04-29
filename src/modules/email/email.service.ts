@@ -214,6 +214,21 @@ async sendEmail(options: EmailOptions): Promise<void> {
     });
   }
 
+  async sendAdminAlert(subject: string, body: string): Promise<void> {
+    const adminEmail = 'cognixai6@gmail.com';
+    await this.sendEmail({
+      to: adminEmail,
+      subject: `[CognIX Alert] ${subject}`,
+      html: `
+        <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
+          <h2 style="color: #dc2626;">⚠️ CognIX System Alert</h2>
+          <pre style="background:#f4f4f4;padding:16px;border-radius:6px;font-size:13px;white-space:pre-wrap;">${body}</pre>
+          <p style="color:#666;font-size:12px;margin-top:20px;">Sent automatically by CognIX API — ${new Date().toISOString()}</p>
+        </div>
+      `,
+    });
+  }
+
   async sendPasswordResetOtpEmail(email: string, otp: string): Promise<void> {
     await this.sendEmail({
       to: email,

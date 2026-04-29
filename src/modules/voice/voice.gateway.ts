@@ -19,6 +19,7 @@ import { ClaudeService } from './services/claude.service';
 import { ConversationService, ConversationMode } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { UsersService } from '@/modules/users/users.service';
+import { EmailService } from '@/modules/email/email.service';
 import { FieldsService } from '@/modules/fields/fields.service';
 
 // ─── Per-socket session state ─────────────────────────────────────────────────
@@ -114,9 +115,37 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly guestSessionService: GuestSessionService,
     private readonly usersService: UsersService,
     private readonly fieldsService: FieldsService,
+    private readonly emailService: EmailService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
   ) {}
+
+  /**
+   * Classifies an AI error, notifies admins if it's a billing/critical issue,
+   * and always returns a safe client-facing message — never the raw API error.
+   */
+  private handleAiError(client: Socket, err: Error, context: string): void {
+    const msg = err.message ?? '';
+    const isBilling = /balance|credit|billing|payment|quota/i.test(msg);
+    const isRateLimit = /rate.?limit|too.?many.?request/i.test(msg);
+
+    this.logger.error(`AI error [${context}]: ${msg}`);
+
+    if (isBilling) {
+      this.emailService
+        .sendAdminAlert(
+          'Anthropic API balance too low',
+          `Context: ${context}\nError: ${msg}\nTime: ${new Date().toISOString()}`,
+        )
+        .catch((e) => this.logger.error('Failed to send admin alert email:', e));
+    }
+
+    const clientMessage = isRateLimit
+      ? 'The AI is busy right now. Please try again in a moment.'
+      : 'Something went wrong on our end. Please try again.';
+
+    client.emit('error', { code: 'AI_ERROR', message: clientMessage });
+  }
 
   afterInit(): void {
     this.logger.log('🎙️  VoiceGateway live at ws://…/voice');
@@ -664,8 +693,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         },
 
         onError: (err) => {
-          this.logger.error(`Dual-speaker Claude error [${client.id}]: ${err.message}`);
-          client.emit('error', { code: 'AI_ERROR', message: err.message });
+          this.handleAiError(client, err, `dual-speaker [${client.id}]`);
           session.isProcessingAI = false;
         },
       });
@@ -796,8 +824,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           },
 
           onError: (err: Error) => {
-            this.logger.error(`Claude error [${client.id}]: ${err.message}`);
-            client.emit('error', { code: 'AI_ERROR', message: err.message });
+            this.handleAiError(client, err, `single-speaker [${client.id}]`);
             session.isProcessingAI = false;
           },
         },

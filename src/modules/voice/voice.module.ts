@@ -12,12 +12,14 @@ import { voiceConfig } from '@/config/voice.config';
 import { VoiceService } from './services/voice.service';
 import { UsersModule } from '@/modules/users/users.module';
 import { FieldsModule } from '@/modules/fields/fields.module';
+import { EmailModule } from '@/modules/email/email.module';
 
 @Module({
   imports: [
     ConfigModule.forFeature(voiceConfig),
     UsersModule,
     FieldsModule,
+    EmailModule,
     JwtModule.registerAsync({
       useFactory: (configService: ConfigService) => ({
         secret: configService.get('jwt.secret'),
