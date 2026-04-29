@@ -400,6 +400,31 @@ Your job is to give the OWNER a brief, actionable insight — something they sho
 ${fieldBlock}${memoryBlock}`;
   }
 
+  /**
+   * Generates a short, descriptive conversation title (4–7 words) from the
+   * first user prompt and the first AI insight. Called once after the first
+   * AI response, fire-and-forget.
+   */
+  async generateConversationTitle(
+    userPrompt: string,
+    aiResponse: string,
+    fieldName?: string,
+  ): Promise<string> {
+    const response = await this.client.messages.create({
+      model: 'claude-haiku-4-5-20251001', // fast + cheap for a title
+      max_tokens: 20,
+      system: 'You generate short conversation titles. Output ONLY the title — no quotes, no explanation, no punctuation at the end. Max 7 words.',
+      messages: [
+        {
+          role: 'user',
+          content: `Generate a title for this conversation${fieldName ? ` (context: ${fieldName})` : ''}.\nUser said: "${userPrompt.slice(0, 200)}"\nAI responded about: "${aiResponse.slice(0, 200)}"`,
+        },
+      ],
+    });
+    const block = response.content[0];
+    return block.type === 'text' ? block.text.trim() : userPrompt.slice(0, 50);
+  }
+
   async summarizeConversationForMemory(
     conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>,
     existingMemory: string | null,

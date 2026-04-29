@@ -94,30 +94,27 @@ export class ConversationService {
       })
       .returning('*');
 
-    // Update conversation metadata in parallel
-    await Promise.all([
-      this.knex('conversations').where('id', dto.conversationId).increment('total_messages', 1),
-      this.knex('conversations')
-        .where('id', dto.conversationId)
-        .update({ last_activity_at: new Date(), updated_at: new Date() }),
-    ]);
-
-    // Auto-title from first user message
-    if (dto.role === 'user') {
-      const conv = await this.knex('conversations')
-        .where('id', dto.conversationId)
-        .whereNull('title')
-        .first();
-
-      if (conv && dto.content.length > 0) {
-        const autoTitle = dto.content.slice(0, 60) + (dto.content.length > 60 ? '...' : '');
-        await this.knex('conversations')
-          .where('id', dto.conversationId)
-          .update({ title: autoTitle });
-      }
-    }
+    // Single atomic update: increment message count + timestamps in one query
+    await this.knex('conversations')
+      .where('id', dto.conversationId)
+      .update({
+        total_messages: this.knex.raw('total_messages + 1'),
+        last_activity_at: new Date(),
+        updated_at: new Date(),
+      });
 
     return message;
+  }
+
+  /**
+   * Sets an AI-generated title on the conversation.
+   * Called once after the first AI response — fire-and-forget from the gateway.
+   */
+  async setTitle(conversationId: string, title: string): Promise<void> {
+    await this.knex('conversations')
+      .where('id', conversationId)
+      .whereNull('title')
+      .update({ title, updated_at: new Date() });
   }
 
   // ── Get paginated history list ──────────────────────────────────────────────

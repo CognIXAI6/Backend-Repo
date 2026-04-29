@@ -36,6 +36,7 @@ import { OnboardingModule } from './modules/onboarding/onboarding.module';
 import { HealthModule } from './modules/health/health.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { ResourcesModule } from './modules/resources/resources.module';
+import { ConversationsModule } from './modules/conversations/conversations.module';
 
 @Module({
   imports: [
@@ -67,6 +68,7 @@ import { ResourcesModule } from './modules/resources/resources.module';
     HealthModule,
     SettingsModule,
     ResourcesModule,
+    ConversationsModule,
   ],
   providers: [
     {

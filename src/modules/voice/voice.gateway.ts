@@ -19,6 +19,7 @@ import { ClaudeService } from './services/claude.service';
 import { ConversationService, ConversationMode } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { UsersService } from '@/modules/users/users.service';
+import { FieldsService } from '@/modules/fields/fields.service';
 
 // ─── Per-socket session state ─────────────────────────────────────────────────
 
@@ -112,6 +113,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly conversationService: ConversationService,
     private readonly guestSessionService: GuestSessionService,
     private readonly usersService: UsersService,
+    private readonly fieldsService: FieldsService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
   ) {}
@@ -203,13 +205,27 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         return;
       }
 
+      // ── Resolve field context ─────────────────────────────────────────────
+      // If the client didn't send fieldId/fieldName, look up the user's
+      // primary field automatically so it's always saved on the conversation.
+      let resolvedFieldId = payload.fieldId;
+      let resolvedFieldName = payload.fieldName;
+
+      if (!isGuest && (!resolvedFieldId || !resolvedFieldName)) {
+        const primaryField = await this.fieldsService.getUserPrimaryField(userId);
+        if (primaryField) {
+          resolvedFieldId = resolvedFieldId ?? (primaryField.field_id ?? primaryField.custom_field_id ?? primaryField.id);
+          resolvedFieldName = resolvedFieldName ?? primaryField.name;
+        }
+      }
+
       // ── Create or resume conversation ─────────────────────────────────────
       let conversationId = payload.conversationId;
       if (!conversationId) {
         const conv = await this.conversationService.createConversation(
           userId,
           payload.mode ?? 'single',
-          payload.fieldId,
+          resolvedFieldId,
         );
         conversationId = conv.id;
       }
@@ -224,7 +240,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const session: ActiveSession = {
         userId,
         conversationId,
-        fieldName: payload.fieldName,
+        fieldName: resolvedFieldName,
         isGuest,
         guestSessionId,
         deepgramEmitter: emitter,
@@ -633,6 +649,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             latencyMs: Date.now() - aiStartTime,
           });
 
+          // Generate AI title after first exchange (fire-and-forget)
+          this.claudeService
+            .generateConversationTitle(otherPersonText, fullText, session.fieldName)
+            .then((title) => this.conversationService.setTitle(session.conversationId, title))
+            .catch((err) => this.logger.error('Dual-speaker title generation failed:', err));
+
           client.emit('ai:done', {
             response: fullText,
             tokensUsed: inputTokens + outputTokens,
@@ -739,6 +761,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               tokensUsed: inputTokens + outputTokens,
               latencyMs: Date.now() - aiStartTime,
             });
+
+            // 5. Generate AI title after the first exchange (fire-and-forget)
+            this.claudeService
+              .generateConversationTitle(userMessage, fullText, session.fieldName)
+              .then((title) => this.conversationService.setTitle(session.conversationId, title))
+              .catch((err) => this.logger.error('Title generation failed:', err));
 
             // 5. Increment guest prompt count and emit updated status
             if (session.isGuest && session.guestSessionId) {
