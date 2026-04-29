@@ -265,16 +265,45 @@ When your response references external content (articles, documents, verses, pap
       ? `\n\nThe user is a professional in the field of: ${fieldName}.
 Tailor your responses to be relevant to their professional context.
 
-## Field relevance gate — STRICTLY ENFORCE
-Only respond to messages that are relevant to the field of "${fieldName}" or general professional productivity (scheduling, summarising, research, communication).
-If the user's message is clearly outside that field, do NOT answer it. Instead, respond with exactly:
-"That's outside your selected field (${fieldName}). I'm here to help with topics relevant to your profession. Try asking something related to ${fieldName}."
-Do not add anything else when rejecting — just that message.
+## Field relevance guidance
+Your primary focus is helping this user with topics relevant to "${fieldName}" and adjacent professional areas.
+${this.getFieldBreadthNote(fieldName)}
+
+Only decline a request if it is clearly recreational or personal with zero professional relevance (e.g. movie recommendations, sports gossip, personal relationships). In that case respond with:
+"I'm focused on helping you professionally. Try asking something related to your work or industry."
+
+When in doubt — answer. A Business professional asking about engineering, construction, law, or finance is almost certainly asking in a professional context. Adjacency to their field is not a reason to decline.
 
 ${this.getFieldLinkGuide(fieldName)}`
       : '';
 
     return basePrompt + fieldContext + memoryBlock;
+  }
+
+  private getFieldBreadthNote(fieldName: string): string {
+    const field = fieldName.toLowerCase();
+
+    if (this.matchesField(field, ['business', 'entrepreneur', 'startup', 'executive', 'management', 'ceo', 'coo', 'cfo'])) {
+      return 'Business is a broad field. Topics like engineering, construction, finance, law, HR, supply chain, real estate, technology, and any industry vertical are ALL within scope — a business professional operates across all of them.';
+    }
+
+    if (this.matchesField(field, ['doctor', 'physician', 'medical', 'medicine', 'healthcare', 'nurse', 'clinical'])) {
+      return 'Healthcare professionals routinely deal with pharmacology, research, administration, insurance, and patient communication — all are in scope.';
+    }
+
+    if (this.matchesField(field, ['lawyer', 'attorney', 'legal', 'law', 'counsel', 'barrister', 'solicitor'])) {
+      return 'Legal professionals work across many domains — contracts, real estate, corporate, criminal, family, tax. Any of these are in scope.';
+    }
+
+    if (this.matchesField(field, ['pastor', 'theology', 'church', 'ministry', 'christian', 'bible', 'religion', 'faith'])) {
+      return 'Ministry work involves theology, counselling, community management, finance, and communications. All are in scope.';
+    }
+
+    if (this.matchesField(field, ['developer', 'engineer', 'software', 'programmer', 'coding', 'tech'])) {
+      return 'Engineering and tech professionals often need help with architecture, DevOps, project management, security, and business requirements — all in scope.';
+    }
+
+    return `Adjacent professional topics, research, and productivity tasks related to ${fieldName} are all in scope.`;
   }
 
   private getFieldLinkGuide(fieldName: string): string {
@@ -380,14 +409,19 @@ ${fieldBlock}${memoryBlock}`;
       .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
       .join('\n');
 
+    const FORMAT_RULES = `Output ONLY a bullet list. Max 6 bullets. Each bullet: one short sentence (≤15 words).
+Cover only: names of people/companies mentioned, key decisions made, recurring topics, stated preferences or goals.
+Omit anything vague, obvious, or that won't help in a future conversation.
+No intro sentence. No headers. Just bullets.`;
+
     const prompt = existingMemory
-      ? `You have an existing memory summary about this user:\n${existingMemory}\n\nHere is their latest conversation:\n${historyText}\n\nUpdate the memory summary to incorporate new key facts. Keep it concise (under 200 words). Focus on: preferences, recurring topics, names mentioned, decisions made, professional context.`
-      : `Summarize the key facts from this conversation to remember for future sessions. Keep it under 150 words. Focus on: preferences, recurring topics, names mentioned, decisions made, professional context.\n\nConversation:\n${historyText}`;
+      ? `Existing memory:\n${existingMemory}\n\nNew conversation:\n${historyText}\n\nMerge into an updated bullet list. Remove outdated or contradicted facts. Add new ones. ${FORMAT_RULES}`
+      : `Conversation:\n${historyText}\n\nExtract facts worth remembering. ${FORMAT_RULES}`;
 
     const response = await this.client.messages.create({
       model: this.model,
-      max_tokens: 300,
-      system: `You are a memory system for an AI assistant${fieldName ? ` serving a ${fieldName} professional` : ''}. Extract only facts worth remembering long-term. Be concise.`,
+      max_tokens: 200,
+      system: `You are a memory system for an AI assistant${fieldName ? ` serving a ${fieldName} professional` : ''}. Extract only concrete facts useful in future conversations. Be extremely concise.`,
       messages: [{ role: 'user', content: prompt }],
     });
 

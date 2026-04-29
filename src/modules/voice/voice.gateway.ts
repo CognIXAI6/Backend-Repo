@@ -265,13 +265,24 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             speakerTexts.set(spk, ((speakerTexts.get(spk) ?? '') + ' ' + w.word).trim());
           }
 
-          // ── Calibration: first final transcript identifies the owner ────
-          if (session.calibrationPhase && speakerTexts.size > 0) {
-            const firstSpeaker = words[0]?.speaker ?? 0;
-            session.ownerSpeakerId = firstSpeaker;
+          // ── Calibration: identify the owner as whoever speaks the most
+          // in the first meaningful transcript (≥3 words from one speaker).
+          // Falls back to the first-word speaker if no dominant speaker found.
+          if (session.calibrationPhase && words.length >= 3) {
+            // Count words per speaker to find the dominant voice
+            const wordCounts = new Map<number, number>();
+            for (const w of words) {
+              const spk = w.speaker ?? 0;
+              wordCounts.set(spk, (wordCounts.get(spk) ?? 0) + 1);
+            }
+            const dominantSpeaker = [...wordCounts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+            session.ownerSpeakerId = dominantSpeaker;
             session.calibrationPhase = false;
-            this.logger.log(`[${client.id}] Owner identified as speaker ${firstSpeaker}`);
-            client.emit('calibration:complete', { ownerSpeakerId: firstSpeaker });
+            this.logger.log(`[${client.id}] Owner identified as speaker ${dominantSpeaker} (word counts: ${JSON.stringify(Object.fromEntries(wordCounts))})`);
+            client.emit('calibration:complete', {
+              ownerSpeakerId: dominantSpeaker,
+              message: 'Voice identified. If the labels are wrong, tap "Swap speakers".',
+            });
           }
 
           const ownerSpk = session.ownerSpeakerId ?? 0;
@@ -504,6 +515,50 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     await this.processPrompt(client, session, text, 'text');
+  }
+
+  // ─── session:swap_speakers ───────────────────────────────────────────────────
+  /**
+   * Swaps owner ↔ other labels when calibration assigned them incorrectly.
+   * Safe to call at any point during a dual-speaker session.
+   *
+   * The client sends this when the user says "that's wrong, swap speakers".
+   * After swapping, all future transcripts and the existing dualSpeakerHistory
+   * are relabelled so Claude context stays consistent.
+   */
+  @SubscribeMessage('session:swap_speakers')
+  handleSwapSpeakers(@ConnectedSocket() client: Socket): void {
+    const session = this.sessions.get(client.id);
+    if (!session || !session.isDualSpeaker) {
+      client.emit('error', { code: 'SWAP_INVALID', message: 'Not in dual-speaker mode' });
+      return;
+    }
+
+    // Flip the ownerSpeakerId (0 → 1 or 1 → 0)
+    if (session.ownerSpeakerId === null) {
+      client.emit('error', { code: 'SWAP_INVALID', message: 'Calibration not complete yet' });
+      return;
+    }
+
+    session.ownerSpeakerId = session.ownerSpeakerId === 0 ? 1 : 0;
+
+    // Relabel the existing history so Claude context is consistent
+    session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
+      ...turn,
+      speaker: turn.speaker === 'owner' ? 'other' : 'owner',
+    }));
+
+    // Swap the accumulated pendingOtherText (it was from the wrong speaker)
+    // We can't undo already-sent prompts but we can reset pending state
+    session.pendingOtherText = '';
+
+    this.logger.log(`[${client.id}] Speakers swapped — owner is now speaker ${session.ownerSpeakerId}`);
+
+    client.emit('calibration:complete', {
+      ownerSpeakerId: session.ownerSpeakerId,
+      swapped: true,
+      message: 'Speaker labels swapped. Your voice is now labelled as Owner.',
+    });
   }
 
   // ─── session:end ─────────────────────────────────────────────────────────────
