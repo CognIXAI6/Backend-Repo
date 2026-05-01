@@ -55,6 +55,10 @@ interface ActiveSession {
   dualSpeakerHistory: DualSpeakerTurn[];
   /** Other person's words accumulated since last Claude trigger */
   pendingOtherText: string;
+  /** Debounce timer — Claude fires only after this much silence (ms) */
+  utteranceDebounceMs: number;
+  /** Active debounce timeout handle — reset on every new utteranceEnd */
+  utteranceDebounceTimer: ReturnType<typeof setTimeout> | null;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
@@ -283,6 +287,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         calibrationPhase: isDualSpeaker,
         dualSpeakerHistory: [],
         pendingOtherText: '',
+        utteranceDebounceMs: 10_000,
+        utteranceDebounceTimer: null,
       };
 
       // Forward Deepgram transcript events → client
@@ -367,55 +373,69 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         });
       });
 
-      // Auto-trigger Claude after 1s of silence (utteranceEnd) — no mic release needed
-      emitter.on('utteranceEnd', async () => {
+      // ── Debounced Claude trigger ───────────────────────────────────────────
+      // Each utteranceEnd resets the timer. Claude only fires after
+      // `utteranceDebounceMs` of continuous silence — giving the conversation
+      // time to accumulate enough context before generating an insight.
+      emitter.on('utteranceEnd', () => {
         if (session.isProcessingAI) return;
 
-        // ── Dual-speaker: trigger only when other person spoke ────────────
-        if (session.isDualSpeaker) {
-          if (session.calibrationPhase) return; // wait until owner is identified
-          const otherText = session.pendingOtherText.trim();
-          if (!otherText) return;
-
-          session.pendingOtherText = '';
-          await this.processDualSpeakerPrompt(client, session, otherText);
-          return;
+        // Clear any previously scheduled trigger
+        if (session.utteranceDebounceTimer) {
+          clearTimeout(session.utteranceDebounceTimer);
+          session.utteranceDebounceTimer = null;
         }
 
-        // ── Single-speaker path ───────────────────────────────────────────
-        const transcript = session.accumulatedTranscript.trim();
-        if (!transcript) return;
+        session.utteranceDebounceTimer = setTimeout(async () => {
+          session.utteranceDebounceTimer = null;
+          if (session.isProcessingAI) return;
 
-        const confidences = [...session.transcriptConfidences];
-        session.accumulatedTranscript = '';
-        session.transcriptConfidences = [];
+          // ── Dual-speaker: trigger only when other person spoke ──────────
+          if (session.isDualSpeaker) {
+            if (session.calibrationPhase) return;
+            const otherText = session.pendingOtherText.trim();
+            if (!otherText) return;
 
-        const avgConfidence =
-          confidences.length > 0
-            ? confidences.reduce((a, b) => a + b, 0) / confidences.length
-            : 1.0;
-
-        const quality = this.isTranscriptMeaningful(transcript, avgConfidence);
-        if (!quality.pass) {
-          this.logger.log(`UtteranceEnd filtered [${quality.reason}]: "${transcript}" (conf=${avgConfidence.toFixed(2)})`);
-          client.emit('ai:skipped', { reason: quality.reason, transcript });
-          return;
-        }
-
-        if (session.isGuest && session.guestSessionId) {
-          const canSend = await this.guestSessionService.canSendPrompt(session.guestSessionId);
-          if (!canSend) {
-            const status = await this.guestSessionService.getPromptStatus(session.guestSessionId);
-            client.emit('guest:limit_reached', {
-              message: 'You have used all 5 free prompts. Sign up to continue.',
-              used: status.used,
-              limit: status.limit,
-            });
+            session.pendingOtherText = '';
+            await this.processDualSpeakerPrompt(client, session, otherText);
             return;
           }
-        }
 
-        await this.processPrompt(client, session, transcript, 'voice');
+          // ── Single-speaker path ─────────────────────────────────────────
+          const transcript = session.accumulatedTranscript.trim();
+          if (!transcript) return;
+
+          const confidences = [...session.transcriptConfidences];
+          session.accumulatedTranscript = '';
+          session.transcriptConfidences = [];
+
+          const avgConfidence =
+            confidences.length > 0
+              ? confidences.reduce((a, b) => a + b, 0) / confidences.length
+              : 1.0;
+
+          const quality = this.isTranscriptMeaningful(transcript, avgConfidence);
+          if (!quality.pass) {
+            this.logger.log(`UtteranceEnd filtered [${quality.reason}]: "${transcript}" (conf=${avgConfidence.toFixed(2)})`);
+            client.emit('ai:skipped', { reason: quality.reason, transcript });
+            return;
+          }
+
+          if (session.isGuest && session.guestSessionId) {
+            const canSend = await this.guestSessionService.canSendPrompt(session.guestSessionId);
+            if (!canSend) {
+              const status = await this.guestSessionService.getPromptStatus(session.guestSessionId);
+              client.emit('guest:limit_reached', {
+                message: 'You have used all 5 free prompts. Sign up to continue.',
+                used: status.used,
+                limit: status.limit,
+              });
+              return;
+            }
+          }
+
+          await this.processPrompt(client, session, transcript, 'voice');
+        }, session.utteranceDebounceMs);
       });
 
       emitter.on('error', (err: Error) => {
@@ -840,6 +860,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private cleanupSession(socketId: string): void {
     const session = this.sessions.get(socketId);
     if (session) {
+      // Cancel any pending debounce timer so Claude doesn't fire after disconnect
+      if (session.utteranceDebounceTimer) {
+        clearTimeout(session.utteranceDebounceTimer);
+        session.utteranceDebounceTimer = null;
+      }
       session.closeDeepgram();
       session.deepgramEmitter.removeAllListeners();
       this.sessions.delete(socketId);

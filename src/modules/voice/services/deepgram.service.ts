@@ -74,7 +74,7 @@ export class DeepgramService implements OnModuleInit {
       language:         'en-US',
       smart_format:     'true',
       interim_results:  'true',
-      utterance_end_ms: '1000',
+      utterance_end_ms: '3000',
       vad_events:       'true',
       // Enable speaker diarization when requested (dual-speaker mode)
       ...(options?.diarize ? { diarize: 'true' } : {}),
