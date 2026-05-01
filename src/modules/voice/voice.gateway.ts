@@ -21,6 +21,7 @@ import { GuestSessionService } from './services/guest-session.service';
 import { UsersService } from '@/modules/users/users.service';
 import { EmailService } from '@/modules/email/email.service';
 import { FieldsService } from '@/modules/fields/fields.service';
+import { ErrorLogService } from '@/modules/error-log/error-log.service';
 
 // ─── Per-socket session state ─────────────────────────────────────────────────
 
@@ -120,6 +121,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly usersService: UsersService,
     private readonly fieldsService: FieldsService,
     private readonly emailService: EmailService,
+    private readonly errorLogService: ErrorLogService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
   ) {}
@@ -128,12 +130,36 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * Classifies an AI error, notifies admins if it's a billing/critical issue,
    * and always returns a safe client-facing message — never the raw API error.
    */
+  /**
+   * Central error emitter — logs internally, sends a safe message to the client.
+   * Raw technical errors are NEVER forwarded to the frontend.
+   */
+  private emitError(
+    client: Socket,
+    code: string,
+    internalMessage: string,
+    opts: { clientMessage?: string; severity?: 'info' | 'warn' | 'error' | 'critical'; context?: Record<string, unknown> } = {},
+  ): void {
+    const severity = opts.severity ?? 'error';
+    const clientMessage = opts.clientMessage ?? 'Something went wrong. Please try again.';
+
+    this.logger.error(`[${code}] ${internalMessage}`);
+
+    this.errorLogService.log({
+      source: 'voice_gateway',
+      code,
+      message: internalMessage,
+      severity,
+      context: { socketId: client.id, ...opts.context },
+    });
+
+    client.emit('error', { code, message: clientMessage });
+  }
+
   private handleAiError(client: Socket, err: Error, context: string): void {
     const msg = err.message ?? '';
     const isBilling = /balance|credit|billing|payment|quota/i.test(msg);
     const isRateLimit = /rate.?limit|too.?many.?request/i.test(msg);
-
-    this.logger.error(`AI error [${context}]: ${msg}`);
 
     if (isBilling) {
       this.emailService
@@ -148,7 +174,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       ? 'The AI is busy right now. Please try again in a moment.'
       : 'Something went wrong on our end. Please try again.';
 
-    client.emit('error', { code: 'AI_ERROR', message: clientMessage });
+    this.emitError(client, 'AI_ERROR', msg, {
+      clientMessage,
+      severity: isBilling ? 'critical' : 'error',
+      context: { aiContext: context },
+    });
   }
 
   afterInit(): void {
@@ -205,7 +235,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           userId = decoded.sub;
           isGuest = false;
         } catch {
-          client.emit('error', { code: 'INVALID_TOKEN', message: 'Access token is invalid or expired' });
+          this.emitError(client, 'INVALID_TOKEN', 'JWT verification failed', { clientMessage: 'Your session has expired. Please log in again.', severity: 'warn' });
           return;
         }
       } else if (payload.guestSessionId) {
@@ -234,7 +264,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           return;
         }
       } else {
-        client.emit('error', { code: 'AUTH_REQUIRED', message: 'Provide accessToken or guestSessionId' });
+        this.emitError(client, 'AUTH_REQUIRED', 'session:start called with no auth credentials', { clientMessage: 'Authentication required. Please sign in and try again.', severity: 'warn' });
         return;
       }
 
@@ -439,7 +469,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
 
       emitter.on('error', (err: Error) => {
-        client.emit('error', { code: 'DEEPGRAM_ERROR', message: err.message });
+        this.emitError(client, 'DEEPGRAM_ERROR', err.message, { clientMessage: 'Voice connection interrupted. Please try again.' });
       });
 
       this.sessions.set(client.id, session);
@@ -459,7 +489,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
     } catch (err) {
       this.logger.error('session:start failed', err);
-      client.emit('error', { code: 'SESSION_START_FAILED', message: (err as Error).message });
+      this.emitError(client, 'SESSION_START_FAILED', (err as Error).message, { clientMessage: 'Failed to start session. Please refresh and try again.' });
     }
   }
 
@@ -471,7 +501,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   ): void {
     const session = this.sessions.get(client.id);
     if (!session) {
-      client.emit('error', { code: 'NO_SESSION', message: 'Call session:start first' });
+      this.emitError(client, 'NO_SESSION', 'audio/text sent before session:start', { clientMessage: 'Session not ready. Please wait a moment and try again.', severity: 'warn' });
       return;
     }
 
@@ -550,7 +580,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   ): Promise<void> {
     const session = this.sessions.get(client.id);
     if (!session) {
-      client.emit('error', { code: 'NO_SESSION', message: 'Call session:start first' });
+      this.emitError(client, 'NO_SESSION', 'audio/text sent before session:start', { clientMessage: 'Session not ready. Please wait a moment and try again.', severity: 'warn' });
       return;
     }
 
@@ -595,13 +625,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   handleSwapSpeakers(@ConnectedSocket() client: Socket): void {
     const session = this.sessions.get(client.id);
     if (!session || !session.isDualSpeaker) {
-      client.emit('error', { code: 'SWAP_INVALID', message: 'Not in dual-speaker mode' });
+      this.emitError(client, 'SWAP_INVALID', 'swap_speakers called outside dual-speaker mode', { clientMessage: 'Speaker swap is only available in dual-speaker mode.', severity: 'warn' });
       return;
     }
 
     // Flip the ownerSpeakerId (0 → 1 or 1 → 0)
     if (session.ownerSpeakerId === null) {
-      client.emit('error', { code: 'SWAP_INVALID', message: 'Calibration not complete yet' });
+      this.emitError(client, 'SWAP_INVALID', 'swap_speakers called before calibration complete', { clientMessage: 'Please say a phrase first so we can identify your voice, then swap.', severity: 'warn' });
       return;
     }
 
@@ -719,7 +749,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
     } catch (err) {
       this.logger.error('processDualSpeakerPrompt error:', err);
-      client.emit('error', { code: 'PROCESSING_FAILED', message: (err as Error).message });
+      this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
       session.isProcessingAI = false;
     }
   }
@@ -851,7 +881,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
     } catch (err) {
       this.logger.error('processPrompt error:', err);
-      client.emit('error', { code: 'PROCESSING_FAILED', message: (err as Error).message });
+      this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
       session.isProcessingAI = false;
     }
   }

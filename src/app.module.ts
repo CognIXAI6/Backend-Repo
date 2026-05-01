@@ -37,6 +37,7 @@ import { HealthModule } from './modules/health/health.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { ResourcesModule } from './modules/resources/resources.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
+import { ErrorLogModule } from './modules/error-log/error-log.module';
 
 @Module({
   imports: [
@@ -69,6 +70,7 @@ import { ConversationsModule } from './modules/conversations/conversations.modul
     SettingsModule,
     ResourcesModule,
     ConversationsModule,
+    ErrorLogModule,
   ],
   providers: [
     {
