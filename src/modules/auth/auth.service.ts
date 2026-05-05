@@ -117,29 +117,43 @@ export class AuthService {
 
     if (!user) {
       // New user — create account
-      user = await this.knex.transaction(async (trx) => {
-        const [newUser] = await trx('users')
-          .insert({
-            email,
-            password: null,
-            auth_provider: 'email_otp',
-            email_verified: true,
-            // Niche provided at signup → onboarding is done immediately
-            onboarding_status: resolvedNicheId ? 'completed' : 'in_progress',
-          })
-          .returning('*');
+      try {
+        user = await this.knex.transaction(async (trx) => {
+          const [newUser] = await trx('users')
+            .insert({
+              email,
+              password: null,
+              auth_provider: 'email_otp',
+              email_verified: true,
+              // Niche provided at signup → onboarding is done immediately
+              onboarding_status: resolvedNicheId ? 'completed' : 'in_progress',
+            })
+            .returning('*');
 
-        if (resolvedNicheId) {
-          await trx('user_fields').insert({
-            user_id: newUser.id,
-            field_id: resolvedNicheId,
-            is_primary: true,
-          });
+          if (resolvedNicheId) {
+            await trx('user_fields').insert({
+              user_id: newUser.id,
+              field_id: resolvedNicheId,
+              is_primary: true,
+            });
+          }
+
+          return newUser;
+        });
+      } catch (err: any) {
+        // Race condition: another request created this user between our findByEmail
+        // check and this INSERT (e.g. double-submit). Recover by fetching the existing row.
+        if (err?.code === '23505') {
+          user = await this.usersService.findByEmail(email);
+          if (!user) throw err;
+        } else {
+          throw err;
         }
+      }
+    }
 
-        return newUser;
-      });
-    } else {
+    // Re-enter the returning-user branch if we recovered from a race condition above
+    if (user) {
       // Returning user — ensure email is verified
       if (!user.email_verified) {
         await this.usersService.update(user.id, { email_verified: true });
