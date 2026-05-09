@@ -18,6 +18,8 @@ export interface User {
   voice_sample_completed_at: Date | null;
   ai_memory: string | null;
   ai_memory_updated_at: Date | null;
+  voice_speaker_id: string | null;
+  voice_embedding_id: string | null;
   deleted_at: Date | null;
   created_at: Date;
   updated_at: Date;
@@ -46,6 +48,8 @@ export interface UpdateUserDto {
   auth_provider?: 'email_otp' | 'clerk_oauth' | 'password';
   ai_memory?: string | null;
   ai_memory_updated_at?: Date | null;
+  voice_speaker_id?: string | null;
+  voice_embedding_id?: string | null;
 }
 
 @Injectable()

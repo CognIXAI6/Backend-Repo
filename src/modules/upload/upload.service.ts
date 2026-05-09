@@ -106,6 +106,53 @@ export class UploadService {
     }
   }
 
+  /**
+   * Upload a raw Buffer to Cloudinary without a Multer file.
+   * Used internally (e.g. voice calibration audio captured from the live stream).
+   */
+  async uploadBuffer(
+    buffer: Buffer,
+    folder: UploadFolder,
+    filename: string,
+    resourceType: 'image' | 'video' | 'raw' | 'auto' = 'video',
+  ): Promise<UploadApiResponse> {
+    if (!buffer || buffer.length === 0) {
+      throw new BadRequestException('Empty buffer provided');
+    }
+
+    this.logger.log(`Uploading buffer: ${filename}, size: ${buffer.length} bytes`);
+
+    return new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          folder,
+          resource_type: resourceType,
+          public_id: `${Date.now()}-${filename}`,
+        },
+        (error, result) => {
+          if (error) {
+            this.logger.error('Cloudinary buffer upload error:', error.message);
+            reject(new BadRequestException(`Buffer upload failed: ${error.message}`));
+            return;
+          }
+          if (!result) {
+            reject(new BadRequestException('No result from Cloudinary'));
+            return;
+          }
+          this.logger.log(`Buffer upload successful: ${result.secure_url}`);
+          resolve(result);
+        },
+      );
+
+      uploadStream.on('error', (streamError) => {
+        this.logger.error('Upload stream error:', streamError);
+        reject(new BadRequestException('Upload stream error'));
+      });
+
+      uploadStream.end(buffer);
+    });
+  }
+
   async deleteFile(publicId: string): Promise<void> {
     try {
       await cloudinary.uploader.destroy(publicId);

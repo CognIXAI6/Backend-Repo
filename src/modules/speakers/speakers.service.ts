@@ -9,6 +9,8 @@ export interface Speaker {
   name: string;
   avatar_url: string | null;
   is_owner: boolean;
+  voice_speaker_id: string | null;
+  voice_embedding_id: string | null;
   created_at: Date;
 }
 
@@ -183,6 +185,18 @@ export class SpeakersService {
       .first();
 
     return Number(result?.count || 0);
+  }
+
+  async setVoiceProfile(
+    speakerId: string,
+    voiceSpeakerId: string,
+    voiceEmbeddingId: string,
+  ): Promise<Speaker> {
+    const [updated] = await this.knex('speakers')
+      .where('id', speakerId)
+      .update({ voice_speaker_id: voiceSpeakerId, voice_embedding_id: voiceEmbeddingId })
+      .returning('*');
+    return updated;
   }
 
   async getSpeakerModes() {

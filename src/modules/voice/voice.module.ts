@@ -8,11 +8,13 @@ import { DeepgramService } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
+import { VoiceVerificationService } from './services/voice-verification.service';
 import { voiceConfig } from '@/config/voice.config';
 import { VoiceService } from './services/voice.service';
 import { UsersModule } from '@/modules/users/users.module';
 import { FieldsModule } from '@/modules/fields/fields.module';
 import { EmailModule } from '@/modules/email/email.module';
+import { SpeakersModule } from '@/modules/speakers/speakers.module';
 
 @Module({
   imports: [
@@ -20,6 +22,7 @@ import { EmailModule } from '@/modules/email/email.module';
     UsersModule,
     FieldsModule,
     EmailModule,
+    SpeakersModule,
     JwtModule.registerAsync({
       useFactory: (configService: ConfigService) => ({
         secret: configService.get('jwt.secret'),
@@ -36,6 +39,7 @@ import { EmailModule } from '@/modules/email/email.module';
     ClaudeService,
     ConversationService,
     GuestSessionService,
+    VoiceVerificationService,
   ],
   exports: [ConversationService, ClaudeService, DeepgramService, VoiceService],
 })

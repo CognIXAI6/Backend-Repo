@@ -14,10 +14,12 @@ import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
 import { EventEmitter } from 'events';
 
-import { DeepgramService } from './services/deepgram.service';
+import { DeepgramService, TranscriptWord } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService, ConversationMode } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
+import { VoiceVerificationService } from './services/voice-verification.service';
+import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
 import { UsersService } from '@/modules/users/users.service';
 import { EmailService } from '@/modules/email/email.service';
 import { FieldsService } from '@/modules/fields/fields.service';
@@ -42,6 +44,12 @@ interface ActiveSession {
   sendAudio: (chunk: Buffer) => void;
   closeDeepgram: () => void;
   accumulatedTranscript: string;
+  /**
+   * Latest non-final (interim) transcript from Deepgram for the current utterance.
+   * Deepgram only marks segments as `is_final` after a silence gap, so this holds
+   * the most recent rolling text in case audio:stop fires before any final result.
+   */
+  pendingInterimTranscript: string;
   /** Confidence score for each final transcript segment, used for quality filtering */
   transcriptConfidences: number[];
   isProcessingAI: boolean;
@@ -60,6 +68,18 @@ interface ActiveSession {
   utteranceDebounceMs: number;
   /** Active debounce timeout handle — reset on every new utteranceEnd */
   utteranceDebounceTimer: ReturnType<typeof setTimeout> | null;
+
+  // ── Backend voice calibration ─────────────────────────────────────────────
+  /**
+   * Raw audio chunks buffered for the auto-calibration upload.
+   * Capped at AUDIO_BUFFER_CAP bytes — cleared once calibration fires.
+   */
+  audioBuffer: Buffer[];
+  audioBufferBytes: number;
+  /** Accumulated speech seconds per Deepgram speaker ID (from word timestamps). */
+  speakerWordSeconds: Map<number, number>;
+  /** True once calibration has been triggered — prevents re-triggering. */
+  voiceCalibrationTriggered: boolean;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
@@ -74,6 +94,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   private readonly logger = new Logger(VoiceGateway.name);
   private readonly sessions = new Map<string, ActiveSession>();
+
+  /** Max bytes to buffer for auto voice calibration (~2MB covers 30+ s of Opus). */
+  private readonly AUDIO_BUFFER_CAP = 2 * 1024 * 1024;
+  /** Minimum total word-speech seconds before triggering auto calibration. */
+  private readonly CALIBRATION_SPEECH_THRESHOLD_S = 5;
 
   private readonly FILLER_WORDS = new Set([
     'um', 'uh', 'hmm', 'hm', 'ah', 'er', 'erm', 'mhm',
@@ -118,6 +143,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly claudeService: ClaudeService,
     private readonly conversationService: ConversationService,
     private readonly guestSessionService: GuestSessionService,
+    private readonly voiceVerificationService: VoiceVerificationService,
+    private readonly uploadService: UploadService,
     private readonly usersService: UsersService,
     private readonly fieldsService: FieldsService,
     private readonly emailService: EmailService,
@@ -310,6 +337,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         sendAudio,
         closeDeepgram: close,
         accumulatedTranscript: '',
+        pendingInterimTranscript: '',
         transcriptConfidences: [],
         isProcessingAI: false,
         isDualSpeaker,
@@ -317,13 +345,23 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         calibrationPhase: isDualSpeaker,
         dualSpeakerHistory: [],
         pendingOtherText: '',
-        utteranceDebounceMs: 10_000,
+        // Single-speaker: 5 s is enough; dual-speaker needs 10 s to accumulate context
+        utteranceDebounceMs: isDualSpeaker ? 10_000 : 5_000,
         utteranceDebounceTimer: null,
+        audioBuffer: [],
+        audioBufferBytes: 0,
+        speakerWordSeconds: new Map(),
+        voiceCalibrationTriggered: false,
       };
 
       // Forward Deepgram transcript events → client
       emitter.on('transcript', (result) => {
         if (!result.isFinal) {
+          // Keep the latest interim text so audio:stop can use it as a fallback
+          // if no final result has arrived yet (race condition).
+          if (!session.isDualSpeaker) {
+            session.pendingInterimTranscript = result.transcript;
+          }
           client.emit('transcript:update', {
             transcript: (session.accumulatedTranscript + ' ' + result.transcript).trim(),
             isFinal: false,
@@ -332,6 +370,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           return;
         }
 
+        // Final result arrived — interim is now superseded
+        session.pendingInterimTranscript = '';
+
         if (typeof result.confidence === 'number') {
           session.transcriptConfidences.push(result.confidence);
         }
@@ -339,16 +380,28 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // ── Dual-speaker path ─────────────────────────────────────────────
         if (session.isDualSpeaker) {
           // Reconstruct per-speaker text from word-level speaker tags
-          const words: Array<{ word: string; speaker?: number }> = result.words ?? [];
+          const words: TranscriptWord[] = result.words ?? [];
           const speakerTexts = new Map<number, string>();
           for (const w of words) {
             const spk = w.speaker ?? 0;
             speakerTexts.set(spk, ((speakerTexts.get(spk) ?? '') + ' ' + w.word).trim());
           }
 
+            // Track per-speaker accumulated speech duration (from word timestamps).
+          // This feeds the auto-calibration threshold check below.
+          for (const w of words) {
+            const spk = w.speaker ?? 0;
+            const dur = (w.end ?? 0) - (w.start ?? 0);
+            session.speakerWordSeconds.set(
+              spk,
+              (session.speakerWordSeconds.get(spk) ?? 0) + dur,
+            );
+          }
+
           // ── Calibration: identify the owner as whoever speaks the most
           // in the first meaningful transcript (≥3 words from one speaker).
-          // Falls back to the first-word speaker if no dominant speaker found.
+          // This is an initial word-count guess; backend voice biometrics will
+          // confirm or correct it asynchronously once enough audio is buffered.
           if (session.calibrationPhase && words.length >= 3) {
             // Count words per speaker to find the dominant voice
             const wordCounts = new Map<number, number>();
@@ -359,11 +412,31 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             const dominantSpeaker = [...wordCounts.entries()].sort((a, b) => b[1] - a[1])[0][0];
             session.ownerSpeakerId = dominantSpeaker;
             session.calibrationPhase = false;
-            this.logger.log(`[${client.id}] Owner identified as speaker ${dominantSpeaker} (word counts: ${JSON.stringify(Object.fromEntries(wordCounts))})`);
+            this.logger.log(`[${client.id}] Word-count calibration: owner=speaker ${dominantSpeaker}`);
             client.emit('calibration:complete', {
               ownerSpeakerId: dominantSpeaker,
-              message: 'Voice identified. If the labels are wrong, tap "Swap speakers".',
+              method: 'word_count',
+              message: 'Voice identified. Biometric verification in progress…',
             });
+          }
+
+          // ── Trigger backend biometric calibration once we have enough speech ──
+          // Runs asynchronously after the initial word-count guess, and will
+          // correct `ownerSpeakerId` if the biometric result differs.
+          if (!session.voiceCalibrationTriggered && !session.isGuest) {
+            const totalSpeech = [...session.speakerWordSeconds.values()].reduce(
+              (a, b) => a + b,
+              0,
+            );
+            if (
+              totalSpeech >= this.CALIBRATION_SPEECH_THRESHOLD_S &&
+              session.audioBuffer.length > 0
+            ) {
+              session.voiceCalibrationTriggered = true;
+              this.autoVoiceCalibration(client, session).catch((err) =>
+                this.logger.error(`[${client.id}] Auto voice calibration error:`, err),
+              );
+            }
           }
 
           const ownerSpk = session.ownerSpeakerId ?? 0;
@@ -510,23 +583,44 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       : Buffer.from(payload.chunk);
 
     session.sendAudio(buffer);
+
+    // Buffer audio for backend voice calibration in dual-speaker sessions.
+    // Stop buffering once calibration has triggered (free memory) or cap reached.
+    if (
+      session.isDualSpeaker &&
+      !session.isGuest &&
+      !session.voiceCalibrationTriggered &&
+      session.audioBufferBytes < this.AUDIO_BUFFER_CAP
+    ) {
+      session.audioBuffer.push(buffer);
+      session.audioBufferBytes += buffer.length;
+    }
   }
 
   // ─── audio:stop ─────────────────────────────────────────────────────────────
   /**
    * User releases mic → flush any transcript not yet sent by utteranceEnd.
    * utteranceEnd handles mid-speech responses; audio:stop catches the remainder.
+   *
+   * Race-condition fix: Deepgram only marks segments as is_final after a silence
+   * gap (~utterance_end_ms). If the user stops the mic quickly, accumulatedTranscript
+   * may be empty even though interim text exists. We fall back to pendingInterimTranscript
+   * so the user always gets a response on short recordings.
    */
   @SubscribeMessage('audio:stop')
   async handleAudioStop(@ConnectedSocket() client: Socket): Promise<void> {
     const session = this.sessions.get(client.id);
     if (!session) return;
 
-    const transcript = session.accumulatedTranscript.trim();
+    // Prefer finalized text; fall back to the latest rolling interim if nothing finalized yet
+    const transcript = (
+      session.accumulatedTranscript.trim() || session.pendingInterimTranscript.trim()
+    );
     const confidences = session.transcriptConfidences;
 
     // Reset accumulated state regardless of filter outcome
     session.accumulatedTranscript = '';
+    session.pendingInterimTranscript = '';
     session.transcriptConfidences = [];
 
     if (!transcript) {
@@ -654,6 +748,131 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       swapped: true,
       message: 'Speaker labels swapped. Your voice is now labelled as Owner.',
     });
+  }
+
+  // ─── session:verify_owner ────────────────────────────────────────────────────
+  /**
+   * Manual override for voice calibration.
+   *
+   * The backend drives calibration automatically via `autoVoiceCalibration()`,
+   * which buffers the live audio and verifies/enrolls without any client action.
+   *
+   * This event exists as an optional escape hatch — the frontend can send it
+   * if the user explicitly wants to re-verify using a specific audio clip they
+   * recorded and uploaded themselves.
+   *
+   * Falls back silently to word-count calibration if:
+   *   - The user has no registered voice profile
+   *   - The voice verification service is unavailable
+   */
+  @SubscribeMessage('session:verify_owner')
+  async handleVerifyOwner(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { audioUrl: string; deepgramSpeakerId: number },
+  ): Promise<void> {
+    const session = this.sessions.get(client.id);
+    if (!session || !session.isDualSpeaker) {
+      this.emitError(client, 'VERIFY_INVALID', 'session:verify_owner called outside dual-speaker mode', {
+        clientMessage: 'Voice verification is only available in dual-speaker mode.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    if (session.isGuest) {
+      client.emit('voice_id:result', {
+        verified: false,
+        method: 'word_count',
+        message: 'Voice ID not available in guest mode. Using automatic speaker detection.',
+      });
+      return;
+    }
+
+    const { audioUrl, deepgramSpeakerId } = payload;
+
+    if (!audioUrl) {
+      this.emitError(client, 'VERIFY_INVALID', 'session:verify_owner missing audioUrl', {
+        clientMessage: 'Audio URL is required for voice verification.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    if (!this.voiceVerificationService.isEnabled) {
+      client.emit('voice_id:result', {
+        verified: false,
+        method: 'word_count',
+        message: 'Voice ID service not configured. Using automatic speaker detection.',
+      });
+      return;
+    }
+
+    try {
+      const user = await this.usersService.findById(session.userId);
+
+      if (!user?.voice_speaker_id) {
+        client.emit('voice_id:result', {
+          verified: false,
+          method: 'word_count',
+          message: 'No voice profile found. Register your voice first at Settings → Voice ID.',
+        });
+        return;
+      }
+
+      const result = await this.voiceVerificationService.verifySpeaker(
+        user.voice_speaker_id,
+        audioUrl,
+      );
+
+      // Map from voice match → Deepgram speaker ID
+      const confirmedOwnerSpeakerId = result.verified
+        ? deepgramSpeakerId         // the clip IS the owner
+        : deepgramSpeakerId === 0 ? 1 : 0; // the clip is NOT the owner → flip
+
+      // Update session state
+      session.ownerSpeakerId = confirmedOwnerSpeakerId;
+      session.calibrationPhase = false;
+
+      // Relabel any history that was accumulated before this verification
+      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => {
+        const deepgramId = turn.speaker === 'owner'
+          ? (confirmedOwnerSpeakerId === 0 ? 0 : 1)
+          : (confirmedOwnerSpeakerId === 0 ? 1 : 0);
+        return {
+          ...turn,
+          speaker: deepgramId === confirmedOwnerSpeakerId ? 'owner' : 'other',
+        };
+      });
+
+      this.logger.log(
+        `[${client.id}] Voice ID calibration — verified=${result.verified}, similarity=${result.similarityScore.toFixed(3)}, ownerSpeakerId=${confirmedOwnerSpeakerId}`,
+      );
+
+      client.emit('voice_id:result', {
+        verified: result.verified,
+        similarityScore: result.similarityScore,
+        threshold: result.threshold,
+        ownerSpeakerId: confirmedOwnerSpeakerId,
+        method: 'voice_id',
+        message: result.verified
+          ? 'Voice confirmed. Your voice is identified.'
+          : `Voice did not match (score ${result.similarityScore.toFixed(2)}). Speakers have been reassigned.`,
+      });
+
+      client.emit('calibration:complete', {
+        ownerSpeakerId: confirmedOwnerSpeakerId,
+        method: 'voice_id',
+        message: 'Voice identification complete.',
+      });
+    } catch (err) {
+      this.logger.error('Voice ID verification error:', err);
+      // Non-fatal — fall back gracefully, don't break the session
+      client.emit('voice_id:result', {
+        verified: false,
+        method: 'word_count',
+        message: 'Voice verification failed. Using automatic speaker detection.',
+      });
+    }
   }
 
   // ─── session:end ─────────────────────────────────────────────────────────────
@@ -883,6 +1102,135 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       this.logger.error('processPrompt error:', err);
       this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
       session.isProcessingAI = false;
+    }
+  }
+
+  // ─── Backend auto voice calibration ──────────────────────────────────────────
+  /**
+   * Uploads the buffered session audio to Cloudinary, then either:
+   *  - VERIFICATION: Checks whether the owner's registered voice is present.
+   *    If the biometric result differs from the initial word-count guess, the
+   *    ownerSpeakerId and conversation history are corrected automatically.
+   *  - ENROLLMENT: No voice profile exists yet → registers the dominant speaker
+   *    as the owner and persists the profile to the users table (one-time).
+   *
+   * This runs entirely on the backend — the frontend never needs to upload audio.
+   * Falls back silently to the word-count result if the service is unavailable.
+   */
+  private async autoVoiceCalibration(client: Socket, session: ActiveSession): Promise<void> {
+    this.logger.log(`[${client.id}] Auto voice calibration triggered (${session.audioBufferBytes} bytes buffered)`);
+
+    // Grab and free the buffer immediately so GC can reclaim memory
+    const audioData = Buffer.concat(session.audioBuffer);
+    session.audioBuffer = [];
+    session.audioBufferBytes = 0;
+
+    // Dominant speaker by accumulated word-time (same speaker word-count picked as owner)
+    const dominantSpeaker =
+      [...session.speakerWordSeconds.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 0;
+
+    try {
+      // Upload to Cloudinary
+      const uploadResult = await this.uploadService.uploadBuffer(
+        audioData,
+        UploadFolder.VOICE_SAMPLES,
+        `voice-cal-${client.id}`,
+        'video',
+      );
+      const audioUrl = uploadResult.secure_url;
+
+      const user = await this.usersService.findById(session.userId);
+      if (!user) return;
+
+      if (user.voice_speaker_id && this.voiceVerificationService.isEnabled) {
+        // ── VERIFICATION MODE ─────────────────────────────────────────────────
+        // Check if the owner's registered voice is present in the session audio.
+        const result = await this.voiceVerificationService.verifySpeaker(
+          user.voice_speaker_id,
+          audioUrl,
+        );
+
+        this.logger.log(
+          `[${client.id}] Voice verification: verified=${result.verified}, score=${result.similarityScore.toFixed(3)}, threshold=${result.threshold}`,
+        );
+
+        // verified=true  → dominant speaker IS the owner (word-count was right)
+        // verified=false → dominant speaker is NOT the owner → flip
+        const confirmedOwner = result.verified
+          ? dominantSpeaker
+          : dominantSpeaker === 0 ? 1 : 0;
+
+        if (confirmedOwner !== session.ownerSpeakerId) {
+          // Biometrics overrule the word-count guess — relabel conversation history
+          session.ownerSpeakerId = confirmedOwner;
+          session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
+            ...turn,
+            speaker: turn.speaker === 'owner' ? 'other' : 'owner',
+          }));
+          this.logger.log(
+            `[${client.id}] Biometrics corrected owner to speaker ${confirmedOwner}`,
+          );
+        }
+
+        session.calibrationPhase = false;
+
+        client.emit('voice_id:result', {
+          verified: result.verified,
+          similarityScore: result.similarityScore,
+          threshold: result.threshold,
+          ownerSpeakerId: confirmedOwner,
+          method: 'voice_id',
+          message: result.verified
+            ? 'Voice confirmed by biometrics.'
+            : `Biometrics reassigned speakers (score ${result.similarityScore.toFixed(2)}).`,
+        });
+
+        client.emit('calibration:complete', {
+          ownerSpeakerId: confirmedOwner,
+          method: 'voice_id',
+          message: 'Speaker identification complete.',
+        });
+      } else if (!user.voice_speaker_id && this.voiceVerificationService.isEnabled) {
+        // ── ENROLLMENT MODE ───────────────────────────────────────────────────
+        // First session ever — register the dominant speaker's voice as the owner.
+        const userName = user.name || user.email.split('@')[0];
+
+        const regResult = await this.voiceVerificationService.registerSpeaker(
+          userName,
+          audioUrl,
+        );
+
+        // Persist voice profile to the database
+        await this.usersService.update(user.id, {
+          voice_speaker_id: regResult.speakerId,
+          voice_embedding_id: regResult.embeddingId,
+        });
+
+        // Dominant speaker = owner (assumption: the app user speaks the most)
+        session.ownerSpeakerId = dominantSpeaker;
+        session.calibrationPhase = false;
+
+        this.logger.log(
+          `[${client.id}] Voice enrolled: speakerId=${regResult.speakerId}, owner=speaker ${dominantSpeaker}`,
+        );
+
+        client.emit('voice_id:result', {
+          enrolled: true,
+          ownerSpeakerId: dominantSpeaker,
+          method: 'voice_enrollment',
+          message: 'Voice profile created. You\'ll be recognized automatically in all future sessions.',
+        });
+
+        client.emit('calibration:complete', {
+          ownerSpeakerId: dominantSpeaker,
+          method: 'voice_enrollment',
+          message: 'Voice enrolled and speaker identified.',
+        });
+      }
+      // else: voice verification service not enabled → word-count result stands
+    } catch (err) {
+      // Non-fatal — word-count calibration already ran, session continues normally
+      this.logger.error(`[${client.id}] Auto voice calibration failed:`, err);
     }
   }
 

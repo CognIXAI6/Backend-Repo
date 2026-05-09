@@ -5,6 +5,7 @@ export const voiceConfig = registerAs('voice', () => ({
   anthropicApiKey: process.env.ANTHROPIC_API_KEY,
   claudeModel: process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514',
   tavilyApiKey: process.env.TAVILY_API_KEY,
+  voiceVerificationUrl: process.env.VOICE_VERIFICATION_URL,
 }));
 
 

@@ -307,7 +307,18 @@ export class AuthService {
     return { message: 'Logged out successfully' };
   }
 
-  private async generateTokens(user: User) {
+  /** Dev-only: issue a token pair for any user by ID (blocked in production). */
+  async devIssueToken(userId: string) {
+    if (this.configService.get('NODE_ENV') === 'production') {
+      throw new UnauthorizedException('Not available in production');
+    }
+    if (!userId) throw new UnauthorizedException('userId is required');
+    const user = await this.usersService.findById(userId);
+    if (!user) throw new UnauthorizedException(`No user found with id: ${userId}`);
+    return this.generateTokens(user);
+  }
+
+  async generateTokens(user: User) {
     const payload = { sub: user.id, email: user.email };
 
     const accessToken = this.jwtService.sign(payload, {

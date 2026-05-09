@@ -6,6 +6,7 @@ import {
   HttpCode,
   HttpStatus,
   Get,
+  BadRequestException,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard, CurrentUser } from '@/common';
@@ -89,5 +90,19 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   async profile(@CurrentUser() user: any) {
     return user;
+  }
+
+  /**
+   * DEV ONLY — issue a real JWT pair for any userId without a password.
+   * Throws 401 in production. Used by test-voice.html.
+   *
+   * POST /api/v1/auth/dev/token   { "userId": "..." }
+   */
+  @Post('dev/token')
+  @HttpCode(HttpStatus.OK)
+  async devToken(@Body() body: Record<string, unknown>) {
+    const userId = typeof body?.userId === 'string' ? body.userId.trim() : undefined;
+    if (!userId) throw new BadRequestException('userId is required');
+    return this.authService.devIssueToken(userId);
   }
 }
