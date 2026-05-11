@@ -69,6 +69,26 @@ interface ActiveSession {
   /** Active debounce timeout handle — reset on every new utteranceEnd */
   utteranceDebounceTimer: ReturnType<typeof setTimeout> | null;
 
+  // ── Per-session user cache ────────────────────────────────────────────────
+  /**
+   * Snapshot of the user row taken at session:start.
+   * Eliminates repeated findById() calls on every AI prompt within a session.
+   * cachedAiMemory is refreshed after saveSessionMemory() writes a new value.
+   */
+  cachedAiMemory: string | null;
+  cachedVoiceSpeakerId: string | null;
+
+  // ── Idle timeout ─────────────────────────────────────────────────────────
+  /** Cleared and reset on every audio:chunk. Fires cleanup after 30 min of silence. */
+  idleTimeoutHandle: ReturnType<typeof setTimeout> | null;
+
+  // ── Speaker naming ────────────────────────────────────────────────────────
+  /**
+   * Display name for the non-owner speaker. Set via session:name_speaker.
+   * Included in every transcript:update so the frontend has a stable name source.
+   */
+  otherSpeakerName: string | null;
+
   // ── Backend voice calibration ─────────────────────────────────────────────
   /**
    * Raw audio chunks buffered for the auto-calibration upload.
@@ -86,7 +106,15 @@ interface ActiveSession {
 
 @WebSocketGateway({
   namespace: '/voice',
-  cors: { origin: '*', credentials: true },
+  // origin:'*' with credentials:true is rejected by every browser (CORS spec).
+  // origin:true tells the cors middleware to reflect the request's Origin header,
+  // which is valid with credentials and works across all deployment environments.
+  cors: { origin: true, credentials: true },
+  // Default pingTimeout is 20 s — shorter than a cold Claude response (10-40 s).
+  // Raise to 60 s so the connection is not dropped while streaming is in progress.
+  pingTimeout: 60_000,
+  // Keep pingInterval at 25 s (Socket.IO default) for normal connections.
+  pingInterval: 25_000,
 })
 export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
@@ -99,6 +127,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly AUDIO_BUFFER_CAP = 2 * 1024 * 1024;
   /** Minimum total word-speech seconds before triggering auto calibration. */
   private readonly CALIBRATION_SPEECH_THRESHOLD_S = 5;
+  /** Milliseconds of inactivity before a session is auto-closed (30 min). */
+  private readonly SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
   private readonly FILLER_WORDS = new Set([
     'um', 'uh', 'hmm', 'hm', 'ah', 'er', 'erm', 'mhm',
@@ -270,23 +300,23 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         guestSessionId = payload.guestSessionId;
         userId = guestSessionId; // conversations store this UUID as user_id
 
-        const canSend = await this.guestSessionService.canSendPrompt(guestSessionId);
-        const status = await this.guestSessionService.getPromptStatus(guestSessionId);
+        // Single DB call instead of the previous canSendPrompt() + getPromptStatus()
+        const guestStatus = await this.guestSessionService.getStatus(guestSessionId);
 
         isGuest = true;
 
         // Emit current prompt status so the frontend can show the counter
         client.emit('guest:status', {
-          used: status.used,
-          limit: status.limit,
-          remaining: status.remaining,
+          used: guestStatus.used,
+          limit: guestStatus.limit,
+          remaining: guestStatus.remaining,
         });
 
-        if (!canSend) {
+        if (!guestStatus.canSend) {
           client.emit('guest:limit_reached', {
             message: 'You have used all 5 free prompts. Sign up to continue.',
-            used: status.used,
-            limit: status.limit,
+            used: guestStatus.used,
+            limit: guestStatus.limit,
           });
           return;
         }
@@ -307,6 +337,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           resolvedFieldId = resolvedFieldId ?? (primaryField.field_id ?? primaryField.custom_field_id ?? primaryField.id);
           resolvedFieldName = resolvedFieldName ?? primaryField.name;
         }
+      }
+
+      // ── Load user data once — cached for the session lifetime ───────────────
+      // Avoids repeated findById() on every AI prompt within this session.
+      let cachedAiMemory: string | null = null;
+      let cachedVoiceSpeakerId: string | null = null;
+
+      if (!isGuest) {
+        const userRecord = await this.usersService.findById(userId);
+        cachedAiMemory = userRecord?.ai_memory ?? null;
+        cachedVoiceSpeakerId = userRecord?.voice_speaker_id ?? null;
       }
 
       // ── Create or resume conversation ─────────────────────────────────────
@@ -348,6 +389,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // Single-speaker: 5 s is enough; dual-speaker needs 10 s to accumulate context
         utteranceDebounceMs: isDualSpeaker ? 10_000 : 5_000,
         utteranceDebounceTimer: null,
+        cachedAiMemory,
+        cachedVoiceSpeakerId,
+        otherSpeakerName: null,
+        idleTimeoutHandle: null,
         audioBuffer: [],
         audioBufferBytes: 0,
         speakerWordSeconds: new Map(),
@@ -403,20 +448,31 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           // This is an initial word-count guess; backend voice biometrics will
           // confirm or correct it asynchronously once enough audio is buffered.
           if (session.calibrationPhase && words.length >= 3) {
-            // Count words per speaker to find the dominant voice
             const wordCounts = new Map<number, number>();
             for (const w of words) {
               const spk = w.speaker ?? 0;
               wordCounts.set(spk, (wordCounts.get(spk) ?? 0) + 1);
             }
-            const dominantSpeaker = [...wordCounts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+            const sorted = [...wordCounts.entries()].sort((a, b) => b[1] - a[1]);
+            const dominantSpeaker = sorted[0][0];
+            const totalWords = [...wordCounts.values()].reduce((a, b) => a + b, 0);
+            // Confidence: ratio of dominant speaker's words. 1.0 = only one speaker
+            // heard, 0.5 = equal split (least reliable).
+            const calibrationConfidence = totalWords > 0 ? sorted[0][1] / totalWords : 1;
+
             session.ownerSpeakerId = dominantSpeaker;
             session.calibrationPhase = false;
-            this.logger.log(`[${client.id}] Word-count calibration: owner=speaker ${dominantSpeaker}`);
+            this.logger.log(
+              `[${client.id}] Word-count calibration: owner=speaker ${dominantSpeaker}, confidence=${calibrationConfidence.toFixed(2)}`,
+            );
             client.emit('calibration:complete', {
               ownerSpeakerId: dominantSpeaker,
               method: 'word_count',
-              message: 'Voice identified. Biometric verification in progress…',
+              confidence: calibrationConfidence,
+              speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
+              message: calibrationConfidence >= 0.7
+                ? 'Voice identified. Biometric verification in progress…'
+                : 'Initial speaker assignment made, but confidence is low. Biometric verification in progress…',
             });
           }
 
@@ -461,6 +517,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                 text,
               ]),
             ),
+            // Stable display names — frontend maps these to colors and labels.
+            // Always included so the UI never needs a separate lookup call.
+            speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
           });
           return;
         }
@@ -525,13 +584,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           }
 
           if (session.isGuest && session.guestSessionId) {
-            const canSend = await this.guestSessionService.canSendPrompt(session.guestSessionId);
-            if (!canSend) {
-              const status = await this.guestSessionService.getPromptStatus(session.guestSessionId);
+            const gs = await this.guestSessionService.getStatus(session.guestSessionId);
+            if (!gs.canSend) {
               client.emit('guest:limit_reached', {
                 message: 'You have used all 5 free prompts. Sign up to continue.',
-                used: status.used,
-                limit: status.limit,
+                used: gs.used,
+                limit: gs.limit,
               });
               return;
             }
@@ -595,6 +653,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.audioBuffer.push(buffer);
       session.audioBufferBytes += buffer.length;
     }
+
+    // Reset the idle timeout on every audio chunk — session stays alive while
+    // the microphone is active. If no audio arrives for 30 minutes, clean up.
+    if (session.idleTimeoutHandle) {
+      clearTimeout(session.idleTimeoutHandle);
+    }
+    session.idleTimeoutHandle = setTimeout(() => {
+      this.logger.warn(`[${client.id}] Session idle for 30 min — auto-closing`);
+      this.cleanupSession(client.id);
+      client.emit('session:ended', { reason: 'idle_timeout' });
+    }, this.SESSION_IDLE_TIMEOUT_MS);
   }
 
   // ─── audio:stop ─────────────────────────────────────────────────────────────
@@ -648,13 +717,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     // ── Guest prompt limit check ───────────────────────────────────────────
     if (session.isGuest && session.guestSessionId) {
-      const canSend = await this.guestSessionService.canSendPrompt(session.guestSessionId);
-      if (!canSend) {
-        const status = await this.guestSessionService.getPromptStatus(session.guestSessionId);
+      const gs = await this.guestSessionService.getStatus(session.guestSessionId);
+      if (!gs.canSend) {
         client.emit('guest:limit_reached', {
           message: 'You have used all 5 free prompts. Sign up to continue.',
-          used: status.used,
-          limit: status.limit,
+          used: gs.used,
+          limit: gs.limit,
         });
         return;
       }
@@ -691,13 +759,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     // ── Guest prompt limit check ───────────────────────────────────────────
     if (session.isGuest && session.guestSessionId) {
-      const canSend = await this.guestSessionService.canSendPrompt(session.guestSessionId);
-      if (!canSend) {
-        const status = await this.guestSessionService.getPromptStatus(session.guestSessionId);
+      const gs = await this.guestSessionService.getStatus(session.guestSessionId);
+      if (!gs.canSend) {
         client.emit('guest:limit_reached', {
           message: 'You have used all 5 free prompts. Sign up to continue.',
-          used: status.used,
-          limit: status.limit,
+          used: gs.used,
+          limit: gs.limit,
         });
         return;
       }
@@ -731,14 +798,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.ownerSpeakerId = session.ownerSpeakerId === 0 ? 1 : 0;
 
-    // Relabel the existing history so Claude context is consistent
+    // Relabel the existing in-memory history so Claude context is consistent
     session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
       ...turn,
       speaker: turn.speaker === 'owner' ? 'other' : 'owner',
     }));
 
-    // Swap the accumulated pendingOtherText (it was from the wrong speaker)
-    // We can't undo already-sent prompts but we can reset pending state
+    // Relabel already-saved conversation_messages in the DB (fire-and-forget)
+    this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
+      this.logger.error(`[${client.id}] relabelSpeakers (swap) failed:`, err),
+    );
+
+    // Reset pending state — it was from the wrong speaker
     session.pendingOtherText = '';
 
     this.logger.log(`[${client.id}] Speakers swapped — owner is now speaker ${session.ownerSpeakerId}`);
@@ -746,7 +817,57 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     client.emit('calibration:complete', {
       ownerSpeakerId: session.ownerSpeakerId,
       swapped: true,
+      confidence: 1.0,
+      speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
       message: 'Speaker labels swapped. Your voice is now labelled as Owner.',
+    });
+  }
+
+  // ─── session:name_speaker ────────────────────────────────────────────────────
+  /**
+   * Sets a display name for one of the speakers.
+   *
+   * The owner is always "You" internally, but the other speaker defaults to "Other".
+   * The frontend can send this at any point (e.g. after the user types the other
+   * person's name in a UI field) to give the conversation a human-readable identity.
+   *
+   * The name is included in every subsequent transcript:update and calibration event
+   * so the frontend never needs to maintain its own name lookup.
+   */
+  @SubscribeMessage('session:name_speaker')
+  handleNameSpeaker(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { speaker: 'owner' | 'other'; name: string },
+  ): void {
+    const session = this.sessions.get(client.id);
+    if (!session || !session.isDualSpeaker) {
+      this.emitError(client, 'NAME_INVALID', 'session:name_speaker called outside dual-speaker mode', {
+        clientMessage: 'Speaker naming is only available in dual-speaker mode.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    const name = (payload.name ?? '').trim().slice(0, 50);
+    if (!name) {
+      this.emitError(client, 'NAME_INVALID', 'session:name_speaker received empty name', {
+        clientMessage: 'Speaker name cannot be empty.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    if (payload.speaker === 'other') {
+      session.otherSpeakerName = name;
+    }
+    // 'owner' name is always "You" — silently ignore attempts to rename it
+
+    this.logger.log(`[${client.id}] Speaker named: ${payload.speaker}="${name}"`);
+
+    client.emit('speaker:named', {
+      speaker: payload.speaker,
+      name: payload.speaker === 'other' ? session.otherSpeakerName : 'You',
+      speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
     });
   }
 
@@ -899,26 +1020,26 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   ): Promise<void> {
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
+    let aiStarted = false;
 
     try {
-      // Build labeled conversation context for Claude
-      const conversationContext = session.dualSpeakerHistory
+      // Cap context at the last 40 turns so Claude input doesn't grow unbounded
+      const recentHistory = session.dualSpeakerHistory.slice(-40);
+      const conversationContext = recentHistory
         .map((t) => `[${t.speaker === 'owner' ? 'Owner' : 'Other Person'}]: ${t.text}`)
         .join('\n');
 
       const userMessage = `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`;
 
-      // Load owner's AI memory for richer context
-      let aiMemory: string | undefined;
-      if (!session.isGuest) {
-        const user = await this.usersService.findById(session.userId);
-        aiMemory = user?.ai_memory ?? undefined;
-      }
-
-      const systemPrompt = this.claudeService.buildDualSpeakerPrompt(session.fieldName, aiMemory);
+      // Use cached ai_memory — no additional DB call needed
+      const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
+        session.fieldName,
+        session.cachedAiMemory ?? undefined,
+      );
 
       client.emit('transcript:confirmed', { transcript: otherPersonText, inputType: 'voice', speaker: 'other' });
       client.emit('ai:start');
+      aiStarted = true;
 
       let firstToken = true;
 
@@ -963,12 +1084,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         onError: (err) => {
           this.handleAiError(client, err, `dual-speaker [${client.id}]`);
+          if (aiStarted) {
+            client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
+          }
           session.isProcessingAI = false;
         },
       });
     } catch (err) {
       this.logger.error('processDualSpeakerPrompt error:', err);
       this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
+      if (aiStarted) {
+        client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
+      }
       session.isProcessingAI = false;
     }
   }
@@ -976,18 +1103,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   // ─── Save session memory after session ends ───────────────────────────────────
   private async saveSessionMemory(session: ActiveSession): Promise<void> {
     try {
-      const history = await this.conversationService.getConversationHistory(
+      const history = await this.conversationService.getRecentHistoryForAI(
         session.conversationId,
-        session.userId,
+        80, // use more context for memory summarisation than for live prompts
       );
       if (history.length < 2) return; // not enough content to memorise
 
-      const user = await this.usersService.findById(session.userId);
-      if (!user) return;
-
       const updatedMemory = await this.claudeService.summarizeConversationForMemory(
         history,
-        user.ai_memory,
+        session.cachedAiMemory, // use cached value — avoids another findById
         session.fieldName,
       );
 
@@ -995,6 +1119,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         ai_memory: updatedMemory,
         ai_memory_updated_at: new Date(),
       });
+
+      // Keep the in-session cache up to date in case the session continues
+      session.cachedAiMemory = updatedMemory;
 
       this.logger.log(`Memory saved for user ${session.userId}`);
     } catch (err) {
@@ -1011,6 +1138,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   ): Promise<void> {
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
+    // Track whether ai:start was emitted so every exit path can emit ai:done.
+    // The frontend relies on ai:done to stop the spinner and unlock the input.
+    let aiStarted = false;
 
     try {
       // 1. Persist user message
@@ -1023,15 +1153,21 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       client.emit('transcript:confirmed', { transcript: userMessage, inputType });
       client.emit('ai:start');
+      aiStarted = true;
 
       // 2. Load conversation history + AI memory for Claude context
-      const [history, userRecord] = await Promise.all([
-        this.conversationService.getConversationHistory(session.conversationId, session.userId),
-        session.isGuest ? Promise.resolve(null) : this.usersService.findById(session.userId),
-      ]);
+      // Use cached ai_memory (set at session:start, refreshed after saveSessionMemory).
+      // Fetch only the last 40 turns — no ownership re-check needed (established at session:start).
+      const history = await this.conversationService.getRecentHistoryForAI(
+        session.conversationId,
+        40,
+      );
+      // The message we just persisted is the last entry; exclude it from the context
       const historyWithoutCurrent = history.slice(0, -1);
-      const aiMemory = userRecord?.ai_memory ?? undefined;
-      const systemPrompt = this.claudeService.buildSystemPrompt(session.fieldName, aiMemory);
+      const systemPrompt = this.claudeService.buildSystemPrompt(
+        session.fieldName,
+        session.cachedAiMemory ?? undefined,
+      );
 
       let firstToken = true;
 
@@ -1094,6 +1230,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           onError: (err: Error) => {
             this.handleAiError(client, err, `single-speaker [${client.id}]`);
+            // Always emit ai:done so the frontend spinner stops and input unlocks.
+            if (aiStarted) {
+              client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
+            }
             session.isProcessingAI = false;
           },
         },
@@ -1101,6 +1241,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     } catch (err) {
       this.logger.error('processPrompt error:', err);
       this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
+      if (aiStarted) {
+        client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
+      }
       session.isProcessingAI = false;
     }
   }
@@ -1139,14 +1282,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
       const audioUrl = uploadResult.secure_url;
 
-      const user = await this.usersService.findById(session.userId);
-      if (!user) return;
+      // Use cached voice_speaker_id — avoids a findById round trip
+      const voiceSpeakerId = session.cachedVoiceSpeakerId;
 
-      if (user.voice_speaker_id && this.voiceVerificationService.isEnabled) {
+      if (voiceSpeakerId && this.voiceVerificationService.isEnabled) {
         // ── VERIFICATION MODE ─────────────────────────────────────────────────
         // Check if the owner's registered voice is present in the session audio.
         const result = await this.voiceVerificationService.verifySpeaker(
-          user.voice_speaker_id,
+          voiceSpeakerId,
           audioUrl,
         );
 
@@ -1161,15 +1304,30 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           : dominantSpeaker === 0 ? 1 : 0;
 
         if (confirmedOwner !== session.ownerSpeakerId) {
-          // Biometrics overrule the word-count guess — relabel conversation history
+          // Biometrics overrule the word-count guess — relabel in-memory history
           session.ownerSpeakerId = confirmedOwner;
           session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
             ...turn,
             speaker: turn.speaker === 'owner' ? 'other' : 'owner',
           }));
+
+          // Relabel already-saved conversation_messages in the DB so they stay
+          // consistent with the corrected in-memory state (fire-and-forget).
+          this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
+            this.logger.error(`[${client.id}] relabelSpeakers failed:`, err),
+          );
+
           this.logger.log(
             `[${client.id}] Biometrics corrected owner to speaker ${confirmedOwner}`,
           );
+
+          // Tell the frontend to re-render historical messages with flipped labels.
+          client.emit('speakers:corrected', {
+            ownerSpeakerId: confirmedOwner,
+            reason: 'biometric_correction',
+            speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
+            message: 'Speaker labels corrected by biometrics. Previous messages have been relabelled.',
+          });
         }
 
         session.calibrationPhase = false;
@@ -1180,6 +1338,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           threshold: result.threshold,
           ownerSpeakerId: confirmedOwner,
           method: 'voice_id',
+          speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
           message: result.verified
             ? 'Voice confirmed by biometrics.'
             : `Biometrics reassigned speakers (score ${result.similarityScore.toFixed(2)}).`,
@@ -1188,11 +1347,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         client.emit('calibration:complete', {
           ownerSpeakerId: confirmedOwner,
           method: 'voice_id',
+          confidence: 1.0,
+          speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
           message: 'Speaker identification complete.',
         });
-      } else if (!user.voice_speaker_id && this.voiceVerificationService.isEnabled) {
+      } else if (!voiceSpeakerId && this.voiceVerificationService.isEnabled) {
         // ── ENROLLMENT MODE ───────────────────────────────────────────────────
-        // First session ever — register the dominant speaker's voice as the owner.
+        // First session ever — fetch user only here (enrollment is a one-time event).
+        const user = await this.usersService.findById(session.userId);
+        if (!user) return;
+
         const userName = user.name || user.email.split('@')[0];
 
         const regResult = await this.voiceVerificationService.registerSpeaker(
@@ -1201,10 +1365,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         );
 
         // Persist voice profile to the database
-        await this.usersService.update(user.id, {
+        await this.usersService.update(session.userId, {
           voice_speaker_id: regResult.speakerId,
           voice_embedding_id: regResult.embeddingId,
         });
+
+        // Update session cache so subsequent calibration checks use the new ID
+        session.cachedVoiceSpeakerId = regResult.speakerId;
 
         // Dominant speaker = owner (assumption: the app user speaks the most)
         session.ownerSpeakerId = dominantSpeaker;
@@ -1218,12 +1385,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           enrolled: true,
           ownerSpeakerId: dominantSpeaker,
           method: 'voice_enrollment',
+          speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
           message: 'Voice profile created. You\'ll be recognized automatically in all future sessions.',
         });
 
         client.emit('calibration:complete', {
           ownerSpeakerId: dominantSpeaker,
           method: 'voice_enrollment',
+          confidence: 1.0,
+          speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
           message: 'Voice enrolled and speaker identified.',
         });
       }
@@ -1238,11 +1408,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private cleanupSession(socketId: string): void {
     const session = this.sessions.get(socketId);
     if (session) {
-      // Cancel any pending debounce timer so Claude doesn't fire after disconnect
+      // Cancel all pending timers
       if (session.utteranceDebounceTimer) {
         clearTimeout(session.utteranceDebounceTimer);
         session.utteranceDebounceTimer = null;
       }
+      if (session.idleTimeoutHandle) {
+        clearTimeout(session.idleTimeoutHandle);
+        session.idleTimeoutHandle = null;
+      }
+
+      // Explicitly free audio buffer to release memory before GC
+      session.audioBuffer = [];
+      session.audioBufferBytes = 0;
+
       session.closeDeepgram();
       session.deepgramEmitter.removeAllListeners();
       this.sessions.delete(socketId);

@@ -5,7 +5,10 @@ import { tavily } from '@tavily/core';
 
 export interface ClaudeStreamCallbacks {
   onToken: (token: string) => void;
-  onDone: (fullText: string, inputTokens: number, outputTokens: number) => void;
+  // Declared as Promise<void> so callers can do async work (DB saves, etc.)
+  // and errors inside onDone propagate to onError instead of becoming silent
+  // unhandled rejections that leave the session in a broken state.
+  onDone: (fullText: string, inputTokens: number, outputTokens: number) => Promise<void> | void;
   onError: (error: Error) => void;
 }
 
@@ -219,7 +222,7 @@ export class ClaudeService implements OnModuleInit {
         }
       }
 
-      callbacks.onDone(fullText, inputTokens, outputTokens);
+      await callbacks.onDone(fullText, inputTokens, outputTokens);
     } catch (error) {
       this.logger.error('Claude stream error:', error);
       callbacks.onError(error instanceof Error ? error : new Error(String(error)));

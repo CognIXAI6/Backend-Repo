@@ -20,8 +20,6 @@ export class AuthController {
    * Step 1 — Request an OTP.
    * Works for both new users (registration) and existing users (login).
    * Optionally accepts a niche_id if the user selected one on the guest screen.
-   *
-   * POST /api/v1/auth/otp/send
    */
   @Post('/login')
   @HttpCode(HttpStatus.OK)
@@ -33,8 +31,6 @@ export class AuthController {
    * Step 2 — Verify the OTP.
    * Creates the account (if new) or logs in (if existing), saves the niche,
    * and returns our JWT pair.
-   *
-   * POST /api/v1/auth/otp/verify
    */
   @Post('otp/verify')
   @HttpCode(HttpStatus.OK)
@@ -45,8 +41,6 @@ export class AuthController {
   /**
    * Clerk OAuth sync — exchange a Clerk session token for our own JWT pair.
    * Call this after the user completes OAuth on the frontend via Clerk.
-   *
-   * POST /api/v1/auth/clerk/sync
    */
   @Post('clerk/sync')
   @HttpCode(HttpStatus.OK)
@@ -56,8 +50,6 @@ export class AuthController {
 
   /**
    * Refresh the access token using a valid refresh token.
-   *
-   * POST /api/v1/auth/refresh
    */
   @Post('refresh')
   @HttpCode(HttpStatus.OK)
@@ -67,8 +59,6 @@ export class AuthController {
 
   /**
    * Revoke the current refresh token (logout).
-   *
-   * POST /api/v1/auth/logout
    */
   @Post('logout')
   @UseGuards(JwtAuthGuard)
@@ -82,8 +72,6 @@ export class AuthController {
 
   /**
    * Return the currently authenticated user's profile.
-   *
-   * GET /api/v1/auth/profile
    */
   @Get('profile')
   @UseGuards(JwtAuthGuard)

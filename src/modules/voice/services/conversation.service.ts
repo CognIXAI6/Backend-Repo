@@ -107,6 +107,25 @@ export class ConversationService {
   }
 
   /**
+   * Flips all speaker_label values in a conversation between 'owner' and 'other'.
+   * Called when biometric verification overrules the initial word-count calibration.
+   * A single atomic UPDATE keeps the correction consistent with in-memory state.
+   */
+  async relabelSpeakers(conversationId: string): Promise<void> {
+    await this.knex.raw(
+      `UPDATE conversation_messages
+          SET speaker_label = CASE
+            WHEN speaker_label = 'owner' THEN 'other'
+            WHEN speaker_label = 'other' THEN 'owner'
+            ELSE speaker_label
+          END
+        WHERE conversation_id = ?
+          AND speaker_label IN ('owner', 'other')`,
+      [conversationId],
+    );
+  }
+
+  /**
    * Sets an AI-generated title on the conversation.
    * Called once after the first AI response — fire-and-forget from the gateway.
    */
@@ -181,6 +200,26 @@ export class ConversationService {
   ): Promise<Array<{ role: 'user' | 'assistant'; content: string }>> {
     const messages = await this.getConversationMessages(conversationId, userId);
     return messages.map((m) => ({ role: m.role, content: m.content }));
+  }
+
+  /**
+   * Lightweight alternative for internal gateway use.
+   * Skips the ownership re-check (trust established at session:start) and
+   * caps to the most recent `limit` messages so Claude context doesn't grow
+   * unbounded in long conversations.
+   */
+  async getRecentHistoryForAI(
+    conversationId: string,
+    limit = 40,
+  ): Promise<Array<{ role: 'user' | 'assistant'; content: string }>> {
+    const messages = await this.knex('conversation_messages')
+      .where('conversation_id', conversationId)
+      .orderBy('created_at', 'desc')
+      .limit(limit)
+      .select('role', 'content');
+
+    // Reverse so oldest-first order is preserved for Claude
+    return messages.reverse().map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
   }
 
   // ── Rename ──────────────────────────────────────────────────────────────────

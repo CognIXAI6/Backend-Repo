@@ -1,5 +1,16 @@
-import { Transform } from 'class-transformer';
-import { IsString, IsOptional, IsEnum, IsArray, IsUrl, IsUUID, IsNotEmpty } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import {
+  IsString,
+  IsOptional,
+  IsEnum,
+  IsArray,
+  IsUrl,
+  IsUUID,
+  IsNotEmpty,
+  IsInt,
+  Min,
+  Max,
+} from 'class-validator';
 
 export enum ResourceType {
   TEXTBOOK = 'textbook',
@@ -10,34 +21,9 @@ export enum ResourceType {
   IMAGE = 'image',
 }
 
-// export class CreateResourceDto {
-//   @IsEnum(ResourceType)
-//   type: ResourceType;
-
-//   @IsString()
-//   title: string;
-
-//   @IsOptional()
-//   @IsString()
-//   description?: string;
-
-//   @IsOptional()
-//   @IsUUID()
-//   fieldId?: string;
-
-//   @IsOptional()
-//   // @IsUrl()
-//   externalUrl?: string;
-
-//   @IsOptional()
-//   @IsArray()
-//   @IsString({ each: true })
-//   tags?: string[];
-// }
-
 export class CreateResourceDto {
-  @IsUUID()
   @IsOptional()
+  // @IsUUID()
   fieldId?: string;
 
   @IsEnum(ResourceType)
@@ -47,19 +33,17 @@ export class CreateResourceDto {
   @IsNotEmpty()
   title: string;
 
-  @IsString()
   @IsOptional()
+  @IsString()
   description?: string;
 
-  @IsString()
   @IsOptional()
+  @IsUrl({}, { message: 'externalUrl must be a valid URL' })
   externalUrl?: string;
 
   @Transform(({ value }) => {
     if (!value) return [];
-
     if (Array.isArray(value)) return value;
-
     try {
       const parsed = JSON.parse(value);
       return Array.isArray(parsed) ? parsed : [];
@@ -67,15 +51,16 @@ export class CreateResourceDto {
       return [value];
     }
   })
+  @IsOptional()
   @IsArray()
   @IsString({ each: true })
-  @IsOptional()
   tags?: string[];
 }
 
 export class UpdateResourceDto {
   @IsOptional()
   @IsString()
+  @IsNotEmpty()
   title?: string;
 
   @IsOptional()
@@ -110,8 +95,15 @@ export class ResourceQueryDto {
   tag?: string;
 
   @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
   page?: number;
 
   @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
   limit?: number;
 }

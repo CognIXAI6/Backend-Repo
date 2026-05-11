@@ -1,0 +1,655 @@
+{
+  "info": {
+    "_postman_id": "cognix-resources-api-v1",
+    "name": "CognIX AI — Resources API",
+    "description": "File & Document Repository endpoints for CognIX AI.\n\n**Authentication:** All requests require a Bearer JWT token. Set `access_token` in the collection variables after logging in.\n\n**Base URL:** Set `base_url` to your environment (e.g. `http://localhost:3000` for local, or your deployed API URL).\n\n**Quick start:**\n1. Set `base_url` and `access_token` in collection variables.\n2. Run **Create Resource (Upload File)** — the `resource_id` variable is auto-set from the response.\n3. Use that `resource_id` in Get, Update, and Delete requests.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3000",
+      "type": "string",
+      "description": "API base URL. Change to your deployed URL for staging/production."
+    },
+    {
+      "key": "access_token",
+      "value": "",
+      "type": "string",
+      "description": "JWT access token. Obtain from the Auth / Login endpoint."
+    },
+    {
+      "key": "resource_id",
+      "value": "",
+      "type": "string",
+      "description": "Auto-populated by the Create Resource request test script."
+    },
+    {
+      "key": "field_id",
+      "value": "",
+      "type": "string",
+      "description": "UUID of the field to scope resources to. Optional on most requests."
+    }
+  ],
+  "item": [
+    {
+      "name": "Create Resource (Upload File)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 201) {",
+              "  const body = pm.response.json();",
+              "  pm.collectionVariables.set('resource_id', body.id);",
+              "  pm.test('Resource created', () => pm.expect(pm.response.code).to.equal(201));",
+              "  pm.test('Has id', () => pm.expect(body.id).to.be.a('string'));",
+              "  pm.test('isProcessed is false', () => pm.expect(body.isProcessed).to.equal(false));",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{access_token}}"
+          }
+        ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "type",
+              "value": "document",
+              "type": "text",
+              "description": "Required. One of: document, textbook, image, audio, video, link"
+            },
+            {
+              "key": "title",
+              "value": "Lecture Notes Week 3",
+              "type": "text",
+              "description": "Required."
+            },
+            {
+              "key": "description",
+              "value": "Covers chapters 5–7",
+              "type": "text",
+              "description": "Optional."
+            },
+            {
+              "key": "fieldId",
+              "value": "{{field_id}}",
+              "type": "text",
+              "description": "Optional. UUID of the field to attach this resource to."
+            },
+            {
+              "key": "tags",
+              "value": "[\"physics\",\"week3\"]",
+              "type": "text",
+              "description": "Optional. JSON array string."
+            },
+            {
+              "key": "file",
+              "type": "file",
+              "src": [],
+              "description": "Required for all types except 'link'. Max 50 MB. Accepted formats per type — document: pdf, docx, xlsx, pptx, txt, csv | image: jpg, png, gif, webp, svg | audio: mp3, wav, ogg, aac, flac | video: mp4, webm, mov, avi."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources"]
+        },
+        "description": "Uploads a file and creates a new resource record.\n\nThe `file` field must be included for all types except `link`. File is validated against a MIME-type whitelist before upload.\n\n**Accepted MIME types by resource type:**\n- `document`: application/pdf, application/msword, .docx, .xlsx, .pptx, text/plain, text/csv\n- `textbook`: application/pdf, application/msword, .docx, text/plain\n- `image`: image/jpeg, image/png, image/gif, image/webp, image/svg+xml\n- `audio`: audio/mpeg, audio/wav, audio/ogg, audio/mp4, audio/aac, audio/flac\n- `video`: video/mp4, video/mpeg, video/webm, video/quicktime, video/x-msvideo\n- `link`: no file — use `externalUrl` instead\n\n**Max file size:** 50 MB"
+      },
+      "response": [
+        {
+          "name": "201 Created — Document uploaded",
+          "originalRequest": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "type", "value": "document", "type": "text" },
+                { "key": "title", "value": "Lecture Notes Week 3", "type": "text" },
+                { "key": "description", "value": "Covers chapters 5–7", "type": "text" },
+                { "key": "tags", "value": "[\"physics\",\"week3\"]", "type": "text" },
+                { "key": "file", "type": "file", "src": [] }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/resources",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "resources"]
+            }
+          },
+          "status": "Created",
+          "code": 201,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3\",\n  \"description\": \"Covers chapters 5\\u20137\",\n  \"fieldId\": null,\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"tags\": [\"physics\", \"week3\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n}"
+        },
+        {
+          "name": "400 Bad Request — File too large",
+          "originalRequest": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "body": { "mode": "formdata", "formdata": [] },
+            "url": { "raw": "{{base_url}}/api/v1/resources", "host": ["{{base_url}}"], "path": ["api", "v1", "resources"] }
+          },
+          "status": "Bad Request",
+          "code": 400,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"statusCode\": 400,\n  \"message\": \"File is too large. Maximum allowed size is 50 MB.\",\n  \"error\": \"Bad Request\"\n}"
+        },
+        {
+          "name": "400 Bad Request — Unsupported MIME type",
+          "originalRequest": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "body": { "mode": "formdata", "formdata": [] },
+            "url": { "raw": "{{base_url}}/api/v1/resources", "host": ["{{base_url}}"], "path": ["api", "v1", "resources"] }
+          },
+          "status": "Bad Request",
+          "code": 400,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"statusCode\": 400,\n  \"message\": \"Unsupported file type \\\"application/zip\\\" for resource type \\\"document\\\". Allowed: application/pdf, application/msword, ...\",\n  \"error\": \"Bad Request\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "Create Resource (External Link)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 201) {",
+              "  const body = pm.response.json();",
+              "  pm.collectionVariables.set('resource_id', body.id);",
+              "  pm.test('Link resource created', () => pm.expect(pm.response.code).to.equal(201));",
+              "  pm.test('externalUrl present', () => pm.expect(body.externalUrl).to.be.a('string'));",
+              "  pm.test('fileUrl is null', () => pm.expect(body.fileUrl).to.be.null);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" }
+        ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "type", "value": "link", "type": "text", "description": "Must be 'link' for external URL resources." },
+            { "key": "title", "value": "Khan Academy — Kinematics", "type": "text" },
+            { "key": "externalUrl", "value": "https://www.khanacademy.org/science/physics/one-dimensional-motion", "type": "text", "description": "Required for type=link. Must be a valid URL." },
+            { "key": "fieldId", "value": "{{field_id}}", "type": "text", "description": "Optional." },
+            { "key": "tags", "value": "[\"physics\",\"external\"]", "type": "text", "description": "Optional." }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources"]
+        },
+        "description": "Creates a resource that points to an external URL. No file upload is required. `externalUrl` must be a valid fully-qualified URL."
+      },
+      "response": [
+        {
+          "name": "201 Created — Link resource",
+          "originalRequest": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "type", "value": "link", "type": "text" },
+                { "key": "title", "value": "Khan Academy — Kinematics", "type": "text" },
+                { "key": "externalUrl", "value": "https://www.khanacademy.org/science/physics", "type": "text" }
+              ]
+            },
+            "url": { "raw": "{{base_url}}/api/v1/resources", "host": ["{{base_url}}"], "path": ["api", "v1", "resources"] }
+          },
+          "status": "Created",
+          "code": 201,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"id\": \"b2c3d4e5-f6a7-8901-bcde-f12345678901\",\n  \"type\": \"link\",\n  \"title\": \"Khan Academy \\u2014 Kinematics\",\n  \"description\": null,\n  \"fieldId\": null,\n  \"fileUrl\": null,\n  \"fileName\": null,\n  \"fileSize\": null,\n  \"mimeType\": null,\n  \"externalUrl\": \"https://www.khanacademy.org/science/physics/one-dimensional-motion\",\n  \"isProcessed\": false,\n  \"tags\": [\"physics\", \"external\"],\n  \"createdAt\": \"2026-05-11T10:05:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:05:00.000Z\"\n}"
+        },
+        {
+          "name": "400 Bad Request — externalUrl missing",
+          "originalRequest": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "body": { "mode": "formdata", "formdata": [{ "key": "type", "value": "link", "type": "text" }] },
+            "url": { "raw": "{{base_url}}/api/v1/resources", "host": ["{{base_url}}"], "path": ["api", "v1", "resources"] }
+          },
+          "status": "Bad Request",
+          "code": 400,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"statusCode\": 400,\n  \"message\": \"External URL is required for link type resources\",\n  \"error\": \"Bad Request\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "List Resources",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
+              "const body = pm.response.json();",
+              "pm.test('Has data array', () => pm.expect(body.data).to.be.an('array'));",
+              "pm.test('Has pagination', () => pm.expect(body.pagination).to.have.all.keys('page','limit','total','totalPages'));"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources?page=1&limit=10",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources"],
+          "query": [
+            { "key": "page", "value": "1", "description": "Page number. Min: 1. Default: 1." },
+            { "key": "limit", "value": "10", "description": "Items per page. Min: 1, Max: 100. Default: 10." },
+            { "key": "type", "value": "document", "description": "Filter by type: document | textbook | image | audio | video | link", "disabled": true },
+            { "key": "fieldId", "value": "{{field_id}}", "description": "Filter by field UUID.", "disabled": true },
+            { "key": "search", "value": "lecture", "description": "Case-insensitive search on title and description.", "disabled": true },
+            { "key": "tag", "value": "physics", "description": "Filter by a single tag (exact match, case-insensitive).", "disabled": true }
+          ]
+        },
+        "description": "Returns a paginated list of the authenticated user's resources.\n\nAll query parameters are optional. `page` and `limit` default to `1` and `10` respectively. `limit` is capped at 100."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources?page=1&limit=10", "host": ["{{base_url}}"], "path": ["api", "v1", "resources"], "query": [{ "key": "page", "value": "1" }, { "key": "limit", "value": "10" }] }
+          },
+          "status": "OK",
+          "code": 200,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"data\": [\n    {\n      \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n      \"type\": \"document\",\n      \"title\": \"Lecture Notes Week 3\",\n      \"description\": \"Covers chapters 5\\u20137\",\n      \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n      \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n      \"fileName\": \"lecture-notes.pdf\",\n      \"fileSize\": 204800,\n      \"mimeType\": \"application/pdf\",\n      \"externalUrl\": null,\n      \"isProcessed\": false,\n      \"tags\": [\"physics\", \"week3\"],\n      \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n      \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 10,\n    \"total\": 47,\n    \"totalPages\": 5\n  }\n}"
+        }
+      ]
+    },
+    {
+      "name": "Get Single Resource",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
+              "const body = pm.response.json();",
+              "pm.test('Correct id', () => pm.expect(body.id).to.equal(pm.collectionVariables.get('resource_id')));"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources/{{resource_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources", "{{resource_id}}"]
+        },
+        "description": "Fetches a single resource by ID. Returns 404 if the resource does not exist or does not belong to the authenticated user."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources/{{resource_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "{{resource_id}}"] }
+          },
+          "status": "OK",
+          "code": 200,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3\",\n  \"description\": \"Covers chapters 5\\u20137\",\n  \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"tags\": [\"physics\", \"week3\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n}"
+        },
+        {
+          "name": "404 Not Found",
+          "originalRequest": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources/non-existent-id", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "non-existent-id"] }
+          },
+          "status": "Not Found",
+          "code": 404,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"statusCode\": 404,\n  \"message\": \"Resource not found\",\n  \"error\": \"Not Found\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "Update Resource",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
+              "const body = pm.response.json();",
+              "pm.test('Title updated', () => pm.expect(body.title).to.equal('Lecture Notes Week 3 (Revised)'));",
+              "pm.test('Tags updated', () => pm.expect(body.tags).to.include('revised'));"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "PATCH",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"description\": \"Updated with exam tips\",\n  \"fieldId\": \"{{field_id}}\",\n  \"tags\": [\"physics\", \"week3\", \"revised\"]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources/{{resource_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources", "{{resource_id}}"]
+        },
+        "description": "Updates resource metadata. All body fields are optional — only send what you want to change.\n\n**Tags behaviour:** Providing `tags` replaces the entire tag set. Send `\"tags\": []` to remove all tags. Omit `tags` entirely to leave them unchanged.\n\nFile replacement is not supported via this endpoint."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {
+            "method": "PATCH",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"tags\": [\"physics\", \"week3\", \"revised\"]\n}", "options": { "raw": { "language": "json" } } },
+            "url": { "raw": "{{base_url}}/api/v1/resources/{{resource_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "{{resource_id}}"] }
+          },
+          "status": "OK",
+          "code": 200,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"description\": \"Updated with exam tips\",\n  \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"tags\": [\"physics\", \"week3\", \"revised\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T11:00:00.000Z\"\n}"
+        },
+        {
+          "name": "400 Bad Request — Validation error",
+          "originalRequest": {
+            "method": "PATCH",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"title\": \"\"\n}", "options": { "raw": { "language": "json" } } },
+            "url": { "raw": "{{base_url}}/api/v1/resources/{{resource_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "{{resource_id}}"] }
+          },
+          "status": "Bad Request",
+          "code": 400,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"statusCode\": 400,\n  \"message\": [\"title should not be empty\"],\n  \"error\": \"Bad Request\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "Delete Resource",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
+              "const body = pm.response.json();",
+              "pm.test('Correct message', () => pm.expect(body.message).to.equal('Resource deleted successfully'));",
+              "if (pm.response.code === 200) {",
+              "  pm.collectionVariables.set('resource_id', '');",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "DELETE",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources/{{resource_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources", "{{resource_id}}"]
+        },
+        "description": "Permanently deletes the resource record and removes the associated file from Cloudinary storage. This action is irreversible."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources/{{resource_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "{{resource_id}}"] }
+          },
+          "status": "OK",
+          "code": 200,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"message\": \"Resource deleted successfully\"\n}"
+        },
+        {
+          "name": "404 Not Found",
+          "originalRequest": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources/non-existent-id", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "non-existent-id"] }
+          },
+          "status": "Not Found",
+          "code": 404,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"statusCode\": 404,\n  \"message\": \"Resource not found\",\n  \"error\": \"Not Found\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "Get Resources by Field",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
+              "const body = pm.response.json();",
+              "pm.test('Has data array', () => pm.expect(body.data).to.be.an('array'));",
+              "pm.test('Has pagination', () => pm.expect(body.pagination).to.have.all.keys('page','limit','total','totalPages'));"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources/field/{{field_id}}?page=1&limit=20",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources", "field", "{{field_id}}"],
+          "query": [
+            { "key": "page", "value": "1", "description": "Page number. Min: 1. Default: 1." },
+            { "key": "limit", "value": "20", "description": "Items per page. Default: 20." }
+          ]
+        },
+        "description": "Returns a paginated list of resources attached to a specific field. Results are ordered by `createdAt` descending."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources/field/{{field_id}}?page=1&limit=20", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "field", "{{field_id}}"], "query": [{ "key": "page", "value": "1" }, { "key": "limit", "value": "20" }] }
+          },
+          "status": "OK",
+          "code": 200,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"data\": [\n    {\n      \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n      \"type\": \"document\",\n      \"title\": \"Lecture Notes Week 3\",\n      \"description\": \"Covers chapters 5\\u20137\",\n      \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n      \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n      \"fileName\": \"lecture-notes.pdf\",\n      \"fileSize\": 204800,\n      \"mimeType\": \"application/pdf\",\n      \"externalUrl\": null,\n      \"isProcessed\": false,\n      \"tags\": [\"physics\", \"week3\"],\n      \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n      \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 20,\n    \"total\": 12,\n    \"totalPages\": 1\n  }\n}"
+        }
+      ]
+    },
+    {
+      "name": "Get Resource Stats",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
+              "const body = pm.response.json();",
+              "pm.test('Has total', () => pm.expect(body.total).to.be.a('number'));",
+              "pm.test('Has byType', () => pm.expect(body.byType).to.be.an('object'));"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources/stats",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources", "stats"]
+        },
+        "description": "Returns the total number of the user's resources and a count broken down by resource type."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources/stats", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "stats"] }
+          },
+          "status": "OK",
+          "code": 200,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"total\": 23,\n  \"byType\": {\n    \"document\": 10,\n    \"image\": 5,\n    \"audio\": 3,\n    \"video\": 2,\n    \"link\": 2,\n    \"textbook\": 1\n  }\n}"
+        }
+      ]
+    },
+    {
+      "name": "Get All Tags",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
+              "const body = pm.response.json();",
+              "pm.test('Returns array', () => pm.expect(body).to.be.an('array'));",
+              "if (body.length > 0) {",
+              "  pm.test('Each item has tag and count', () => {",
+              "    pm.expect(body[0]).to.have.all.keys('tag', 'count');",
+              "  });",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources/tags",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources", "tags"]
+        },
+        "description": "Returns all unique tags used across the authenticated user's resources, ordered by usage frequency (most used first)."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources/tags", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "tags"] }
+          },
+          "status": "OK",
+          "code": 200,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "[\n  { \"tag\": \"physics\", \"count\": 8 },\n  { \"tag\": \"week3\",   \"count\": 5 },\n  { \"tag\": \"revised\", \"count\": 2 },\n  { \"tag\": \"external\", \"count\": 1 }\n]"
+        }
+      ]
+    },
+    {
+      "name": "Get Resources for AI Context (RAG)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
+              "const body = pm.response.json();",
+              "pm.test('Returns array', () => pm.expect(body).to.be.an('array'));",
+              "if (body.length > 0) {",
+              "  pm.test('Each item has required RAG fields', () => {",
+              "    pm.expect(body[0]).to.have.all.keys('id', 'type', 'title', 'description', 'content', 'url');",
+              "  });",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/v1/resources/rag",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "resources", "rag"],
+          "query": [
+            { "key": "fieldId", "value": "{{field_id}}", "description": "Optional. Scopes results to a specific field.", "disabled": true }
+          ]
+        },
+        "description": "Returns a lightweight list of resources for use as AI context in RAG pipelines. Includes `content` (extracted text) where `isProcessed` is `true`. `content` is `null` for unprocessed resources.\n\nUse `fieldId` to scope context to a specific subject area."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/resources/rag", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "rag"] }
+          },
+          "status": "OK",
+          "code": 200,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "[\n  {\n    \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n    \"type\": \"document\",\n    \"title\": \"Lecture Notes Week 3\",\n    \"description\": \"Covers chapters 5\\u20137\",\n    \"content\": \"Chapter 5: Kinematics. Displacement is the change in position...\",\n    \"url\": null\n  },\n  {\n    \"id\": \"b2c3d4e5-f6a7-8901-bcde-f12345678901\",\n    \"type\": \"link\",\n    \"title\": \"Khan Academy \\u2014 Kinematics\",\n    \"description\": null,\n    \"content\": null,\n    \"url\": \"https://www.khanacademy.org/science/physics/one-dimensional-motion\"\n  }\n]"
+        }
+      ]
+    }
+  ]
+}

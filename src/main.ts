@@ -23,6 +23,15 @@ process.on('uncaughtException', (err: Error) => {
   throw err;
 });
 
+// Catch unhandled promise rejections so they surface in logs instead of
+// silently swallowing errors or crashing Node 15+ with an unhandled rejection.
+process.on('unhandledRejection', (reason: unknown) => {
+  console.error('[unhandledRejection]', reason);
+  // Do NOT exit — log only. Crashing the process on every unhandled rejection
+  // would take down all active WebSocket sessions. Individual errors are already
+  // caught and reported at the call site via try/catch or .catch() handlers.
+});
+
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     rawBody: true,

@@ -14,9 +14,9 @@ export class UploadController {
     @CurrentUser('id') userId: string,
     @UploadedFile() file: Express.Multer.File,
   ) {
-    if (!userId) {
-      throw new BadRequestException('User not authenticated');
-    }
+    // if (!userId) {
+    //   throw new BadRequestException('User not authenticated');
+    // }
 
     const result = await this.uploadService.uploadFile(file, UploadFolder.FILES, 'auto');
 
