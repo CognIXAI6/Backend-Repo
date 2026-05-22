@@ -69,15 +69,21 @@ export class DeepgramService implements OnModuleInit {
 
     // ── Step 1: build the V1Socket (does NOT open the connection yet) ─────────
     const rawSocket = (await this.deepgram.listen.v1.connect({
-      Authorization:    `Token ${this.apiKey}`,
-      model:            'nova-2',
-      language:         'en-US',
-      smart_format:     'true',
-      interim_results:  'true',
-      utterance_end_ms: '3000',
-      vad_events:       'true',
+      Authorization:           `Token ${this.apiKey}`,
+      model:                   'nova-2',
+      language:                'en-US',
+      smart_format:            'true',
+      interim_results:         'true',
+      utterance_end_ms:        '3000',
+      vad_events:              'true',
       // Enable speaker diarization when requested (dual-speaker mode)
       ...(options?.diarize ? { diarize: 'true' } : {}),
+      // Fail fast: don't retry on connection failure during session start.
+      // The gateway catch block will surface a clear error to the client instead
+      // of leaving 30 zombie reconnect attempts running in the background.
+      reconnectAttempts:       0,
+      // Close the TCP connection if the WS upgrade doesn't complete within 10 s.
+      connectionTimeoutInSeconds: 10,
     })) as unknown as V1Socket;
 
     // ── Step 2: register event handlers BEFORE calling connect()/waitForOpen() ─
@@ -119,21 +125,39 @@ export class DeepgramService implements OnModuleInit {
     });
 
     // ── Step 3: call connect() to start WS handshake, then waitForOpen() ─────
-    // V1Socket.connect() calls socket.reconnect() to start the handshake.
-    // waitForOpen() returns a promise that resolves only when readyState === OPEN.
-    // Without this, audio arrives before the socket is open → readyState=3 (CLOSED).
     const socket = rawSocket.connect();
 
-    // waitForOpen() can reject (TIMEOUT) when Deepgram is unreachable or the API
-    // key is invalid.  Catch it here so we can clean up and surface a proper error
-    // to the gateway rather than leaving an orphaned socket.
+    // waitForOpen() rejects with a raw ErrorEvent (not an Error instance) when
+    // Deepgram rejects the connection (invalid API key, quota exceeded, network
+    // failure, etc.).  Wrap it so the gateway always gets a proper Error with a
+    // human-readable message, and close the socket immediately on failure so the
+    // underlying ReconnectingWebSocket stops its retry loop.
     try {
-      await socket.waitForOpen();
+      // Race waitForOpen() against a 10-second timeout so a hanging TCP connection
+      // (Deepgram accepts TCP but never upgrades to WS) doesn't block forever.
+      await Promise.race([
+        socket.waitForOpen(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Deepgram connection timed out after 10 s')), 10_000),
+        ),
+      ]);
     } catch (err) {
-      this.logger.error(`[${sessionId}] Deepgram waitForOpen failed: ${(err as Error).message}`);
+      // Convert non-Error rejections (e.g. ErrorEvent from the WS layer) to
+      // proper Error instances so callers always have a .message to log/display.
+      const reason =
+        err instanceof Error
+          ? err.message
+          : typeof (err as { message?: string }).message === 'string'
+            ? (err as { message: string }).message
+            : JSON.stringify(err);
+
+      const wrappedErr = new Error(`Deepgram connection failed: ${reason}`);
+
+      this.logger.error(`[${sessionId}] ${wrappedErr.message}`);
+      // Close immediately so the SDK stops its internal retry loop
       try { socket.close(); } catch (_) {}
-      emitter.emit('error', err instanceof Error ? err : new Error(String(err)));
-      throw err; // re-throw so handleSessionStart emits error to the WS client
+      emitter.emit('error', wrappedErr);
+      throw wrappedErr;
     }
 
     this.logger.log(`[${sessionId}] Deepgram socket ready (readyState=${socket.readyState})`);
@@ -157,7 +181,7 @@ export class DeepgramService implements OnModuleInit {
     // Calling close() on state 0 or 3 is what triggers the secondary ws crash.
     const close = (): void => {
       try {
-        if (socket.readyState === 1) socket.sendCloseStream();
+        if (socket.readyState === 1) socket.sendCloseStream({} as any);
       } catch (_) {}
       try {
         if (socket.readyState === 0 || socket.readyState === 1) socket.close();
