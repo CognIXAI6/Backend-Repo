@@ -21,6 +21,7 @@ import { GuestSessionService } from './services/guest-session.service';
 import { VoiceVerificationService } from './services/voice-verification.service';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
 import { UsersService } from '@/modules/users/users.service';
+import { SpeakersService } from '@/modules/speakers/speakers.service';
 import { EmailService } from '@/modules/email/email.service';
 import { FieldsService } from '@/modules/fields/fields.service';
 import { ErrorLogService } from '@/modules/error-log/error-log.service';
@@ -84,10 +85,17 @@ interface ActiveSession {
 
   // ── Speaker naming ────────────────────────────────────────────────────────
   /**
-   * Display name for the non-owner speaker. Set via session:name_speaker.
-   * Included in every transcript:update so the frontend has a stable name source.
+   * Display name for the non-owner speaker. Set via session:name_speaker or
+   * auto-resolved by identifyOtherSpeaker() after biometric calibration.
+   * Falls back to "Guest Speaker" if no registered speaker matches.
    */
   otherSpeakerName: string | null;
+  /** Cached display name for the owner (from user record). */
+  cachedOwnerName: string;
+  /** Owner's accumulated words since the last AI trigger (mirrors pendingOtherText). */
+  pendingOwnerText: string;
+  /** True once identifyOtherSpeaker() has been dispatched — prevents re-runs. */
+  otherSpeakerIdentificationTriggered: boolean;
 
   // ── Backend voice calibration ─────────────────────────────────────────────
   /**
@@ -181,6 +189,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly errorLogService: ErrorLogService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly speakersService: SpeakersService,
   ) {}
 
   /**
@@ -343,11 +352,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // Avoids repeated findById() on every AI prompt within this session.
       let cachedAiMemory: string | null = null;
       let cachedVoiceSpeakerId: string | null = null;
+      let cachedOwnerName = 'You';
 
       if (!isGuest) {
         const userRecord = await this.usersService.findById(userId);
         cachedAiMemory = userRecord?.ai_memory ?? null;
         cachedVoiceSpeakerId = userRecord?.voice_speaker_id ?? null;
+        cachedOwnerName = userRecord?.name || userRecord?.email?.split('@')[0] || 'You';
       }
 
       // ── Create or resume conversation ─────────────────────────────────────
@@ -392,6 +403,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         cachedAiMemory,
         cachedVoiceSpeakerId,
         otherSpeakerName: null,
+        cachedOwnerName,
+        pendingOwnerText: '',
+        otherSpeakerIdentificationTriggered: false,
         idleTimeoutHandle: null,
         audioBuffer: [],
         audioBufferBytes: 0,
@@ -504,6 +518,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
             if (label === 'other') {
               session.pendingOtherText = (session.pendingOtherText + ' ' + text).trim();
+            } else {
+              session.pendingOwnerText = (session.pendingOwnerText + ' ' + text).trim();
             }
           }
 
@@ -558,8 +574,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             const otherText = session.pendingOtherText.trim();
             if (!otherText) return;
 
+            const ownerText = session.pendingOwnerText.trim();
             session.pendingOtherText = '';
-            await this.processDualSpeakerPrompt(client, session, otherText);
+            session.pendingOwnerText = '';
+            await this.processDualSpeakerPrompt(client, session, otherText, ownerText);
             return;
           }
 
@@ -1017,16 +1035,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     client: Socket,
     session: ActiveSession,
     otherPersonText: string,
+    ownerText: string = '',
   ): Promise<void> {
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
 
+    const speakerName = session.otherSpeakerName ?? 'Guest Speaker';
+    const ownerName = session.cachedOwnerName;
+
     try {
       // Cap context at the last 40 turns so Claude input doesn't grow unbounded
       const recentHistory = session.dualSpeakerHistory.slice(-40);
       const conversationContext = recentHistory
-        .map((t) => `[${t.speaker === 'owner' ? 'Owner' : 'Other Person'}]: ${t.text}`)
+        .map((t) => `[${t.speaker === 'owner' ? ownerName : speakerName}]: ${t.text}`)
         .join('\n');
 
       const userMessage = `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`;
@@ -1037,7 +1059,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.cachedAiMemory ?? undefined,
       );
 
-      client.emit('transcript:confirmed', { transcript: otherPersonText, inputType: 'voice', speaker: 'other' });
+      // Emit both speaker transcripts so the frontend can render all three turns together.
+      // Legacy fields (transcript, speaker string) are kept for backward compatibility
+      // until the frontend is updated to read the new `owner`/`speaker` objects.
+      client.emit('transcript:confirmed', {
+        transcript: otherPersonText,   // legacy — was the only transcript
+        inputType: 'voice',
+        speaker: 'other',              // legacy — was a plain string
+        owner: { transcript: ownerText, name: ownerName },
+        otherSpeaker: { transcript: otherPersonText, name: speakerName },
+      });
       client.emit('ai:start');
       aiStarted = true;
 
@@ -1053,6 +1084,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         },
 
         onDone: async (fullText, inputTokens, outputTokens) => {
+          // Save owner turn if they spoke this round
+          if (ownerText) {
+            await this.conversationService.saveMessage({
+              conversationId: session.conversationId,
+              role: 'user',
+              content: ownerText,
+              transcript: ownerText,
+              speakerLabel: 'owner',
+            });
+          }
           await this.conversationService.saveMessage({
             conversationId: session.conversationId,
             role: 'user',
@@ -1078,6 +1119,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             response: fullText,
             tokensUsed: inputTokens + outputTokens,
             latencyMs: Date.now() - aiStartTime,
+            // Structured turn data so the frontend can render all three segments
+            dualSpeaker: {
+              owner: { transcript: ownerText, name: ownerName },
+              speaker: { transcript: otherPersonText, name: speakerName },
+            },
           });
           session.isProcessingAI = false;
         },
@@ -1282,6 +1328,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
       const audioUrl = uploadResult.secure_url;
 
+      // Identify the other speaker against registered speakers (fire-and-forget)
+      if (!session.otherSpeakerIdentificationTriggered) {
+        session.otherSpeakerIdentificationTriggered = true;
+        this.identifyOtherSpeaker(client, session, audioUrl).catch((err) =>
+          this.logger.error(`[${client.id}] Other speaker identification failed:`, err),
+        );
+      }
+
       // Use cached voice_speaker_id — avoids a findById round trip
       const voiceSpeakerId = session.cachedVoiceSpeakerId;
 
@@ -1402,6 +1456,74 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // Non-fatal — word-count calibration already ran, session continues normally
       this.logger.error(`[${client.id}] Auto voice calibration failed:`, err);
     }
+  }
+
+  /**
+   * Attempts to identify the non-owner speaker by checking the session audio
+   * against every registered non-owner speaker for this user.
+   * Sets session.otherSpeakerName to the matched speaker's name or "Guest Speaker".
+   * Emits `speaker:identified` so the frontend can update the display name immediately.
+   */
+  private async identifyOtherSpeaker(
+    client: Socket,
+    session: ActiveSession,
+    audioUrl: string,
+  ): Promise<void> {
+    // Skip for guests or if the user already named the speaker manually
+    if (session.isGuest || session.otherSpeakerName) return;
+
+    if (!this.voiceVerificationService.isEnabled) {
+      session.otherSpeakerName = 'Guest Speaker';
+      client.emit('speaker:identified', {
+        speakerName: 'Guest Speaker',
+        method: 'service_disabled',
+        speakerNames: { owner: session.cachedOwnerName, other: 'Guest Speaker' },
+      });
+      return;
+    }
+
+    const allSpeakers = await this.speakersService.getUserSpeakers(session.userId);
+    const candidates = allSpeakers.filter((s) => !s.is_owner && s.voice_speaker_id);
+
+    if (candidates.length === 0) {
+      session.otherSpeakerName = 'Guest Speaker';
+      client.emit('speaker:identified', {
+        speakerName: 'Guest Speaker',
+        method: 'no_registered_speakers',
+        speakerNames: { owner: session.cachedOwnerName, other: 'Guest Speaker' },
+      });
+      return;
+    }
+
+    let bestMatch: { name: string; score: number } | null = null;
+
+    for (const speaker of candidates) {
+      try {
+        const result = await this.voiceVerificationService.verifySpeaker(
+          speaker.voice_speaker_id!,
+          audioUrl,
+        );
+        if (result.verified && (!bestMatch || result.similarityScore > bestMatch.score)) {
+          bestMatch = { name: speaker.name, score: result.similarityScore };
+        }
+      } catch (err) {
+        this.logger.warn(`[${client.id}] Speaker check failed for "${speaker.name}":`, err);
+      }
+    }
+
+    const identifiedName = bestMatch?.name ?? 'Guest Speaker';
+    session.otherSpeakerName = identifiedName;
+
+    this.logger.log(
+      `[${client.id}] Other speaker identified: "${identifiedName}"${bestMatch ? ` (score=${bestMatch.score.toFixed(3)})` : ' (no match)'}`,
+    );
+
+    client.emit('speaker:identified', {
+      speakerName: identifiedName,
+      method: bestMatch ? 'voice_match' : 'no_match',
+      ...(bestMatch ? { similarityScore: bestMatch.score } : {}),
+      speakerNames: { owner: session.cachedOwnerName, other: identifiedName },
+    });
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────────
