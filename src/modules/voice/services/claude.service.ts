@@ -79,12 +79,22 @@ export class ClaudeService implements OnModuleInit {
     history: ConversationTurn[],
     systemPrompt: string,
     callbacks: ClaudeStreamCallbacks,
+    options: { enableWebSearch?: boolean } = {},
   ): Promise<void> {
+    // Sanitize history: if content is somehow an array (defensive against DB edge cases),
+    // flatten to text-only so no tool_use blocks leak into the messages array.
     const messages: Anthropic.MessageParam[] = [
-      ...history.map((turn) => ({
-        role: turn.role as 'user' | 'assistant',
-        content: turn.content,
-      })),
+      ...history.map((turn) => {
+        const c = turn.content as unknown;
+        if (Array.isArray(c)) {
+          const text = (c as Array<{ type: string; text?: string }>)
+            .filter((b) => b.type === 'text')
+            .map((b) => b.text ?? '')
+            .join('') || '…';
+          return { role: turn.role as 'user' | 'assistant', content: text };
+        }
+        return { role: turn.role as 'user' | 'assistant', content: String(c) };
+      }),
       { role: 'user', content: userMessage },
     ];
 
@@ -97,7 +107,10 @@ export class ClaudeService implements OnModuleInit {
       },
     ];
 
-    const tools = this.tavilyClient ? [WEB_SEARCH_TOOL] : undefined;
+    // Voice mode disables tools — web search adds 500ms–2s and is incompatible
+    // with real-time voice. Text mode keeps tools for current-events queries.
+    const tools =
+      options.enableWebSearch !== false && this.tavilyClient ? [WEB_SEARCH_TOOL] : undefined;
 
     try {
       // ── Single streaming call — stream from the very start ─────────────────
@@ -105,11 +118,13 @@ export class ClaudeService implements OnModuleInit {
       let inputTokens = 0;
       let outputTokens = 0;
 
-      // Accumulate tool-use block if Claude decides to call web_search
-      let toolUseId: string | null = null;
-      let toolName: string | null = null;
-      let toolInputJson = '';
-      let inToolUse = false;
+      // Collect ALL tool-use blocks Claude may emit in a single response.
+      // A single response can contain multiple tool_use blocks; only capturing
+      // the last one (as the old code did) leaves earlier ones without a
+      // matching tool_result, which causes a 400 from the Anthropic API.
+      interface PendingToolCall { id: string; name: string; inputJson: string }
+      const collectedToolCalls: PendingToolCall[] = [];
+      let activeToolCall: PendingToolCall | null = null;
 
       const stream = this.client.messages.stream({
         model: this.model,
@@ -126,22 +141,21 @@ export class ClaudeService implements OnModuleInit {
 
         if (event.type === 'content_block_start') {
           if (event.content_block.type === 'tool_use') {
-            inToolUse = true;
-            toolUseId = event.content_block.id;
-            toolName = event.content_block.name;
-            toolInputJson = '';
+            // Flush any previous tool call that was open (shouldn't happen, but safe)
+            if (activeToolCall) collectedToolCalls.push(activeToolCall);
+            activeToolCall = { id: event.content_block.id, name: event.content_block.name, inputJson: '' };
           } else {
-            inToolUse = false;
+            if (activeToolCall) { collectedToolCalls.push(activeToolCall); activeToolCall = null; }
           }
         }
 
         if (event.type === 'content_block_delta') {
-          if (event.delta.type === 'text_delta' && !inToolUse) {
+          if (event.delta.type === 'text_delta' && !activeToolCall) {
             const token = event.delta.text;
             fullText += token;
             callbacks.onToken(token);
-          } else if (event.delta.type === 'input_json_delta') {
-            toolInputJson += event.delta.partial_json;
+          } else if (event.delta.type === 'input_json_delta' && activeToolCall) {
+            activeToolCall.inputJson += event.delta.partial_json;
           }
         }
 
@@ -150,60 +164,57 @@ export class ClaudeService implements OnModuleInit {
         }
       }
 
+      // Flush any still-open tool call after the stream ends
+      if (activeToolCall) { collectedToolCalls.push(activeToolCall); activeToolCall = null; }
+
       const finalMessage = await stream.finalMessage();
 
-      // ── Tool use requested — run Tavily then stream the follow-up ──────────
-      if (
-        finalMessage.stop_reason === 'tool_use' &&
-        toolUseId &&
-        toolName === 'web_search' &&
-        this.tavilyClient
-      ) {
-        let query = '';
-        try {
-          query = (JSON.parse(toolInputJson) as { query: string }).query;
-        } catch {
-          query = userMessage;
-        }
+      // ── Tool use requested — run ALL Tavily searches then stream the follow-up ─
+      // Claude can emit multiple tool_use blocks in one response. We collect them
+      // all above and must provide a tool_result for EACH one; missing any causes
+      // a 400 "tool_use without tool_result" error from the Anthropic API.
+      const webSearchCalls = collectedToolCalls.filter(
+        (tc) => tc.name === 'web_search' && this.tavilyClient,
+      );
 
-        this.logger.log(`Web search triggered: "${query}"`);
+      if (finalMessage.stop_reason === 'tool_use' && webSearchCalls.length > 0) {
+        this.logger.log(`Web search triggered (${webSearchCalls.length} call(s))`);
 
-        let searchContent = '';
-        try {
-          const searchResult = await this.tavilyClient.search(query, {
-            searchDepth: 'basic',
-            maxResults: 5,
-          });
-          searchContent = searchResult.results
-            .map((r, i) => `[${i + 1}] ${r.title}\n${r.content}\nSource: ${r.url}`)
-            .join('\n\n');
-        } catch (searchErr) {
-          this.logger.error('Tavily search error:', searchErr);
-          searchContent = 'Search failed — please answer based on your training knowledge.';
-        }
+        // Run all searches in parallel to keep latency low
+        const toolResults = await Promise.all(
+          webSearchCalls.map(async (tc) => {
+            let query = userMessage;
+            try { query = (JSON.parse(tc.inputJson) as { query: string }).query; } catch {}
+
+            this.logger.log(`  → searching: "${query}"`);
+
+            let content = 'Search failed — please answer based on your training knowledge.';
+            try {
+              const r = await this.tavilyClient!.search(query, { searchDepth: 'basic', maxResults: 5 });
+              content = r.results
+                .map((res, i) => `[${i + 1}] ${res.title}\n${res.content}\nSource: ${res.url}`)
+                .join('\n\n');
+            } catch (err) {
+              this.logger.error(`Tavily search error for "${query}":`, err);
+            }
+
+            return { type: 'tool_result' as const, tool_use_id: tc.id, content };
+          }),
+        );
 
         const messagesWithTool: Anthropic.MessageParam[] = [
           ...messages,
           { role: 'assistant', content: finalMessage.content },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'tool_result',
-                tool_use_id: toolUseId,
-                content: searchContent,
-              },
-            ],
-          },
+          // Single user message with ALL tool_results — one per tool_use block
+          { role: 'user', content: toolResults },
         ];
 
-        // Stream the final answer after the tool result
+        // Stream the final answer — disable tools on follow-up to avoid recursion
         fullText = '';
         const followUpStream = this.client.messages.stream({
           model: this.model,
           max_tokens: 300,
           system: systemWithCache,
-          tools,
           messages: messagesWithTool,
         });
 
@@ -437,6 +448,46 @@ ${fieldBlock}${memoryBlock}`;
     });
     const block = response.content[0];
     return block.type === 'text' ? block.text.trim() : userPrompt.slice(0, 50);
+  }
+
+  /**
+   * Fast topic-relevance gate. Returns true if the utterance is relevant to the
+   * ongoing AI conversation, false if it is clearly off-topic ambient speech
+   * (e.g. narrating a movie to someone else, unrelated social chatter).
+   *
+   * Uses Haiku with max_tokens:1 so cost and latency are negligible (~200-400ms).
+   * Defaults to true on any error so the filter never silently blocks real input.
+   */
+  async checkTopicRelevance(
+    transcript: string,
+    history: Array<{ role: 'user' | 'assistant'; content: string }>,
+  ): Promise<boolean> {
+    const context = history
+      .slice(-6)
+      .map((m) => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content.slice(0, 120)}`)
+      .join('\n');
+
+    try {
+      const response = await this.client.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1,
+        system:
+          'You are a relevance filter for a voice AI assistant. ' +
+          'Reply Y if the utterance is relevant to the AI conversation, ' +
+          'or N if it is clearly off-topic ambient speech (narrating events to another person, ' +
+          'social chitchat addressed to someone else, random content unrelated to the conversation). ' +
+          'When in doubt, reply Y.',
+        messages: [
+          {
+            role: 'user',
+            content: `Conversation:\n${context}\n\nNew utterance: "${transcript.slice(0, 200)}"\n\nRelevant?`,
+          },
+        ],
+      });
+      return (response.content[0] as Anthropic.TextBlock)?.text?.trim().toUpperCase() !== 'N';
+    } catch {
+      return true; // fail open — never silently block real input
+    }
   }
 
   async summarizeConversationForMemory(

@@ -139,24 +139,50 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
   private readonly FILLER_WORDS = new Set([
+    // Pure noise / hesitation sounds — never carry intent
     'um', 'uh', 'hmm', 'hm', 'ah', 'er', 'erm', 'mhm',
-    'okay', 'ok', 'yeah', 'yep', 'yup', 'nope',
-    'right', 'sure', 'well', 'so', 'just', 'anyway',
+  ]);
+
+  /**
+   * Short phrases that are intentional voice commands.
+   * These bypass the minimum-length check so "yes", "continue", etc. reach Claude.
+   * They are NOT filtered by filler_only because they carry clear conversational intent.
+   */
+  private readonly VOICE_COMMANDS = new Set([
+    'yes', 'no', 'sure', 'okay', 'ok', 'right', 'got it',
+    'continue', 'expand', 'more', 'go on', 'keep going', 'tell me more',
+    'explain', 'elaborate', 'why', 'how', 'what', 'when', 'where', 'who',
+    'really', 'interesting', 'what else', 'and then', 'what next', 'so what',
+    'stop', 'pause', 'thanks', 'thank you',
   ]);
 
   /**
    * Returns true only if the transcript is worth sending to Claude.
-   * Checks: minimum length, Deepgram confidence, and filler-word-only content.
+   * Checks: minimum length (with voice-command bypass), Deepgram confidence, and filler-word-only content.
    */
+  // Regex: ends with comma OR ends with a bare conjunction/incomplete word (≤10 words total).
+  // Catches "how about," and "In Nigeria. And, I want to also" without over-filtering.
+  private readonly INCOMPLETE_FRAGMENT_RE =
+    /[,]$|[\s](and|or|but|so|because|when|if|as|while|then|also|to|the|a|an)\.?$/i;
+
   private isTranscriptMeaningful(
     transcript: string,
     avgConfidence: number,
   ): { pass: boolean; reason?: string } {
     const trimmed = transcript.trim();
+    const lower = trimmed.toLowerCase().replace(/[^a-z\s]/g, '').trim();
     const words = trimmed.split(/\s+/).filter(Boolean);
 
-    // Layer 1 — too short to be a real prompt
-    if (words.length < 2 || trimmed.replace(/\s/g, '').length < 8) {
+    // Layer 0 — dangling fragment (trailing comma or bare conjunction at end of short utterance)
+    if (words.length <= 10 && this.INCOMPLETE_FRAGMENT_RE.test(trimmed)) {
+      return { pass: false, reason: 'incomplete_fragment' };
+    }
+
+    // Layer 1 — too short, but allow known voice commands through unconditionally
+    if (words.length < 2 || trimmed.replace(/\s/g, '').length < 6) {
+      if (this.VOICE_COMMANDS.has(lower)) {
+        return { pass: true }; // Intentional command — skip remaining checks
+      }
       return { pass: false, reason: 'too_short' };
     }
 
@@ -253,6 +279,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   handleConnection(client: Socket): void {
     this.logger.log(`Client connected: ${client.id}`);
+    const auth = client.handshake.auth as Record<string, unknown>;
+    const token = (auth?.accessToken ?? auth?.token) as string | undefined;
+    if (token) {
+      try {
+        this.jwtService.verify<{ sub: string }>(token, {
+          secret: this.configService.get<string>('jwt.secret'),
+        });
+      } catch {
+        this.logger.warn(`Client ${client.id} rejected — invalid JWT at handshake`);
+        client.emit('error', { code: 'INVALID_TOKEN', message: 'Your session has expired. Please log in again.' });
+        client.disconnect(true);
+      }
+    }
   }
 
   handleDisconnect(client: Socket): void {
@@ -363,6 +402,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       // ── Create or resume conversation ─────────────────────────────────────
       let conversationId = payload.conversationId;
+      if (conversationId) {
+        // Validate ownership before attaching — prevents session hijacking
+        try {
+          await this.conversationService.assertOwnership(conversationId, userId);
+        } catch {
+          // Ownership check failed; silently create a fresh conversation
+          this.logger.warn(`session:start: conversationId ${conversationId} not owned by ${userId} — creating new`);
+          conversationId = undefined;
+        }
+      }
       if (!conversationId) {
         const conv = await this.conversationService.createConversation(
           userId,
@@ -397,8 +446,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         calibrationPhase: isDualSpeaker,
         dualSpeakerHistory: [],
         pendingOtherText: '',
-        // Single-speaker: 5 s is enough; dual-speaker needs 10 s to accumulate context
-        utteranceDebounceMs: isDualSpeaker ? 10_000 : 5_000,
+        // Single-speaker: 1.5 s feels responsive; dual-speaker: 3 s to accumulate context
+        utteranceDebounceMs: isDualSpeaker ? 3_000 : 1_500,
         utteranceDebounceTimer: null,
         cachedAiMemory,
         cachedVoiceSpeakerId,
@@ -618,7 +667,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
 
       emitter.on('error', (err: Error) => {
-        this.emitError(client, 'DEEPGRAM_ERROR', err.message, { clientMessage: 'Voice connection interrupted. Please try again.' });
+        this.logger.warn(`Deepgram error for session ${client.id}: ${err.message}`);
+        client.emit('session:degraded', {
+          reason: 'deepgram_error',
+          message: 'Voice connection interrupted. Tap the mic to reconnect.',
+        });
+        this.cleanupSession(client.id);
       });
 
       this.sessions.set(client.id, session);
@@ -1135,7 +1189,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           }
           session.isProcessingAI = false;
         },
-      });
+      },
+      { enableWebSearch: false },
+      );
     } catch (err) {
       this.logger.error('processDualSpeakerPrompt error:', err);
       this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
@@ -1189,7 +1245,27 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let aiStarted = false;
 
     try {
-      // 1. Persist user message
+      // 1. Load conversation history FIRST — needed for both topic check and Claude context.
+      //    No ownership re-check needed; established at session:start.
+      const history = await this.conversationService.getRecentHistoryForAI(
+        session.conversationId,
+        40,
+      );
+
+      // 2. Topic relevance gate (voice only, after ≥4 messages = 2 full turns).
+      //    Off-topic speech (narrating a movie, chatting with someone else, etc.)
+      //    is silently skipped before any DB write or Claude call.
+      if (inputType === 'voice' && history.length >= 4) {
+        const relevant = await this.claudeService.checkTopicRelevance(userMessage, history);
+        if (!relevant) {
+          this.logger.log(`Topic filter blocked: "${userMessage.slice(0, 80)}…"`);
+          client.emit('ai:skipped', { reason: 'off_topic', transcript: userMessage });
+          session.isProcessingAI = false;
+          return;
+        }
+      }
+
+      // 3. Persist user message (only after passing relevance check)
       await this.conversationService.saveMessage({
         conversationId: session.conversationId,
         role: 'user',
@@ -1201,15 +1277,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       client.emit('ai:start');
       aiStarted = true;
 
-      // 2. Load conversation history + AI memory for Claude context
-      // Use cached ai_memory (set at session:start, refreshed after saveSessionMemory).
-      // Fetch only the last 40 turns — no ownership re-check needed (established at session:start).
-      const history = await this.conversationService.getRecentHistoryForAI(
-        session.conversationId,
-        40,
-      );
-      // The message we just persisted is the last entry; exclude it from the context
-      const historyWithoutCurrent = history.slice(0, -1);
+      // 4. Build system prompt using cached ai_memory (set at session:start).
+      //    `history` was loaded before the user message was saved, so it already
+      //    excludes the current turn — no slice needed.
       const systemPrompt = this.claudeService.buildSystemPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
@@ -1217,10 +1287,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       let firstToken = true;
 
-      // 3. Stream Claude response
+      // 5. Stream Claude response.
+      //    Voice disables web search — tool use adds 500ms+ and is incompatible
+      //    with near-instant voice UX. Text keeps it for current-events queries.
       await this.claudeService.streamResponse(
         userMessage,
-        historyWithoutCurrent,
+        history,
         systemPrompt,
         {
           onToken: (token: string) => {
@@ -1232,7 +1304,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           },
 
           onDone: async (fullText: string, inputTokens: number, outputTokens: number) => {
-            // 4. Persist assistant message
+            // 6. Persist assistant message
             await this.conversationService.saveMessage({
               conversationId: session.conversationId,
               role: 'assistant',
@@ -1241,13 +1313,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               latencyMs: Date.now() - aiStartTime,
             });
 
-            // 5. Generate AI title after the first exchange (fire-and-forget)
+            // 7. Generate AI title after the first exchange (fire-and-forget)
             this.claudeService
               .generateConversationTitle(userMessage, fullText, session.fieldName)
               .then((title) => this.conversationService.setTitle(session.conversationId, title))
               .catch((err) => this.logger.error('Title generation failed:', err));
 
-            // 5. Increment guest prompt count and emit updated status
+            // 8. Increment guest prompt count and emit updated status
             if (session.isGuest && session.guestSessionId) {
               const updated = await this.guestSessionService.incrementPromptCount(session.guestSessionId);
               const remaining = Math.max(0, updated.prompt_limit - updated.prompt_count);
@@ -1283,6 +1355,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             session.isProcessingAI = false;
           },
         },
+        { enableWebSearch: inputType === 'text' },
       );
     } catch (err) {
       this.logger.error('processPrompt error:', err);

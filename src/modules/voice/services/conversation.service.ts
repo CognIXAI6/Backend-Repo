@@ -247,7 +247,7 @@ export class ConversationService {
 
   // ── Private helpers ─────────────────────────────────────────────────────────
 
-  private async assertOwnership(conversationId: string, userId: string): Promise<void> {
+  async assertOwnership(conversationId: string, userId: string): Promise<void> {
     const conv = await this.knex('conversations')
       .where({ id: conversationId, user_id: userId })
       .whereNull('deleted_at')
