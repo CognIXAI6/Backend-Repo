@@ -1,3 +1,6 @@
+// ⚠️  Must be the very first import — Sentry patches Node.js modules at load time.
+import './instrument';
+
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, VersioningType } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -9,9 +12,9 @@ import * as bodyParser from 'body-parser';
 // Prevent the Deepgram SDK's internal ws.WebSocket from crashing the process
 // when it emits an unhandled 'error' event during a connection timeout / close race.
 // NestJS's own exception filters do not cover Node.js-level EventEmitter errors.
+import * as Sentry from '@sentry/nestjs';
+
 process.on('uncaughtException', (err: Error) => {
-  // Only suppress WebSocket-level close-before-open errors from the SDK internals.
-  // Everything else is re-thrown so genuine bugs still surface.
   if (
     err.message.includes('WebSocket was closed before the connection was established') ||
     err.message.includes('WebSocket is not open')
@@ -19,17 +22,14 @@ process.on('uncaughtException', (err: Error) => {
     console.error('[DeepgramSDK] Suppressed uncaught WS error:', err.message);
     return;
   }
+  Sentry.captureException(err, { tags: { source: 'uncaughtException' } });
   console.error('[uncaughtException] Re-throwing fatal error:', err);
   throw err;
 });
 
-// Catch unhandled promise rejections so they surface in logs instead of
-// silently swallowing errors or crashing Node 15+ with an unhandled rejection.
 process.on('unhandledRejection', (reason: unknown) => {
+  Sentry.captureException(reason, { tags: { source: 'unhandledRejection' } });
   console.error('[unhandledRejection]', reason);
-  // Do NOT exit — log only. Crashing the process on every unhandled rejection
-  // would take down all active WebSocket sessions. Individual errors are already
-  // caught and reported at the call site via try/catch or .catch() handlers.
 });
 
 async function bootstrap() {

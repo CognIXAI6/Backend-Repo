@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_INTERCEPTOR, APP_FILTER } from '@nestjs/core';
+import { SentryModule } from '@sentry/nestjs/setup';
 
 // Config
 import {
@@ -41,6 +42,7 @@ import { ErrorLogModule } from './modules/error-log/error-log.module';
 
 @Module({
   imports: [
+    SentryModule.forRoot(),
     ConfigModule.forRoot({
       isGlobal: true,
       load: [

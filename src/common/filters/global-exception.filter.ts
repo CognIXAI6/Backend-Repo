@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Response } from 'express';
+import * as Sentry from '@sentry/nestjs';
 
 @Catch()
 export class GlobalExceptionFilter implements ExceptionFilter {
@@ -35,6 +36,20 @@ export class GlobalExceptionFilter implements ExceptionFilter {
         name: exception.name,
         stack: exception.stack,
       };
+    }
+
+    // Forward 5xx errors to Sentry — 4xx are client errors, not bugs.
+    if (status >= 500) {
+      Sentry.withScope((scope) => {
+        scope.setTag('source', 'global_exception_filter');
+        scope.setContext('request', {
+          method: request.method,
+          url: request.url,
+          headers: request.headers,
+          body: request.body,
+        });
+        Sentry.captureException(exception);
+      });
     }
 
     // Log the full error details

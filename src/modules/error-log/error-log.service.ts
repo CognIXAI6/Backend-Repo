@@ -1,6 +1,7 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
+import * as Sentry from '@sentry/nestjs';
 
 export type ErrorSeverity = 'info' | 'warn' | 'error' | 'critical';
 
@@ -21,10 +22,25 @@ export class ErrorLogService {
   constructor(@Inject(KNEX_CONNECTION) private readonly knex: Knex) {}
 
   /**
-   * Persist an error to the error_logs table.
+   * Persist an error to the error_logs table and forward to Sentry.
    * Fire-and-forget — never throws, so callers don't need try/catch.
    */
   log(dto: LogErrorDto): void {
+    const severity = dto.severity ?? 'error';
+
+    // Forward 'error' and 'critical' to Sentry for real-time alerting.
+    // 'info' and 'warn' stay local — they're expected operational events.
+    if (severity === 'error' || severity === 'critical') {
+      Sentry.withScope((scope) => {
+        scope.setTag('source', dto.source);
+        scope.setTag('code', dto.code);
+        scope.setTag('severity', severity);
+        if (dto.context) scope.setContext('details', dto.context);
+        scope.setLevel(severity === 'critical' ? 'fatal' : 'error');
+        Sentry.captureMessage(`[${dto.source}] ${dto.code}: ${dto.message}`);
+      });
+    }
+
     this.knex('error_logs')
       .insert({
         source: dto.source,
@@ -32,7 +48,7 @@ export class ErrorLogService {
         message: dto.message,
         stack: dto.stack ?? null,
         context: dto.context ? JSON.stringify(dto.context) : null,
-        severity: dto.severity ?? 'error',
+        severity,
         notified: dto.notified ?? false,
       })
       .catch((err) => {
