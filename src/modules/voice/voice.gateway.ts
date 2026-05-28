@@ -1253,10 +1253,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
 
       // 2. Topic relevance gate (voice only, after ≥4 messages = 2 full turns).
-      //    Off-topic speech (narrating a movie, chatting with someone else, etc.)
-      //    is silently skipped before any DB write or Claude call.
+      //    Catches ambient speech directed at a third person in the room, not topic filtering.
       if (inputType === 'voice' && history.length >= 4) {
-        const relevant = await this.claudeService.checkTopicRelevance(userMessage, history);
+        const relevant = await this.claudeService.checkTopicRelevance(userMessage, history, session.fieldName);
         if (!relevant) {
           this.logger.log(`Topic filter blocked: "${userMessage.slice(0, 80)}…"`);
           client.emit('ai:skipped', { reason: 'off_topic', transcript: userMessage });

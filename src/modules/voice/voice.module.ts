@@ -3,12 +3,14 @@ import { ConfigModule } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { VoiceController } from './controllers/voice.controller';
+import { VideoAnalysisController } from './controllers/video-analysis.controller';
 import { VoiceGateway } from './voice.gateway';
 import { DeepgramService } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { VoiceVerificationService } from './services/voice-verification.service';
+import { VideoAnalysisService } from './services/video-analysis.service';
 import { voiceConfig } from '@/config/voice.config';
 import { VoiceService } from './services/voice.service';
 import { UsersModule } from '@/modules/users/users.module';
@@ -31,7 +33,7 @@ import { SpeakersModule } from '@/modules/speakers/speakers.module';
       inject: [ConfigService],
     }),
   ],
-  controllers: [VoiceController],
+  controllers: [VoiceController, VideoAnalysisController],
   providers: [
     VoiceGateway,
     VoiceService,
@@ -40,6 +42,7 @@ import { SpeakersModule } from '@/modules/speakers/speakers.module';
     ConversationService,
     GuestSessionService,
     VoiceVerificationService,
+    VideoAnalysisService,
   ],
   exports: [ConversationService, ClaudeService, DeepgramService, VoiceService],
 })

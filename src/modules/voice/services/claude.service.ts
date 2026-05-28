@@ -461,26 +461,35 @@ ${fieldBlock}${memoryBlock}`;
   async checkTopicRelevance(
     transcript: string,
     history: Array<{ role: 'user' | 'assistant'; content: string }>,
+    fieldName?: string,
   ): Promise<boolean> {
     const context = history
       .slice(-6)
       .map((m) => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content.slice(0, 120)}`)
       .join('\n');
 
+    const fieldLine = fieldName
+      ? `The AI assistant specialises in ${fieldName}, but it can and should help with questions from ANY domain — a counsellor helps with education, relationships, career, health, and more; a doctor may discuss lifestyle or mental health; a lawyer may discuss finance. Topic changes are always allowed.\n\n`
+      : '';
+
     try {
       const response = await this.client.messages.create({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 1,
         system:
-          'You are a relevance filter for a voice AI assistant. ' +
-          'Reply Y if the utterance is relevant to the AI conversation, ' +
-          'or N if it is clearly off-topic ambient speech (narrating events to another person, ' +
-          'social chitchat addressed to someone else, random content unrelated to the conversation). ' +
+          `${fieldLine}` +
+          'You are an ambient-speech filter for a voice AI assistant. ' +
+          'Your ONLY job is to detect whether the user is addressing the AI or not. ' +
+          'Reply N ONLY if the utterance is clearly ambient speech directed at a third person ' +
+          '(e.g. narrating events to someone else in the room, chatting with a colleague, ' +
+          'talking on a separate phone call). ' +
+          'Reply Y for ANY genuine question, statement, or topic change directed at the AI — ' +
+          'even if it seems unrelated to the recent conversation. ' +
           'When in doubt, reply Y.',
         messages: [
           {
             role: 'user',
-            content: `Conversation:\n${context}\n\nNew utterance: "${transcript.slice(0, 200)}"\n\nRelevant?`,
+            content: `Conversation:\n${context}\n\nNew utterance: "${transcript.slice(0, 200)}"\n\nIs the user addressing the AI?`,
           },
         ],
       });
