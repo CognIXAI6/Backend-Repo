@@ -81,6 +81,16 @@ export class SpeakersController {
     return this.speakersService.updateSpeaker(userId, speakerId, name, file);
   }
 
+  @Post(':id/enroll-voice')
+  @UseInterceptors(FileInterceptor('audio'))
+  async enrollVoice(
+    @CurrentUser('id') userId: string,
+    @Param('id') speakerId: string,
+    @UploadedFile() audio: Express.Multer.File,
+  ) {
+    return this.speakersService.enrollSpeakerVoice(userId, speakerId, audio);
+  }
+
   @Delete(":id")
   async deleteSpeaker(
     @CurrentUser("id") userId: string,

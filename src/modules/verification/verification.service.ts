@@ -153,6 +153,48 @@ async createHealthcareVerification(
     return verification;
   }
 
+  async createCounsellingVerification(
+    userId: string,
+    fieldId: string,
+    dto: import('./dto/verification.dto').CreateCounsellingVerificationDto,
+    file?: Express.Multer.File,
+  ): Promise<ProfessionalVerification> {
+    const existing = await this.knex('professional_verifications')
+      .where('user_id', userId)
+      .andWhere('field_id', fieldId)
+      .first();
+
+    if (existing && existing.status === 'pending') {
+      throw new BadRequestException('Verification already pending');
+    }
+
+    let licenseDocumentUrl = dto.licenseDocumentUrl;
+
+    if (file) {
+      const uploadResult = await this.uploadService.uploadFile(
+        file,
+        UploadFolder.LICENSES,
+      );
+      licenseDocumentUrl = uploadResult.secure_url;
+    }
+
+    const [verification] = await this.knex('professional_verifications')
+      .insert({
+        user_id: userId,
+        field_id: fieldId,
+        full_name: dto.fullName,
+        country: dto.country,
+        specialty: dto.specialty,
+        years_of_experience: dto.yearsOfExperience,
+        license_type: dto.licenseType,
+        license_document_url: licenseDocumentUrl,
+        status: 'approved',
+      })
+      .returning('*');
+
+    return verification;
+  }
+
   async getUserVerifications(userId: string): Promise<ProfessionalVerification[]> {
     return this.knex('professional_verifications')
       .select('professional_verifications.*', 'fields.name as field_name')

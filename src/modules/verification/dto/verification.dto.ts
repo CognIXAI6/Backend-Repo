@@ -49,3 +49,29 @@ export class CreateLegalVerificationDto {
   @IsString()
   licenseDocumentUrl?: string;
 }
+
+export class CreateCounsellingVerificationDto {
+  @IsString()
+  fullName: string;
+
+  @IsString()
+  country: string;
+
+  @IsString()
+  specialty: string;
+
+  @Transform(({ value }) => parseInt(value, 10))
+  @IsInt()
+  @Min(0)
+  yearsOfExperience: number;
+
+  @IsString()
+  licenseType: string;
+
+  @IsString()
+  fieldId: string;
+
+  @IsOptional()
+  @IsString()
+  licenseDocumentUrl?: string;
+}

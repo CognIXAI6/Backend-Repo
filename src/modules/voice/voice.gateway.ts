@@ -235,7 +235,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const severity = opts.severity ?? 'error';
     const clientMessage = opts.clientMessage ?? 'Something went wrong. Please try again.';
 
-    this.logger.error(`[${code}] ${internalMessage}`);
+    // Respect the severity level — don't log every recoverable warning as ERROR.
+    if (severity === 'warn') {
+      this.logger.warn(`[${code}] ${internalMessage}`);
+    } else if (severity === 'info') {
+      this.logger.log(`[${code}] ${internalMessage}`);
+    } else {
+      this.logger.error(`[${code}] ${internalMessage}`);
+    }
 
     this.errorLogService.log({
       source: 'voice_gateway',
@@ -425,7 +432,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const isDualSpeaker = payload.mode === 'dual_speaker';
       const { emitter, sendAudio, close } = await this.deepgramService.createLiveSession(
         client.id,
-        { diarize: isDualSpeaker },
+        {
+          diarize: isDualSpeaker,
+          // Dual-speaker/capture-call sessions need a larger utterance window
+          // so conversational back-and-forth accumulates into full sentences
+          // rather than fragmenting on every brief pause.
+          utteranceEndMs: isDualSpeaker ? 2000 : 1500,
+          // Switch to nova-2-meeting for diarized sessions — it is trained on
+          // multi-speaker meeting recordings and handles echo/background noise
+          // much better than the general-purpose nova-2 model.
+          meetingMode: isDualSpeaker,
+        },
       );
 
       const session: ActiveSession = {
@@ -446,8 +463,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         calibrationPhase: isDualSpeaker,
         dualSpeakerHistory: [],
         pendingOtherText: '',
-        // Single-speaker: 1.5 s feels responsive; dual-speaker: 3 s to accumulate context
-        utteranceDebounceMs: isDualSpeaker ? 3_000 : 1_500,
+        // Single-speaker: 3 s to avoid triggering on mid-thought pauses.
+        // Dual-speaker/capture-call: 8 s so a full conversational exchange can
+        // accumulate before Claude generates an insight.
+        utteranceDebounceMs: isDualSpeaker ? 8_000 : 3_000,
         utteranceDebounceTimer: null,
         cachedAiMemory,
         cachedVoiceSpeakerId,
@@ -572,8 +591,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             }
           }
 
+          // Grow the shared accumulator so the live-transcript area on the
+          // frontend shows the full rolling conversation rather than only the
+          // latest Deepgram utterance fragment. The accumulator is cleared when
+          // the utteranceEnd debounce fires and processDualSpeakerPrompt runs.
+          session.accumulatedTranscript =
+            (session.accumulatedTranscript + ' ' + result.transcript).trim();
+
           client.emit('transcript:update', {
-            transcript: result.transcript,
+            // Send the ACCUMULATED text, not just the latest utterance.
+            transcript: session.accumulatedTranscript,
             isFinal: true,
             confidence: result.confidence,
             speakers: Object.fromEntries(
@@ -617,22 +644,53 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           session.utteranceDebounceTimer = null;
           if (session.isProcessingAI) return;
 
-          // ── Dual-speaker: trigger only when other person spoke ──────────
+          // ── Dual-speaker / capture-call path ────────────────────────────
           if (session.isDualSpeaker) {
             if (session.calibrationPhase) return;
-            const otherText = session.pendingOtherText.trim();
-            if (!otherText) return;
 
+            const otherText = session.pendingOtherText.trim();
             const ownerText = session.pendingOwnerText.trim();
+
+            // Count every meaningful word from either speaker.
+            const combinedWords = `${ownerText} ${otherText}`
+              .trim()
+              .split(/\s+/)
+              .filter(Boolean).length;
+
+            // Need at least 8 combined words before spending a Claude call.
+            // Short phrases ("okay", "hi") are not worth an insight.
+            if (combinedWords < 8) return;
+
             session.pendingOtherText = '';
             session.pendingOwnerText = '';
-            await this.processDualSpeakerPrompt(client, session, otherText, ownerText);
+            // Also clear the display accumulator so the live transcript resets
+            // after each insight cycle, matching single-speaker behaviour.
+            session.accumulatedTranscript = '';
+
+            // If Deepgram detected a genuine second speaker, pass the other
+            // person's text as the primary payload; otherwise treat the
+            // accumulated owner text as the conversation fragment to analyse
+            // (common when diarization merges both streams into speaker 0).
+            const primaryText = otherText || ownerText;
+            const contextText  = otherText ? ownerText : '';
+            const speakerDetected = Boolean(otherText);
+
+            await this.processDualSpeakerPrompt(
+              client, session, primaryText, contextText, speakerDetected,
+            );
             return;
           }
 
           // ── Single-speaker path ─────────────────────────────────────────
           const transcript = session.accumulatedTranscript.trim();
           if (!transcript) return;
+
+          const wordCount = transcript.split(/\s+/).filter(Boolean).length;
+
+          // If fewer than 6 words have accumulated, keep them in the buffer
+          // and wait for the next utteranceEnd. This prevents "okay", "hi" etc.
+          // from firing a solo Claude call — they'll merge with the next phrase.
+          if (wordCount < 6) return;
 
           const confidences = [...session.transcriptConfidences];
           session.accumulatedTranscript = '';
@@ -667,10 +725,24 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
 
       emitter.on('error', (err: Error) => {
+        if (!this.sessions.has(client.id)) return; // already cleaned up by 'close' handler
         this.logger.warn(`Deepgram error for session ${client.id}: ${err.message}`);
         client.emit('session:degraded', {
           reason: 'deepgram_error',
           message: 'Voice connection interrupted. Tap the mic to reconnect.',
+        });
+        this.cleanupSession(client.id);
+      });
+
+      // Deepgram closed the WS (readyState → 3). Without this handler audio chunks
+      // keep arriving and spam "sendAudio skipped — readyState=3" indefinitely.
+      // cleanupSession removes listeners first, so only ONE of 'error'/'close' wins.
+      emitter.on('close', () => {
+        if (!this.sessions.has(client.id)) return; // already cleaned up by 'error' handler
+        this.logger.warn(`[${client.id}] Deepgram connection closed unexpectedly — degrading session`);
+        client.emit('session:degraded', {
+          reason: 'deepgram_closed',
+          message: 'Voice connection dropped. Tap the mic to reconnect.',
         });
         this.cleanupSession(client.id);
       });
@@ -704,7 +776,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   ): void {
     const session = this.sessions.get(client.id);
     if (!session) {
-      this.emitError(client, 'NO_SESSION', 'audio/text sent before session:start', { clientMessage: 'Session not ready. Please wait a moment and try again.', severity: 'warn' });
+      // Silently discard audio chunks that arrive in the brief window between
+      // session:degraded being emitted and the frontend's MediaRecorder fully
+      // stopping. Emitting NO_SESSION here causes a confusing error toast.
       return;
     }
 
@@ -1090,6 +1164,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session: ActiveSession,
     otherPersonText: string,
     ownerText: string = '',
+    speakerDetected = true,
   ): Promise<void> {
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
@@ -1105,7 +1180,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         .map((t) => `[${t.speaker === 'owner' ? ownerName : speakerName}]: ${t.text}`)
         .join('\n');
 
-      const userMessage = `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`;
+      // When diarization detected a second speaker use the "other person said"
+      // framing; when the audio stream wasn't separated (capture-call mode where
+      // both voices appear as speaker 0) fall back to a neutral summary prompt.
+      const userMessage = speakerDetected
+        ? `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`
+        : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${otherPersonText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
 
       // Use cached ai_memory — no additional DB call needed
       const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
@@ -1113,15 +1193,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.cachedAiMemory ?? undefined,
       );
 
-      // Emit both speaker transcripts so the frontend can render all three turns together.
-      // Legacy fields (transcript, speaker string) are kept for backward compatibility
-      // until the frontend is updated to read the new `owner`/`speaker` objects.
+      // Emit transcript so the frontend can render the turn.
+      // When a real second speaker was detected, use 'other' as the speaker label
+      // so the frontend shows their name. When only owner speech was available
+      // (capture-call with merged streams), emit as 'owner'.
       client.emit('transcript:confirmed', {
-        transcript: otherPersonText,   // legacy — was the only transcript
+        transcript: otherPersonText,
         inputType: 'voice',
-        speaker: 'other',              // legacy — was a plain string
-        owner: { transcript: ownerText, name: ownerName },
-        otherSpeaker: { transcript: otherPersonText, name: speakerName },
+        speaker: speakerDetected ? 'other' : 'owner',
+        owner: ownerText ? { transcript: ownerText, name: ownerName } : undefined,
+        otherSpeaker: speakerDetected ? { transcript: otherPersonText, name: speakerName } : undefined,
       });
       client.emit('ai:start');
       aiStarted = true;
@@ -1601,25 +1682,31 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   // ─── Helpers ─────────────────────────────────────────────────────────────────
   private cleanupSession(socketId: string): void {
     const session = this.sessions.get(socketId);
-    if (session) {
-      // Cancel all pending timers
-      if (session.utteranceDebounceTimer) {
-        clearTimeout(session.utteranceDebounceTimer);
-        session.utteranceDebounceTimer = null;
-      }
-      if (session.idleTimeoutHandle) {
-        clearTimeout(session.idleTimeoutHandle);
-        session.idleTimeoutHandle = null;
-      }
+    if (!session) return;
 
-      // Explicitly free audio buffer to release memory before GC
-      session.audioBuffer = [];
-      session.audioBufferBytes = 0;
+    // Delete from the map FIRST so any re-entrant calls (e.g. from closeDeepgram
+    // firing a synchronous 'close'/'error' event) find no session and return early.
+    this.sessions.delete(socketId);
 
-      session.closeDeepgram();
-      session.deepgramEmitter.removeAllListeners();
-      this.sessions.delete(socketId);
-      this.logger.log(`Session cleaned up: ${socketId}`);
+    // Remove all emitter listeners BEFORE closing so the 'close'/'error' events
+    // emitted by socket.close() do not re-trigger the gateway handlers.
+    session.deepgramEmitter.removeAllListeners();
+
+    // Cancel all pending timers
+    if (session.utteranceDebounceTimer) {
+      clearTimeout(session.utteranceDebounceTimer);
+      session.utteranceDebounceTimer = null;
     }
+    if (session.idleTimeoutHandle) {
+      clearTimeout(session.idleTimeoutHandle);
+      session.idleTimeoutHandle = null;
+    }
+
+    // Explicitly free audio buffer to release memory before GC
+    session.audioBuffer = [];
+    session.audioBufferBytes = 0;
+
+    session.closeDeepgram();
+    this.logger.log(`Session cleaned up: ${socketId}`);
   }
 }

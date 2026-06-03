@@ -18,6 +18,7 @@ import { JwtAuthGuard, CurrentUser } from '@/common';
 import {
   CreateHealthcareVerificationDto,
   CreateLegalVerificationDto,
+  CreateCounsellingVerificationDto,
 } from './dto/verification.dto';
 import { memoryStorage } from 'multer';
 
@@ -81,6 +82,39 @@ async createHealthcareVerification(
   );
 }
 
+
+  @Post('counselling')
+  @UseInterceptors(FileInterceptor('license', {
+    storage: memoryStorage(),
+    limits: { fileSize: 15 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+      if (!file.mimetype.match(/\/(jpg|jpeg|png|pdf)$/i)) {
+        return cb(new BadRequestException('Only image and PDF files are allowed'), false);
+      }
+      cb(null, true);
+    },
+  }))
+  async createCounsellingVerification(
+    @CurrentUser('id') userId: string,
+    @Body() dto: CreateCounsellingVerificationDto,
+    @UploadedFile(
+      new ParseFilePipe({
+        validators: [
+          new MaxFileSizeValidator({ maxSize: 5 * 1024 * 1024 }),
+          new FileTypeValidator({ fileType: /(pdf|jpg|jpeg|png)$/i }),
+        ],
+        fileIsRequired: false,
+      }),
+    )
+    file?: Express.Multer.File,
+  ) {
+    return this.verificationService.createCounsellingVerification(
+      userId,
+      dto.fieldId,
+      dto,
+      file,
+    );
+  }
 
   @Post('legal')
   @UseInterceptors(FileInterceptor('license'))

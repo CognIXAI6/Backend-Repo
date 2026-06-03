@@ -223,6 +223,16 @@ export class FieldsService {
     return setting?.value;
   }
 
+  async getCounsellingSpecialties() {
+    const setting = await this.knex('app_settings').where('key', 'counselling_specialties').first();
+    return setting?.value;
+  }
+
+  async getCounsellingLicenseTypes() {
+    const setting = await this.knex('app_settings').where('key', 'counselling_license_types').first();
+    return setting?.value;
+  }
+
     async getAppSetting(key: string) {
     const setting = await this.knex('app_settings').where('key', key).first();
     return setting?.value;

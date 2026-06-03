@@ -37,6 +37,16 @@ export class FieldsController {
     return this.fieldsService.getLegalPracticeTypes();
   }
 
+  @Get('/counselling_specialties')
+  async getCounsellingSpecialties() {
+    return this.fieldsService.getCounsellingSpecialties();
+  }
+
+  @Get('/counselling_license_types')
+  async getCounsellingLicenseTypes() {
+    return this.fieldsService.getCounsellingLicenseTypes();
+  }
+
   @Get('settings/:key')
   async getAppSetting(@Param('key') key: string) {
     return this.fieldsService.getAppSetting(key);

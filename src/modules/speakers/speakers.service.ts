@@ -1,7 +1,8 @@
-import { Injectable, Inject, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Inject, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { UploadFolder, UploadService } from '../upload/upload.service';
+import { VoiceVerificationService } from '../voice/services/voice-verification.service';
 
 export interface Speaker {
   id: string;
@@ -16,9 +17,12 @@ export interface Speaker {
 
 @Injectable()
 export class SpeakersService {
+  private readonly logger = new Logger(SpeakersService.name);
+
   constructor(
     @Inject(KNEX_CONNECTION) private knex: Knex,
     private uploadService: UploadService,
+    private voiceVerificationService: VoiceVerificationService,
   ) {}
 
   // async createSpeaker(
@@ -197,6 +201,72 @@ export class SpeakersService {
       .update({ voice_speaker_id: voiceSpeakerId, voice_embedding_id: voiceEmbeddingId })
       .returning('*');
     return updated;
+  }
+
+  async enrollSpeakerVoice(
+    userId: string,
+    speakerId: string,
+    audioFile: Express.Multer.File,
+  ): Promise<Speaker & { voiceEnrolled: boolean; enrollmentError?: string }> {
+    const speaker = await this.getSpeakerById(userId, speakerId);
+    if (!speaker) throw new NotFoundException('Speaker not found');
+
+    // ── 1. Upload audio regardless of whether the voice service is available ─
+    // This ensures the recording is always preserved and can be used for
+    // re-enrollment later even if the embedding service is temporarily down.
+    const uploadResult = await this.uploadService.uploadFile(
+      audioFile,
+      UploadFolder.VOICE_SAMPLES,
+      'video',
+    );
+
+    await this.knex('voice_samples').insert({
+      user_id: userId,
+      speaker_id: speakerId,
+      audio_url: uploadResult.secure_url,
+      duration_seconds: Math.round(audioFile.size / 16000),
+    });
+
+    // ── 2. Attempt voice registration — non-fatal if service is unavailable ──
+    // Common failure modes:
+    //   • VOICE_VERIFICATION_URL not set (service disabled)
+    //   • Python service can't resolve DNS to download its embedding model
+    //   • Network partition between services
+    // In all cases we return the speaker without a voice profile and let the
+    // caller decide how to surface this to the user.
+    if (!this.voiceVerificationService.isEnabled) {
+      this.logger.warn(
+        `Voice enrollment skipped for "${speaker.name}" — VOICE_VERIFICATION_URL not configured`,
+      );
+      return { ...speaker, voiceEnrolled: false, enrollmentError: 'Voice verification service is not configured' };
+    }
+
+    try {
+      const registration = await this.voiceVerificationService.registerSpeaker(
+        speaker.name,
+        uploadResult.secure_url,
+        speaker.voice_speaker_id ?? undefined,
+      );
+
+      const updated = await this.setVoiceProfile(
+        speakerId,
+        registration.speakerId,
+        registration.embeddingId,
+      );
+      return { ...updated, voiceEnrolled: true };
+    } catch (err) {
+      // Log the underlying cause (DNS failure, timeout, API error…) but do NOT
+      // re-throw — the speaker is already saved and the audio is in Cloudinary.
+      this.logger.warn(
+        `Voice registration failed for "${speaker.name}" (audio saved, no embedding): ${(err as Error).message}`,
+      );
+      const fresh = await this.getSpeakerById(userId, speakerId);
+      return {
+        ...(fresh ?? speaker),
+        voiceEnrolled: false,
+        enrollmentError: (err as Error).message,
+      };
+    }
   }
 
   async getSpeakerModes() {

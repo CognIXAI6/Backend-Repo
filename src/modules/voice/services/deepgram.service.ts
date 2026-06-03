@@ -60,7 +60,7 @@ export class DeepgramService implements OnModuleInit {
     this.logger.log('Deepgram client initialized (SDK v5)');
   }
 
-  async createLiveSession(sessionId: string, options?: { diarize?: boolean }): Promise<{
+  async createLiveSession(sessionId: string, options?: { diarize?: boolean; utteranceEndMs?: number; meetingMode?: boolean }): Promise<{
     emitter: EventEmitter;
     sendAudio: (chunk: Buffer) => void;
     close: () => void;
@@ -70,11 +70,16 @@ export class DeepgramService implements OnModuleInit {
     // ── Step 1: build the V1Socket (does NOT open the connection yet) ─────────
     const rawSocket = (await this.deepgram.listen.v1.connect({
       Authorization:           `Token ${this.apiKey}`,
-      model:                   'nova-2',
+      // nova-2-meeting is specifically trained on multi-speaker meeting audio
+      // and handles cross-talk, echo, and background noise far better than
+      // the general-purpose nova-2 model.  Use it for all diarized sessions.
+      model:                   options?.meetingMode ? 'nova-2-meeting' : 'nova-2',
       language:                'en-US',
       smart_format:            'true',
       interim_results:         'true',
-      utterance_end_ms:        '1500',
+      // Dual-speaker mode needs a longer end-of-utterance window so that
+      // back-and-forth conversation doesn't fragment into word-sized chunks.
+      utterance_end_ms:        String(options?.utteranceEndMs ?? 1500),
       vad_events:              'true',
       // Enable speaker diarization when requested (dual-speaker mode)
       ...(options?.diarize ? { diarize: 'true' } : {}),
@@ -111,6 +116,15 @@ export class DeepgramService implements OnModuleInit {
 
       if (data?.type === 'UtteranceEnd') {
         emitter.emit('utteranceEnd');
+      }
+
+      // Deepgram sends { type: 'Error', description: '...' } as a message frame
+      // before closing the WS. Route it through the error emitter so the gateway
+      // can degrade the session cleanly rather than silently swallowing the error.
+      if (data?.type === 'Error') {
+        const msg = (data as any)?.description ?? (data as any)?.message ?? 'Deepgram stream error';
+        this.logger.warn(`[${sessionId}] Deepgram stream error message: ${msg}`);
+        emitter.emit('error', new Error(msg));
       }
     });
 
