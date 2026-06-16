@@ -48,7 +48,7 @@ export class ClaudeService implements OnModuleInit {
     const apiKey = this.configService.get<string>('voice.anthropicApiKey');
     if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
     this.client = new Anthropic({ apiKey });
-    this.model = this.configService.get<string>('voice.claudeModel') ?? 'claude-sonnet-4-20250514';
+    this.model = this.configService.get<string>('voice.claudeModel') ?? 'claude-sonnet-4-6';
 
     const tavilyApiKey = this.configService.get<string>('voice.tavilyApiKey');
     if (tavilyApiKey) {
