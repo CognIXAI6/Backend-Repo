@@ -108,6 +108,17 @@ interface ActiveSession {
   speakerWordSeconds: Map<number, number>;
   /** True once calibration has been triggered — prevents re-triggering. */
   voiceCalibrationTriggered: boolean;
+
+  // ── Single-speaker voice profile building ────────────────────────────────
+  /**
+   * Accumulated speech seconds from single-speaker (non-dual) sessions.
+   * Clean owner-only audio is the highest-quality training signal — no other
+   * speaker's voice contaminates it. Once the threshold is reached, the audio
+   * is uploaded and used to enroll or reinforce the owner's voice profile.
+   */
+  singleSpeakerSpeechSeconds: number;
+  /** True once the single-speaker profile build has been dispatched this session. */
+  singleSpeakerProfileTriggered: boolean;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
@@ -133,8 +144,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   /** Max bytes to buffer for auto voice calibration (~2MB covers 30+ s of Opus). */
   private readonly AUDIO_BUFFER_CAP = 2 * 1024 * 1024;
-  /** Minimum total word-speech seconds before triggering auto calibration. */
-  private readonly CALIBRATION_SPEECH_THRESHOLD_S = 5;
+  /** Minimum combined word-speech seconds before triggering biometric calibration. */
+  private readonly CALIBRATION_SPEECH_THRESHOLD_S = 3;
+  /** Minimum speech seconds in single-speaker mode before building the owner's voice profile. */
+  private readonly SINGLE_SPEAKER_PROFILE_THRESHOLD_S = 10;
+  /**
+   * Minimum similarity score required to act on a biometric "not verified" result.
+   * If the score is below this floor, audio quality is too poor to make a reliable
+   * determination — we keep the word-count assignment rather than risk a wrong flip.
+   */
+  private readonly VOICE_FLIP_CONFIDENCE_FLOOR = 0.35;
   /** Milliseconds of inactivity before a session is auto-closed (30 min). */
   private readonly SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -479,6 +498,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         audioBufferBytes: 0,
         speakerWordSeconds: new Map(),
         voiceCalibrationTriggered: false,
+        singleSpeakerSpeechSeconds: 0,
+        singleSpeakerProfileTriggered: false,
       };
 
       // Forward Deepgram transcript events → client
@@ -625,6 +646,38 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           isFinal: true,
           confidence: result.confidence,
         });
+
+        // ── Owner voice profile building from single-speaker sessions ─────
+        // Single-speaker audio is 100% guaranteed to be the owner's voice —
+        // the highest-quality training signal we have. Accumulate speech
+        // duration and build/reinforce the profile once enough is buffered.
+        // This runs silently in the background and never blocks the conversation.
+        if (
+          !session.isGuest &&
+          !session.singleSpeakerProfileTriggered &&
+          this.voiceVerificationService.isEnabled
+        ) {
+          const words: TranscriptWord[] = result.words ?? [];
+          if (words.length > 0) {
+            for (const w of words) {
+              session.singleSpeakerSpeechSeconds += (w.end ?? 0) - (w.start ?? 0);
+            }
+          } else {
+            // Fallback estimate when word timestamps are absent (~2.5 words/sec)
+            session.singleSpeakerSpeechSeconds +=
+              (result.transcript?.split(/\s+/).filter(Boolean).length ?? 0) / 2.5;
+          }
+
+          if (
+            session.singleSpeakerSpeechSeconds >= this.SINGLE_SPEAKER_PROFILE_THRESHOLD_S &&
+            session.audioBuffer.length > 0
+          ) {
+            session.singleSpeakerProfileTriggered = true;
+            this.buildSingleSpeakerVoiceProfile(client, session).catch((err) =>
+              this.logger.error(`[${client.id}] Single-speaker voice profile build failed:`, err),
+            );
+          }
+        }
       });
 
       // ── Debounced Claude trigger ───────────────────────────────────────────
@@ -788,14 +841,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.sendAudio(buffer);
 
-    // Buffer audio for backend voice calibration in dual-speaker sessions.
-    // Stop buffering once calibration has triggered (free memory) or cap reached.
-    if (
-      session.isDualSpeaker &&
-      !session.isGuest &&
-      !session.voiceCalibrationTriggered &&
-      session.audioBufferBytes < this.AUDIO_BUFFER_CAP
-    ) {
+    // Buffer audio for voice profile work in both single- and dual-speaker sessions.
+    // Dual-speaker: feeds biometric calibration (mixed audio, fires after 3 s combined speech).
+    // Single-speaker: feeds owner voice profile build/reinforce (clean owner-only audio).
+    // In both cases stop buffering once the respective job has triggered.
+    const shouldBuffer = !session.isGuest && session.audioBufferBytes < this.AUDIO_BUFFER_CAP;
+    const dualSpeakerNeedsBuffer = session.isDualSpeaker && !session.voiceCalibrationTriggered;
+    const singleSpeakerNeedsBuffer =
+      !session.isDualSpeaker &&
+      !session.singleSpeakerProfileTriggered &&
+      this.voiceVerificationService.isEnabled;
+
+    if (shouldBuffer && (dualSpeakerNeedsBuffer || singleSpeakerNeedsBuffer)) {
       session.audioBuffer.push(buffer);
       session.audioBufferBytes += buffer.length;
     }
@@ -1447,6 +1504,69 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
   }
 
+  // ─── Single-speaker owner voice profile ──────────────────────────────────────
+  /**
+   * Builds or reinforces the owner's voice profile from a single-speaker session.
+   *
+   * Single-speaker mode is the highest-quality training signal: the audio
+   * contains only the owner's voice with no other speaker contaminating it.
+   * Every qualifying single-speaker session improves the biometric model used
+   * in future dual-speaker calibration.
+   *
+   * - No profile yet → enroll the owner (first-time setup).
+   * - Profile exists  → add new samples to reinforce the existing embedding.
+   */
+  private async buildSingleSpeakerVoiceProfile(client: Socket, session: ActiveSession): Promise<void> {
+    this.logger.log(
+      `[${client.id}] Building owner voice profile from single-speaker session (${session.audioBufferBytes} bytes, ${session.singleSpeakerSpeechSeconds.toFixed(1)} s speech)`,
+    );
+
+    const audioData = Buffer.concat(session.audioBuffer);
+    session.audioBuffer = [];
+    session.audioBufferBytes = 0;
+
+    try {
+      const uploadResult = await this.uploadService.uploadBuffer(
+        audioData,
+        UploadFolder.VOICE_SAMPLES,
+        `voice-profile-${session.userId}`,
+        'video',
+      );
+      const audioUrl = uploadResult.secure_url;
+      const voiceSpeakerId = session.cachedVoiceSpeakerId;
+
+      if (voiceSpeakerId) {
+        // Reinforce existing profile — pass the known ID so the service updates
+        // the existing embedding rather than creating a duplicate entry.
+        await this.voiceVerificationService.registerSpeaker(
+          session.cachedOwnerName,
+          audioUrl,
+          voiceSpeakerId,
+        );
+        this.logger.log(
+          `[${client.id}] Owner voice profile reinforced from single-speaker session (id=${voiceSpeakerId})`,
+        );
+      } else {
+        // No profile yet — this single-speaker audio gives us a clean first enrollment.
+        const regResult = await this.voiceVerificationService.registerSpeaker(
+          session.cachedOwnerName,
+          audioUrl,
+        );
+        await this.usersService.update(session.userId, {
+          voice_speaker_id: regResult.speakerId,
+          voice_embedding_id: regResult.embeddingId,
+        });
+        session.cachedVoiceSpeakerId = regResult.speakerId;
+        this.logger.log(
+          `[${client.id}] Owner voice profile enrolled from single-speaker session (id=${regResult.speakerId})`,
+        );
+      }
+    } catch (err) {
+      // Non-fatal — the conversation continues; profile just wasn't updated this session.
+      this.logger.error(`[${client.id}] Single-speaker voice profile build failed:`, err);
+    }
+  }
+
   // ─── Backend auto voice calibration ──────────────────────────────────────────
   /**
    * Uploads the buffered session audio to Cloudinary, then either:
@@ -1506,6 +1626,29 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         // verified=true  → dominant speaker IS the owner (word-count was right)
         // verified=false → dominant speaker is NOT the owner → flip
+        //
+        // Guard: if the similarity score is below the confidence floor the
+        // audio quality is too poor to make a reliable determination (noise,
+        // echo, very short clip). Keep the word-count assignment rather than
+        // risk flipping to the wrong speaker.
+        if (!result.verified && result.similarityScore < this.VOICE_FLIP_CONFIDENCE_FLOOR) {
+          this.logger.warn(
+            `[${client.id}] Biometric score too low (${result.similarityScore.toFixed(3)}) — keeping word-count result, not flipping`,
+          );
+          client.emit('voice_id:result', {
+            verified: false,
+            similarityScore: result.similarityScore,
+            threshold: result.threshold,
+            ownerSpeakerId: session.ownerSpeakerId,
+            method: 'voice_id',
+            uncertain: true,
+            speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
+            message: 'Audio quality too low for confident identification. Using initial voice assignment.',
+          });
+          session.calibrationPhase = false;
+          return;
+        }
+
         const confirmedOwner = result.verified
           ? dominantSpeaker
           : dominantSpeaker === 0 ? 1 : 0;
@@ -1538,6 +1681,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         }
 
         session.calibrationPhase = false;
+
+        // ── Profile reinforcement ─────────────────────────────────────────
+        // Each verified session adds more training data to the owner's voice
+        // profile. The more sessions, the more accurate future identification
+        // becomes — especially helpful when mic conditions vary across calls.
+        // Fire-and-forget: failure is non-fatal, session continues normally.
+        this.voiceVerificationService
+          .registerSpeaker(session.cachedOwnerName, audioUrl, voiceSpeakerId)
+          .then(() => this.logger.log(`[${client.id}] Owner voice profile reinforced`))
+          .catch((err) => this.logger.warn(`[${client.id}] Profile reinforcement failed (non-fatal):`, err));
 
         client.emit('voice_id:result', {
           verified: result.verified,
