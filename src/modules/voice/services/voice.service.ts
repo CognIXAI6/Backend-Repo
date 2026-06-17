@@ -26,34 +26,24 @@ export class VoiceService {
     durationSeconds: number,
     speakerId?: string,
   ): Promise<VoiceSample> {
-    return {
-      id: "1",
-      user_id: "1222",
-      speaker_id: "1",
-      audio_url: "",
-      duration_seconds: durationSeconds,
-      voice_profile: null,
-      created_at: new Date(),
-    };
     if (!file) {
       throw new BadRequestException('No audio file provided');
     }
 
-    // Validate duration (10-15 seconds as per requirement)
     if (durationSeconds < 10 || durationSeconds > 20) {
-      throw new BadRequestException('Voice sample must be between 10-15 seconds');
+      throw new BadRequestException('Voice sample must be between 10 and 20 seconds');
     }
 
     const uploadResult = await this.uploadService.uploadFile(
       file,
       UploadFolder.VOICE_SAMPLES,
-      'video', // Audio files in Cloudinary use 'video' resource type
+      'video',
     );
 
     const [voiceSample] = await this.knex('voice_samples')
       .insert({
         user_id: userId,
-        speaker_id: speakerId,
+        speaker_id: speakerId ?? null,
         audio_url: uploadResult.secure_url,
         duration_seconds: durationSeconds,
       })

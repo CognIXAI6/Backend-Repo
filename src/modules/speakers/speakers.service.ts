@@ -212,28 +212,26 @@ export class SpeakersService {
     if (!speaker) throw new NotFoundException('Speaker not found');
 
     // ── 1. Upload audio regardless of whether the voice service is available ─
-    // This ensures the recording is always preserved and can be used for
-    // re-enrollment later even if the embedding service is temporarily down.
+    // Preserves the recording for re-enrollment later even if the embedding
+    // service is temporarily down.
     const uploadResult = await this.uploadService.uploadFile(
       audioFile,
       UploadFolder.VOICE_SAMPLES,
       'video',
     );
 
-    await this.knex('voice_samples').insert({
-      user_id: userId,
-      speaker_id: speakerId,
-      audio_url: uploadResult.secure_url,
-      duration_seconds: Math.round(audioFile.size / 16000),
-    });
+    const [voiceSample] = await this.knex('voice_samples')
+      .insert({
+        user_id: userId,
+        speaker_id: speakerId,
+        audio_url: uploadResult.secure_url,
+        duration_seconds: Math.round(audioFile.size / 16000),
+      })
+      .returning('id');
+
+    const voiceSampleId: string = voiceSample.id;
 
     // ── 2. Attempt voice registration — non-fatal if service is unavailable ──
-    // Common failure modes:
-    //   • VOICE_VERIFICATION_URL not set (service disabled)
-    //   • Python service can't resolve DNS to download its embedding model
-    //   • Network partition between services
-    // In all cases we return the speaker without a voice profile and let the
-    // caller decide how to surface this to the user.
     if (!this.voiceVerificationService.isEnabled) {
       this.logger.warn(
         `Voice enrollment skipped for "${speaker.name}" — VOICE_VERIFICATION_URL not configured`,
@@ -248,15 +246,28 @@ export class SpeakersService {
         speaker.voice_speaker_id ?? undefined,
       );
 
+      // ── 3. Persist the embedding result in both places ────────────────────
+      // speakers row — used at session time for fast verification lookups
       const updated = await this.setVoiceProfile(
         speakerId,
         registration.speakerId,
         registration.embeddingId,
       );
+
+      // voice_samples row — keeps an audit trail of which recording produced
+      // which embedding, and lets us re-enroll from a specific past sample
+      await this.knex('voice_samples')
+        .where('id', voiceSampleId)
+        .update({
+          voice_profile: {
+            voice_speaker_id: registration.speakerId,
+            voice_embedding_id: registration.embeddingId,
+            enrolled_at: new Date().toISOString(),
+          },
+        });
+
       return { ...updated, voiceEnrolled: true };
     } catch (err) {
-      // Log the underlying cause (DNS failure, timeout, API error…) but do NOT
-      // re-throw — the speaker is already saved and the audio is in Cloudinary.
       this.logger.warn(
         `Voice registration failed for "${speaker.name}" (audio saved, no embedding): ${(err as Error).message}`,
       );
