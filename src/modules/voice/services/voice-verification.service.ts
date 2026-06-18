@@ -44,8 +44,12 @@ export class VoiceVerificationService {
     this.assertEnabled();
 
     const id = speakerId ?? randomUUID();
+    const overwrite = !!speakerId;
 
-    const response = await fetch(`${this.baseUrl}/registration`, {
+    const url = new URL(`${this.baseUrl}/registration`);
+    if (overwrite) url.searchParams.set('overwrite', 'true');
+
+    const response = await fetch(url.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
