@@ -61,7 +61,8 @@ export class VoiceVerificationService {
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      throw new Error(`Voice registration failed (${response.status}): ${body}`);
+      this.logger.error(`Voice registration upstream error (${response.status}): ${body}`);
+      throw new Error('Failed to register voice profile');
     }
 
     const data = (await response.json()) as {
@@ -71,7 +72,8 @@ export class VoiceVerificationService {
     };
 
     if (!data.success) {
-      throw new Error(`Voice registration unsuccessful for speaker: ${speakerName}`);
+      this.logger.error(`Voice registration unsuccessful for speaker: ${speakerName}`);
+      throw new Error('Failed to register voice profile');
     }
 
     return {
@@ -100,7 +102,8 @@ export class VoiceVerificationService {
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      throw new Error(`Voice verification failed (${response.status}): ${body}`);
+      this.logger.error(`Voice verification upstream error (${response.status}): ${body}`);
+      throw new Error('Failed to verify voice profile');
     }
 
     const data = (await response.json()) as {

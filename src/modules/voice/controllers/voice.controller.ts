@@ -9,10 +9,12 @@ import {
   UseInterceptors,
   UploadedFile,
   BadRequestException,
+  InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { VoiceService } from '../services/voice.service';
-import { VoiceVerificationService } from '../services/voice-verification.service';
+import { VoiceVerificationService, SpeakerRegistrationResult, SpeakerVerificationResult } from '../services/voice-verification.service';
 import { UsersService } from '@/modules/users/users.service';
 import { SpeakersService } from '@/modules/speakers/speakers.service';
 import { JwtAuthGuard, CurrentUser } from '@/common';
@@ -20,6 +22,8 @@ import { JwtAuthGuard, CurrentUser } from '@/common';
 @Controller('voice')
 @UseGuards(JwtAuthGuard)
 export class VoiceController {
+  private readonly logger = new Logger(VoiceController.name);
+
   constructor(
     private voiceService: VoiceService,
     private voiceVerificationService: VoiceVerificationService,
@@ -115,11 +119,17 @@ export class VoiceController {
 
     const name = speakerName?.trim() || user.name || user.email;
 
-    const result = await this.voiceVerificationService.registerSpeaker(
-      name,
-      audioUrl,
-      user.voice_speaker_id ?? undefined,
-    );
+    let result: SpeakerRegistrationResult;
+    try {
+      result = await this.voiceVerificationService.registerSpeaker(
+        name,
+        audioUrl,
+        user.voice_speaker_id ?? undefined,
+      );
+    } catch (err) {
+      this.logger.error('registerOwnerVoice failed', err instanceof Error ? err.stack : err);
+      throw new InternalServerErrorException('Voice registration failed. Please try again.');
+    }
 
     await this.usersService.update(userId, {
       voice_speaker_id: result.speakerId,
@@ -152,11 +162,17 @@ export class VoiceController {
     const speaker = await this.speakersService.getSpeakerById(userId, speakerId);
     if (!speaker) throw new BadRequestException('Speaker not found');
 
-    const result = await this.voiceVerificationService.registerSpeaker(
-      speaker.name,
-      audioUrl,
-      speaker.voice_speaker_id ?? undefined,
-    );
+    let result: Awaited<ReturnType<typeof this.voiceVerificationService.registerSpeaker>>;
+    try {
+      result = await this.voiceVerificationService.registerSpeaker(
+        speaker.name,
+        audioUrl,
+        speaker.voice_speaker_id ?? undefined,
+      );
+    } catch (err) {
+      this.logger.error('registerOtherSpeakerVoice failed', err instanceof Error ? err.stack : err);
+      throw new InternalServerErrorException('Voice registration failed. Please try again.');
+    }
 
     await this.speakersService.setVoiceProfile(speakerId, result.speakerId, result.embeddingId);
 
@@ -187,10 +203,16 @@ export class VoiceController {
       throw new BadRequestException('No voice profile registered. Call POST /voice/voice-id/register first.');
     }
 
-    const result = await this.voiceVerificationService.verifySpeaker(
-      user.voice_speaker_id,
-      audioUrl,
-    );
+    let result: SpeakerVerificationResult;
+    try {
+      result = await this.voiceVerificationService.verifySpeaker(
+        user.voice_speaker_id,
+        audioUrl,
+      );
+    } catch (err) {
+      this.logger.error('verifyOwnerVoice failed', err instanceof Error ? err.stack : err);
+      throw new InternalServerErrorException('Voice verification failed. Please try again.');
+    }
 
     return {
       verified: result.verified,
