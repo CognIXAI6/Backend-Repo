@@ -18,7 +18,7 @@ import { DeepgramService, TranscriptWord } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService, ConversationMode } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
-import { VoiceVerificationService } from './services/voice-verification.service';
+import { VoiceVerificationService, SpeakerIdentificationResult } from './services/voice-verification.service';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
 import { UsersService } from '@/modules/users/users.service';
 import { SpeakersService } from '@/modules/speakers/speakers.service';
@@ -94,8 +94,36 @@ interface ActiveSession {
   cachedOwnerName: string;
   /** Owner's accumulated words since the last AI trigger (mirrors pendingOtherText). */
   pendingOwnerText: string;
-  /** True once identifyOtherSpeaker() has been dispatched — prevents re-runs. */
-  otherSpeakerIdentificationTriggered: boolean;
+  /**
+   * Maps each Deepgram speaker number → resolved display name.
+   * Populated as each new speaker accumulates enough audio for identification.
+   */
+  identifiedDeepgramSpeakers: Map<number, string>;
+  /**
+   * Tracks which Deepgram speaker numbers have already had identification dispatched.
+   * Prevents re-triggering for the same speaker within a session.
+   */
+  speakerIdentificationTriggered: Set<number>;
+  /**
+   * The Deepgram speaker number that produced the most words in the most recent
+   * final transcript result. Used to tag incoming audio chunks to the right
+   * per-speaker buffer so identification gets clean, separated audio.
+   */
+  currentDominantSpeaker: number;
+  /**
+   * Per-speaker audio chunk accumulators keyed by Deepgram speaker number.
+   * Chunks are tagged to the speaker dominant at the time of arrival, giving
+   * identifyDualSpeaker() speaker-separated audio instead of a mixed stream.
+   */
+  speakerAudioBuffers: Map<number, Buffer[]>;
+  /** Per-speaker buffered byte counts (mirrors speakerAudioBuffers lengths). */
+  speakerAudioBytes: Map<number, number>;
+  /**
+   * Set once identifyDualSpeaker() has biometrically confirmed which Deepgram
+   * speaker is the owner. Prevents autoVoiceCalibration from racing with
+   * identifyDualSpeaker and double-flipping the ownerSpeakerId.
+   */
+  ownerBiometricallyConfirmed: boolean;
 
   // ── Backend voice calibration ─────────────────────────────────────────────
   /**
@@ -148,12 +176,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly CALIBRATION_SPEECH_THRESHOLD_S = 3;
   /** Minimum speech seconds in single-speaker mode before building the owner's voice profile. */
   private readonly SINGLE_SPEAKER_PROFILE_THRESHOLD_S = 10;
-  /**
-   * Minimum similarity score required to act on a biometric "not verified" result.
-   * If the score is below this floor, audio quality is too poor to make a reliable
-   * determination — we keep the word-count assignment rather than risk a wrong flip.
-   */
-  private readonly VOICE_FLIP_CONFIDENCE_FLOOR = 0.35;
+  /** Per-speaker speech seconds before triggering real-time 1:N identification. */
+  private readonly SPEAKER_IDENTIFICATION_THRESHOLD_S = 3;
   /** Milliseconds of inactivity before a session is auto-closed (30 min). */
   private readonly SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -492,7 +516,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         otherSpeakerName: null,
         cachedOwnerName,
         pendingOwnerText: '',
-        otherSpeakerIdentificationTriggered: false,
+        identifiedDeepgramSpeakers: new Map(),
+        speakerIdentificationTriggered: new Set(),
+        currentDominantSpeaker: 0,
+        speakerAudioBuffers: new Map(),
+        speakerAudioBytes: new Map(),
+        ownerBiometricallyConfirmed: false,
         idleTimeoutHandle: null,
         audioBuffer: [],
         audioBufferBytes: 0,
@@ -535,8 +564,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             speakerTexts.set(spk, ((speakerTexts.get(spk) ?? '') + ' ' + w.word).trim());
           }
 
-            // Track per-speaker accumulated speech duration (from word timestamps).
-          // This feeds the auto-calibration threshold check below.
+          // Update the dominant speaker so incoming audio chunks get tagged to the
+          // right per-speaker buffer (drives identifyDualSpeaker audio accuracy).
+          const dominantInResult = [...speakerTexts.entries()]
+            .sort((a, b) => b[1].length - a[1].length)[0]?.[0];
+          if (dominantInResult !== undefined) {
+            session.currentDominantSpeaker = dominantInResult;
+          }
+
+          // Track per-speaker accumulated speech duration (from word timestamps).
+          // This feeds both the auto-calibration threshold and the per-speaker
+          // identification trigger below.
           for (const w of words) {
             const spk = w.speaker ?? 0;
             const dur = (w.end ?? 0) - (w.start ?? 0);
@@ -544,6 +582,25 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               spk,
               (session.speakerWordSeconds.get(spk) ?? 0) + dur,
             );
+          }
+
+          // ── Per-speaker real-time identification ─────────────────────────
+          // After word-count calibration has given an initial owner guess, run
+          // 1:N identification for EVERY Deepgram speaker (owner included) once
+          // they have crossed the speech threshold. identifyDualSpeaker() will
+          // confirm the owner biometrically and correct any word-count mistake.
+          if (!session.calibrationPhase && !session.isGuest && this.voiceVerificationService.isEnabled) {
+            for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
+              if (
+                seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S &&
+                !session.speakerIdentificationTriggered.has(spkId)
+              ) {
+                session.speakerIdentificationTriggered.add(spkId);
+                this.identifyDualSpeaker(client, session, spkId).catch((err) =>
+                  this.logger.error(`[${client.id}] identifyDualSpeaker error (speaker ${spkId}):`, err),
+                );
+              }
+            }
           }
 
           // ── Calibration: identify the owner as whoever speaks the most
@@ -841,12 +898,32 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.sendAudio(buffer);
 
+    // ── Per-speaker audio tagging ──────────────────────────────────────────────
+    // Tag each incoming chunk to the speaker that was dominant in the last final
+    // transcript result. This builds speaker-separated audio buffers that give
+    // identifyDualSpeaker() much cleaner input than the full mixed stream.
+    // The tag is approximate at speaker transitions (a few hundred ms of overlap)
+    // but over 3+ seconds of speech the buffers are dominated by the right voice.
+    if (session.isDualSpeaker && !session.isGuest && this.voiceVerificationService.isEnabled) {
+      const spk = session.currentDominantSpeaker;
+      const spkBufs = session.speakerAudioBuffers.get(spk) ?? [];
+      const spkBytes = session.speakerAudioBytes.get(spk) ?? 0;
+      if (spkBytes < this.AUDIO_BUFFER_CAP) {
+        spkBufs.push(buffer);
+        session.speakerAudioBuffers.set(spk, spkBufs);
+        session.speakerAudioBytes.set(spk, spkBytes + buffer.length);
+      }
+    }
+
     // Buffer audio for voice profile work in both single- and dual-speaker sessions.
-    // Dual-speaker: feeds biometric calibration (mixed audio, fires after 3 s combined speech).
+    // Dual-speaker: feeds biometric calibration AND per-speaker identification.
+    //   Buffering continues after calibration fires so that speakers who appear
+    //   mid-session still have recent audio available for identifyDualSpeaker().
+    //   autoVoiceCalibration() clears the buffer after grabbing it; it refills
+    //   automatically on the next chunks.
     // Single-speaker: feeds owner voice profile build/reinforce (clean owner-only audio).
-    // In both cases stop buffering once the respective job has triggered.
     const shouldBuffer = !session.isGuest && session.audioBufferBytes < this.AUDIO_BUFFER_CAP;
-    const dualSpeakerNeedsBuffer = session.isDualSpeaker && !session.voiceCalibrationTriggered;
+    const dualSpeakerNeedsBuffer = session.isDualSpeaker;
     const singleSpeakerNeedsBuffer =
       !session.isDualSpeaker &&
       !session.singleSpeakerProfileTriggered &&
@@ -1601,116 +1678,25 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
       const audioUrl = uploadResult.secure_url;
 
-      // Identify the other speaker against registered speakers (fire-and-forget)
-      if (!session.otherSpeakerIdentificationTriggered) {
-        session.otherSpeakerIdentificationTriggered = true;
-        this.identifyOtherSpeaker(client, session, audioUrl).catch((err) =>
-          this.logger.error(`[${client.id}] Other speaker identification failed:`, err),
-        );
-      }
+      // Per-speaker identification is now driven from the transcript handler
+      // via identifyDualSpeaker() — no separate call needed here.
 
       // Use cached voice_speaker_id — avoids a findById round trip
       const voiceSpeakerId = session.cachedVoiceSpeakerId;
 
       if (voiceSpeakerId && this.voiceVerificationService.isEnabled) {
-        // ── VERIFICATION MODE ─────────────────────────────────────────────────
-        // Check if the owner's registered voice is present in the session audio.
-        const result = await this.voiceVerificationService.verifySpeaker(
-          voiceSpeakerId,
-          audioUrl,
-        );
-
-        this.logger.log(
-          `[${client.id}] Voice verification: verified=${result.verified}, score=${result.similarityScore.toFixed(3)}, threshold=${result.threshold}`,
-        );
-
-        // verified=true  → dominant speaker IS the owner (word-count was right)
-        // verified=false → dominant speaker is NOT the owner → flip
+        // ── PROFILE REINFORCEMENT ─────────────────────────────────────────────
+        // Speaker identification and owner correction are now handled entirely by
+        // identifyDualSpeaker(), which runs per-speaker with cleaner, separated
+        // audio and a full 1:N comparison (owner + contacts).
         //
-        // Guard: if the similarity score is below the confidence floor the
-        // audio quality is too poor to make a reliable determination (noise,
-        // echo, very short clip). Keep the word-count assignment rather than
-        // risk flipping to the wrong speaker.
-        if (!result.verified && result.similarityScore < this.VOICE_FLIP_CONFIDENCE_FLOOR) {
-          this.logger.warn(
-            `[${client.id}] Biometric score too low (${result.similarityScore.toFixed(3)}) — keeping word-count result, not flipping`,
-          );
-          client.emit('voice_id:result', {
-            verified: false,
-            similarityScore: result.similarityScore,
-            threshold: result.threshold,
-            ownerSpeakerId: session.ownerSpeakerId,
-            method: 'voice_id',
-            uncertain: true,
-            speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
-            message: 'Audio quality too low for confident identification. Using initial voice assignment.',
-          });
-          session.calibrationPhase = false;
-          return;
-        }
-
-        const confirmedOwner = result.verified
-          ? dominantSpeaker
-          : dominantSpeaker === 0 ? 1 : 0;
-
-        if (confirmedOwner !== session.ownerSpeakerId) {
-          // Biometrics overrule the word-count guess — relabel in-memory history
-          session.ownerSpeakerId = confirmedOwner;
-          session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
-            ...turn,
-            speaker: turn.speaker === 'owner' ? 'other' : 'owner',
-          }));
-
-          // Relabel already-saved conversation_messages in the DB so they stay
-          // consistent with the corrected in-memory state (fire-and-forget).
-          this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
-            this.logger.error(`[${client.id}] relabelSpeakers failed:`, err),
-          );
-
-          this.logger.log(
-            `[${client.id}] Biometrics corrected owner to speaker ${confirmedOwner}`,
-          );
-
-          // Tell the frontend to re-render historical messages with flipped labels.
-          client.emit('speakers:corrected', {
-            ownerSpeakerId: confirmedOwner,
-            reason: 'biometric_correction',
-            speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
-            message: 'Speaker labels corrected by biometrics. Previous messages have been relabelled.',
-          });
-        }
-
-        session.calibrationPhase = false;
-
-        // ── Profile reinforcement ─────────────────────────────────────────
-        // Each verified session adds more training data to the owner's voice
-        // profile. The more sessions, the more accurate future identification
-        // becomes — especially helpful when mic conditions vary across calls.
-        // Fire-and-forget: failure is non-fatal, session continues normally.
+        // autoVoiceCalibration's only remaining job here is to add this session's
+        // mixed audio to the owner's voice profile so the model improves over time.
+        // Fire-and-forget — failure is non-fatal.
         this.voiceVerificationService
           .registerSpeaker(session.cachedOwnerName, audioUrl, voiceSpeakerId)
           .then(() => this.logger.log(`[${client.id}] Owner voice profile reinforced`))
           .catch((err) => this.logger.warn(`[${client.id}] Profile reinforcement failed (non-fatal):`, err));
-
-        client.emit('voice_id:result', {
-          verified: result.verified,
-          similarityScore: result.similarityScore,
-          threshold: result.threshold,
-          ownerSpeakerId: confirmedOwner,
-          method: 'voice_id',
-          speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
-          message: result.verified
-            ? 'Voice confirmed by biometrics.'
-            : `Biometrics reassigned speakers (score ${result.similarityScore.toFixed(2)}).`,
-        });
-
-        client.emit('calibration:complete', {
-          ownerSpeakerId: confirmedOwner,
-          method: 'voice_id',
-          confidence: 1.0,
-          speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
-          message: 'Speaker identification complete.',
-        });
       } else if (!voiceSpeakerId && this.voiceVerificationService.isEnabled) {
         // ── ENROLLMENT MODE ───────────────────────────────────────────────────
         // First session ever — fetch user only here (enrollment is a one-time event).
@@ -1765,70 +1751,213 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   /**
-   * Attempts to identify the non-owner speaker by checking the session audio
-   * against every registered non-owner speaker for this user.
-   * Sets session.otherSpeakerName to the matched speaker's name or "Guest Speaker".
-   * Emits `speaker:identified` so the frontend can update the display name immediately.
+   * Identifies a single Deepgram speaker number using a single 1:N identify call
+   * against ALL of this user's registered voice profiles — both the owner's profile
+   * and their registered contacts.
+   *
+   * Uses per-speaker audio (chunks tagged to this speaker while they were dominant)
+   * rather than the full mixed stream, producing much cleaner embeddings and higher
+   * identification accuracy.
+   *
+   * If the result matches the owner's registered voice profile, the ownerSpeakerId
+   * is confirmed (or corrected if word-count calibration was wrong) and history is
+   * relabelled. If it matches a contact, they are named. Either way, a
+   * `speaker:identified` event is emitted for the frontend.
    */
-  private async identifyOtherSpeaker(
+  private async identifyDualSpeaker(
     client: Socket,
     session: ActiveSession,
-    audioUrl: string,
+    deepgramSpeakerId: number,
   ): Promise<void> {
-    // Skip for guests or if the user already named the speaker manually
-    if (session.isGuest || session.otherSpeakerName) return;
+    if (session.isGuest) return;
 
-    if (!this.voiceVerificationService.isEnabled) {
-      session.otherSpeakerName = 'Guest Speaker';
-      client.emit('speaker:identified', {
-        speakerName: 'Guest Speaker',
-        method: 'service_disabled',
-        speakerNames: { owner: session.cachedOwnerName, other: 'Guest Speaker' },
-      });
-      return;
-    }
-
+    // ── Build candidate list (owner + contacts) ───────────────────────────────
+    // Fetch the user's registered contacts that have a biometric profile.
     const allSpeakers = await this.speakersService.getUserSpeakers(session.userId);
-    const candidates = allSpeakers.filter((s) => !s.is_owner && s.voice_speaker_id);
+    const contactCandidates = allSpeakers.filter((s) => !s.is_owner && s.voice_speaker_id);
 
-    if (candidates.length === 0) {
-      session.otherSpeakerName = 'Guest Speaker';
+    // Include the owner's profile so identification can distinguish owner from
+    // contacts in one pass — this is what allows biometric owner correction.
+    const candidateIds: string[] = [];
+    if (session.cachedVoiceSpeakerId) {
+      candidateIds.push(session.cachedVoiceSpeakerId);
+    }
+    for (const s of contactCandidates) {
+      candidateIds.push(s.voice_speaker_id!);
+    }
+
+    const fallbackName = 'Guest Speaker';
+
+    if (candidateIds.length === 0) {
+      // No registered profiles at all — nothing to compare against
+      session.identifiedDeepgramSpeakers.set(deepgramSpeakerId, fallbackName);
+      if (!session.otherSpeakerName) session.otherSpeakerName = fallbackName;
       client.emit('speaker:identified', {
-        speakerName: 'Guest Speaker',
+        deepgramSpeakerId,
+        speakerName: fallbackName,
         method: 'no_registered_speakers',
-        speakerNames: { owner: session.cachedOwnerName, other: 'Guest Speaker' },
+        speakerNames: { owner: session.cachedOwnerName, other: session.otherSpeakerName ?? fallbackName },
       });
       return;
     }
 
-    let bestMatch: { name: string; score: number } | null = null;
+    // ── Choose audio: per-speaker buffer is primary, mixed buffer is fallback ─
+    // Per-speaker buffers contain only chunks tagged to this speaker while they
+    // were the dominant voice, giving the embedding model a much cleaner signal.
+    const perSpeakerBufs = session.speakerAudioBuffers.get(deepgramSpeakerId);
+    const hasPerSpeakerAudio = perSpeakerBufs && perSpeakerBufs.length > 0;
+    const audioData = hasPerSpeakerAudio
+      ? Buffer.concat(perSpeakerBufs!)
+      : Buffer.concat(session.audioBuffer);
 
-    for (const speaker of candidates) {
-      try {
-        const result = await this.voiceVerificationService.verifySpeaker(
-          speaker.voice_speaker_id!,
-          audioUrl,
-        );
-        if (result.verified && (!bestMatch || result.similarityScore > bestMatch.score)) {
-          bestMatch = { name: speaker.name, score: result.similarityScore };
-        }
-      } catch (err) {
-        this.logger.warn(`[${client.id}] Speaker check failed for "${speaker.name}":`, err);
-      }
+    if (audioData.length === 0) {
+      this.logger.warn(`[${client.id}] identifyDualSpeaker: no audio for speaker ${deepgramSpeakerId}`);
+      return;
     }
 
-    const identifiedName = bestMatch?.name ?? 'Guest Speaker';
-    session.otherSpeakerName = identifiedName;
+    // ── Upload audio for SpeechBrain to process ───────────────────────────────
+    let audioUrl: string;
+    try {
+      const uploadResult = await this.uploadService.uploadBuffer(
+        audioData,
+        UploadFolder.VOICE_SAMPLES,
+        `spk-id-${client.id}-${deepgramSpeakerId}`,
+        'video',
+      );
+      audioUrl = uploadResult.secure_url;
+    } catch (err) {
+      this.logger.warn(`[${client.id}] identifyDualSpeaker: upload failed for speaker ${deepgramSpeakerId}:`, err);
+      return;
+    }
+
+    // ── Single 1:N identify call ──────────────────────────────────────────────
+    let result: SpeakerIdentificationResult;
+    try {
+      result = await this.voiceVerificationService.identifySpeaker(audioUrl, candidateIds);
+    } catch (err) {
+      this.logger.warn(`[${client.id}] identifyDualSpeaker: identify call failed for speaker ${deepgramSpeakerId} (non-fatal):`, err);
+      return;
+    }
 
     this.logger.log(
-      `[${client.id}] Other speaker identified: "${identifiedName}"${bestMatch ? ` (score=${bestMatch.score.toFixed(3)})` : ' (no match)'}`,
+      `[${client.id}] Speaker ${deepgramSpeakerId} identify result: ` +
+      `identified=${result.identified}, matchedId=${result.speakerId ?? 'none'}, ` +
+      `score=${result.similarityScore.toFixed(3)}, ` +
+      `audio=${hasPerSpeakerAudio ? 'per-speaker' : 'mixed'}, ` +
+      `candidates=${result.candidatesChecked}`,
     );
 
+    // ── Resolve who this Deepgram speaker is ─────────────────────────────────
+    const isOwner = result.identified && result.speakerId === session.cachedVoiceSpeakerId;
+    const matchedContact = result.identified && !isOwner
+      ? contactCandidates.find((s) => s.voice_speaker_id === result.speakerId)
+      : null;
+
+    let resolvedName: string;
+    let method: string;
+
+    if (isOwner) {
+      resolvedName = session.cachedOwnerName;
+      method = 'voice_id_owner';
+    } else if (matchedContact) {
+      resolvedName = matchedContact.name;
+      method = 'voice_id';
+    } else {
+      resolvedName = fallbackName;
+      method = 'no_match';
+    }
+
+    session.identifiedDeepgramSpeakers.set(deepgramSpeakerId, resolvedName);
+
+    // ── Owner correction ──────────────────────────────────────────────────────
+    // If biometrics say this Deepgram speaker IS the owner but word-count picked
+    // a different speaker, correct it now. Only the first biometric confirmation
+    // wins (ownerBiometricallyConfirmed flag prevents a second identification
+    // call from double-flipping if both speakers finish identification close together).
+    if (isOwner && !session.ownerBiometricallyConfirmed) {
+      session.ownerBiometricallyConfirmed = true;
+
+      if (session.ownerSpeakerId !== deepgramSpeakerId) {
+        const previousOwner = session.ownerSpeakerId;
+        session.ownerSpeakerId = deepgramSpeakerId;
+
+        // Relabel in-memory history so Claude context stays correct
+        session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
+          ...turn,
+          speaker: turn.speaker === 'owner' ? 'other' : 'owner',
+        }));
+
+        // Relabel DB messages fire-and-forget
+        this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
+          this.logger.error(`[${client.id}] relabelSpeakers (biometric correction) failed:`, err),
+        );
+
+        this.logger.log(
+          `[${client.id}] Biometric identification corrected owner: ` +
+          `was speaker ${previousOwner}, now speaker ${deepgramSpeakerId}`,
+        );
+
+        client.emit('speakers:corrected', {
+          ownerSpeakerId: deepgramSpeakerId,
+          reason: 'biometric_identification',
+          speakerNames: { owner: session.cachedOwnerName, other: session.otherSpeakerName ?? fallbackName },
+          message: 'Voice confirmed — speaker labels have been corrected.',
+        });
+      }
+
+      client.emit('calibration:complete', {
+        ownerSpeakerId: deepgramSpeakerId,
+        method: 'voice_id',
+        confidence: result.similarityScore,
+        speakerNames: { owner: session.cachedOwnerName, other: session.otherSpeakerName ?? fallbackName },
+        message: 'Your voice has been biometrically confirmed.',
+      });
+    }
+
+    // If this speaker turned out to be a contact but word-count had them as owner,
+    // the OTHER Deepgram speaker must be the real owner — flip if not yet confirmed.
+    if (matchedContact && !session.ownerBiometricallyConfirmed && session.ownerSpeakerId === deepgramSpeakerId) {
+      const correctedOwner = deepgramSpeakerId === 0 ? 1 : 0;
+      session.ownerSpeakerId = correctedOwner;
+
+      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
+        ...turn,
+        speaker: turn.speaker === 'owner' ? 'other' : 'owner',
+      }));
+
+      this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
+        this.logger.error(`[${client.id}] relabelSpeakers (contact flip) failed:`, err),
+      );
+
+      this.logger.log(
+        `[${client.id}] Speaker ${deepgramSpeakerId} identified as contact "${resolvedName}" ` +
+        `— owner corrected to speaker ${correctedOwner}`,
+      );
+
+      client.emit('speakers:corrected', {
+        ownerSpeakerId: correctedOwner,
+        reason: 'contact_identification',
+        speakerNames: { owner: session.cachedOwnerName, other: resolvedName },
+        message: `${resolvedName} identified — speaker labels have been corrected.`,
+      });
+    }
+
+    // Keep otherSpeakerName updated for dual-speaker prompt code that reads it
+    if (!isOwner && (!session.otherSpeakerName || session.otherSpeakerName === fallbackName)) {
+      session.otherSpeakerName = resolvedName;
+    }
+
     client.emit('speaker:identified', {
-      speakerName: identifiedName,
-      method: bestMatch ? 'voice_match' : 'no_match',
-      ...(bestMatch ? { similarityScore: bestMatch.score } : {}),
-      speakerNames: { owner: session.cachedOwnerName, other: identifiedName },
+      deepgramSpeakerId,
+      speakerName: resolvedName,
+      isOwner,
+      method,
+      ...(result.identified ? { similarityScore: result.similarityScore } : {}),
+      audioSource: hasPerSpeakerAudio ? 'per_speaker' : 'mixed',
+      speakerNames: {
+        owner: session.cachedOwnerName,
+        other: session.otherSpeakerName ?? fallbackName,
+      },
     });
   }
 
@@ -1855,9 +1984,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.idleTimeoutHandle = null;
     }
 
-    // Explicitly free audio buffer to release memory before GC
+    // Explicitly free audio buffers to release memory before GC
     session.audioBuffer = [];
     session.audioBufferBytes = 0;
+    session.speakerAudioBuffers.clear();
+    session.speakerAudioBytes.clear();
 
     session.closeDeepgram();
     this.logger.log(`Session cleaned up: ${socketId}`);

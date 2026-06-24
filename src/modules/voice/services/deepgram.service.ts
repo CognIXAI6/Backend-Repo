@@ -124,7 +124,9 @@ export class DeepgramService implements OnModuleInit {
       if (data?.type === 'Error') {
         const msg = (data as any)?.description ?? (data as any)?.message ?? 'Deepgram stream error';
         this.logger.warn(`[${sessionId}] Deepgram stream error message: ${msg}`);
-        emitter.emit('error', new Error(msg));
+        if (emitter.listenerCount('error') > 0) {
+          emitter.emit('error', new Error(msg));
+        }
       }
     });
 
@@ -135,7 +137,11 @@ export class DeepgramService implements OnModuleInit {
 
     rawSocket.on('error', (err: Error) => {
       this.logger.error(`[${sessionId}] Deepgram error: ${err.message}`);
-      emitter.emit('error', err);
+      // Guard: if listeners were removed (session cleanup), emitting 'error' on a
+      // bare EventEmitter crashes Node.js with "Unhandled 'error' event".
+      if (emitter.listenerCount('error') > 0) {
+        emitter.emit('error', err);
+      }
     });
 
     // ── Step 3: call connect() to start WS handshake, then waitForOpen() ─────
@@ -170,7 +176,9 @@ export class DeepgramService implements OnModuleInit {
       this.logger.error(`[${sessionId}] ${wrappedErr.message}`);
       // Close immediately so the SDK stops its internal retry loop
       try { socket.close(); } catch (_) {}
-      emitter.emit('error', wrappedErr);
+      // Do NOT emit 'error' here — the gateway hasn't registered its emitter
+      // listeners yet (it awaits this method first), so emitting would crash Node.js.
+      // The thrown error propagates to the gateway's catch block instead.
       throw wrappedErr;
     }
 

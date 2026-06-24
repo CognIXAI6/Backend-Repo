@@ -14,6 +14,15 @@ export interface SpeakerVerificationResult {
   speakerId: string;
 }
 
+export interface SpeakerIdentificationResult {
+  identified: boolean;
+  speakerId: string | null;
+  speakerName: string | null;
+  similarityScore: number;
+  threshold: number;
+  candidatesChecked: number;
+}
+
 @Injectable()
 export class VoiceVerificationService {
   private readonly logger = new Logger(VoiceVerificationService.name);
@@ -119,6 +128,51 @@ export class VoiceVerificationService {
       similarityScore: data.similarity_score,
       threshold: data.threshold,
       speakerId: data.speaker_id,
+    };
+  }
+
+  /**
+   * 1:N identification — finds the best-matching registered speaker for an audio clip.
+   * Pass candidateSpeakerIds to restrict the search to a known list (e.g. a user's contacts).
+   */
+  async identifySpeaker(
+    audioUrl: string,
+    candidateSpeakerIds: string[],
+  ): Promise<SpeakerIdentificationResult> {
+    this.assertEnabled();
+
+    const body: Record<string, unknown> = { audio_url: audioUrl };
+    if (candidateSpeakerIds.length > 0) {
+      body.speaker_ids = candidateSpeakerIds;
+    }
+
+    const response = await fetch(`${this.baseUrl}/speakers/identify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const raw = await response.text().catch(() => '');
+      this.logger.error(`Voice identification upstream error (${response.status}): ${raw}`);
+      throw new Error('Failed to identify speaker');
+    }
+
+    const data = (await response.json()) as {
+      success: boolean;
+      identified: boolean;
+      best_match: { speaker_id: string; speaker_name: string | null; similarity_score: number } | null;
+      threshold: number;
+      candidates_checked: number;
+    };
+
+    return {
+      identified: data.identified,
+      speakerId: data.best_match?.speaker_id ?? null,
+      speakerName: data.best_match?.speaker_name ?? null,
+      similarityScore: data.best_match?.similarity_score ?? 0,
+      threshold: data.threshold,
+      candidatesChecked: data.candidates_checked,
     };
   }
 
