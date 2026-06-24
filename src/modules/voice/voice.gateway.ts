@@ -124,6 +124,13 @@ interface ActiveSession {
    * identifyDualSpeaker and double-flipping the ownerSpeakerId.
    */
   ownerBiometricallyConfirmed: boolean;
+  /**
+   * The very first audio chunk received for this session.
+   * Browser MediaRecorder embeds the WebM/container header ONLY in chunk 0.
+   * Prepending this chunk to any per-speaker buffer ensures the assembled
+   * audio is a valid WebM file that Cloudinary and SpeechBrain can parse.
+   */
+  audioHeaderChunk: Buffer | null;
 
   // ── Backend voice calibration ─────────────────────────────────────────────
   /**
@@ -522,6 +529,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerAudioBuffers: new Map(),
         speakerAudioBytes: new Map(),
         ownerBiometricallyConfirmed: false,
+        audioHeaderChunk: null,
         idleTimeoutHandle: null,
         audioBuffer: [],
         audioBufferBytes: 0,
@@ -897,6 +905,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       : Buffer.from(payload.chunk);
 
     session.sendAudio(buffer);
+
+    // Capture the container header — present only in the very first WebM chunk.
+    if (!session.audioHeaderChunk) {
+      session.audioHeaderChunk = buffer;
+    }
 
     // ── Per-speaker audio tagging ──────────────────────────────────────────────
     // Tag each incoming chunk to the speaker that was dominant in the last final
@@ -1804,11 +1817,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // ── Choose audio: per-speaker buffer is primary, mixed buffer is fallback ─
     // Per-speaker buffers contain only chunks tagged to this speaker while they
     // were the dominant voice, giving the embedding model a much cleaner signal.
+    //
+    // WebM streams embed the container header (EBML/Tracks metadata) ONLY in the
+    // very first chunk of the session. Per-speaker buffers start mid-stream and
+    // lack this header, causing Cloudinary to reject them. We prepend the captured
+    // audioHeaderChunk to restore a valid WebM structure before uploading.
     const perSpeakerBufs = session.speakerAudioBuffers.get(deepgramSpeakerId);
-    const hasPerSpeakerAudio = perSpeakerBufs && perSpeakerBufs.length > 0;
-    const audioData = hasPerSpeakerAudio
-      ? Buffer.concat(perSpeakerBufs!)
-      : Buffer.concat(session.audioBuffer);
+    const hasPerSpeakerAudio = !!(perSpeakerBufs && perSpeakerBufs.length > 0);
+    let audioData: Buffer;
+    if (hasPerSpeakerAudio) {
+      const headerChunks = session.audioHeaderChunk ? [session.audioHeaderChunk] : [];
+      audioData = Buffer.concat([...headerChunks, ...perSpeakerBufs!]);
+    } else {
+      audioData = Buffer.concat(session.audioBuffer);
+    }
 
     if (audioData.length === 0) {
       this.logger.warn(`[${client.id}] identifyDualSpeaker: no audio for speaker ${deepgramSpeakerId}`);
