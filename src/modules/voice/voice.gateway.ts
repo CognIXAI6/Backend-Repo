@@ -16,7 +16,7 @@ import { EventEmitter } from 'events';
 
 import { DeepgramService, TranscriptWord } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
-import { ConversationService, ConversationMode } from './services/conversation.service';
+import { ConversationService, ConversationMode, SaveTranscriptSegmentDto } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { VoiceVerificationService, SpeakerIdentificationResult } from './services/voice-verification.service';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
@@ -26,11 +26,41 @@ import { EmailService } from '@/modules/email/email.service';
 import { FieldsService } from '@/modules/fields/fields.service';
 import { ErrorLogService } from '@/modules/error-log/error-log.service';
 
+// ─── Mode types ───────────────────────────────────────────────────────────────
+
+type RealtimeMode = 'single' | 'dual_speaker' | 'multiple_speaker';
+
 // ─── Per-socket session state ─────────────────────────────────────────────────
 
 interface DualSpeakerTurn {
   speaker: 'owner' | 'other';
   text: string;
+}
+
+interface SpeakerRosterEntry {
+  speakerId: string;
+  displayName: string;
+  voiceSpeakerId: string | null;
+  role: 'owner' | 'participant';
+}
+
+interface MultiSpeakerTurn {
+  deepgramSpeakerId: number;
+  speakerId: string | null;
+  speakerLabel: string;
+  text: string;
+  confidence: number;
+  startMs: number | null;
+  endMs: number | null;
+  identificationMethod: 'diarization' | 'voice_id' | 'manual' | 'unknown';
+}
+
+interface ResolvedSpeaker {
+  speakerId: string | null;
+  label: string;
+  voiceSpeakerId: string | null;
+  method: 'diarization' | 'voice_id' | 'manual' | 'unknown';
+  confidence?: number;
 }
 
 interface ActiveSession {
@@ -47,16 +77,18 @@ interface ActiveSession {
   accumulatedTranscript: string;
   /**
    * Latest non-final (interim) transcript from Deepgram for the current utterance.
-   * Deepgram only marks segments as `is_final` after a silence gap, so this holds
-   * the most recent rolling text in case audio:stop fires before any final result.
    */
   pendingInterimTranscript: string;
-  /** Confidence score for each final transcript segment, used for quality filtering */
+  /** Confidence score for each final transcript segment */
   transcriptConfidences: number[];
   isProcessingAI: boolean;
 
-  // ── Dual-speaker mode ────────────────────────────────────────────────────
+  // ── Session mode ─────────────────────────────────────────────────────────
+  mode: RealtimeMode;
   isDualSpeaker: boolean;
+  isMultiSpeaker: boolean;
+
+  // ── Dual-speaker mode ────────────────────────────────────────────────────
   /** Deepgram speaker number (0 or 1) assigned to the owner during calibration */
   ownerSpeakerId: number | null;
   /** true while waiting for owner to say calibration phrase */
@@ -65,109 +97,70 @@ interface ActiveSession {
   dualSpeakerHistory: DualSpeakerTurn[];
   /** Other person's words accumulated since last Claude trigger */
   pendingOtherText: string;
+  /** Owner words accumulated since last Claude trigger */
+  pendingOwnerText: string;
   /** Debounce timer — Claude fires only after this much silence (ms) */
   utteranceDebounceMs: number;
-  /** Active debounce timeout handle — reset on every new utteranceEnd */
+  /** Active debounce timeout handle */
   utteranceDebounceTimer: ReturnType<typeof setTimeout> | null;
 
+  // ── Multi-speaker mode ───────────────────────────────────────────────────
+  /** Speakers the client pre-selected for this session */
+  speakerRoster: SpeakerRosterEntry[];
+  speakerRosterByVoiceId: Map<string, SpeakerRosterEntry>;
+  /** Voice-ID / manual resolutions per Deepgram speaker number */
+  resolvedSpeakers: Map<number, ResolvedSpeaker>;
+  /** Full labeled history for multi-speaker mode */
+  multiSpeakerHistory: MultiSpeakerTurn[];
+  /** Turns pending AI trigger */
+  pendingMultiSpeakerTurns: MultiSpeakerTurn[];
+  /** Session-local anonymous labels (Guest 1, Guest 2 …) per Deepgram speaker id */
+  anonymousSpeakerLabels: Map<number, string>;
+  nextAnonymousSpeakerNumber: number;
+  /** Audio source metadata for logging/AI context */
+  audioSource: 'mic_only' | 'mixed_mic_tab';
+
   // ── Per-session user cache ────────────────────────────────────────────────
-  /**
-   * Snapshot of the user row taken at session:start.
-   * Eliminates repeated findById() calls on every AI prompt within a session.
-   * cachedAiMemory is refreshed after saveSessionMemory() writes a new value.
-   */
   cachedAiMemory: string | null;
   cachedVoiceSpeakerId: string | null;
-
-  // ── Idle timeout ─────────────────────────────────────────────────────────
-  /** Cleared and reset on every audio:chunk. Fires cleanup after 30 min of silence. */
-  idleTimeoutHandle: ReturnType<typeof setTimeout> | null;
-
-  // ── Speaker naming ────────────────────────────────────────────────────────
-  /**
-   * Display name for the non-owner speaker. Set via session:name_speaker or
-   * auto-resolved by identifyOtherSpeaker() after biometric calibration.
-   * Falls back to "Guest Speaker" if no registered speaker matches.
-   */
-  otherSpeakerName: string | null;
-  /** Cached display name for the owner (from user record). */
   cachedOwnerName: string;
-  /** Owner's accumulated words since the last AI trigger (mirrors pendingOtherText). */
-  pendingOwnerText: string;
-  /**
-   * Maps each Deepgram speaker number → resolved display name.
-   * Populated as each new speaker accumulates enough audio for identification.
-   */
+
+  // ── Speaker naming (dual-speaker) ────────────────────────────────────────
+  otherSpeakerName: string | null;
+
+  // ── Real-time speaker identification ─────────────────────────────────────
   identifiedDeepgramSpeakers: Map<number, string>;
-  /**
-   * Tracks which Deepgram speaker numbers have already had identification dispatched.
-   * Prevents re-triggering for the same speaker within a session.
-   */
   speakerIdentificationTriggered: Set<number>;
-  /**
-   * The Deepgram speaker number that produced the most words in the most recent
-   * final transcript result. Used to tag incoming audio chunks to the right
-   * per-speaker buffer so identification gets clean, separated audio.
-   */
   currentDominantSpeaker: number;
-  /**
-   * Per-speaker audio chunk accumulators keyed by Deepgram speaker number.
-   * Chunks are tagged to the speaker dominant at the time of arrival, giving
-   * identifyDualSpeaker() speaker-separated audio instead of a mixed stream.
-   */
   speakerAudioBuffers: Map<number, Buffer[]>;
-  /** Per-speaker buffered byte counts (mirrors speakerAudioBuffers lengths). */
   speakerAudioBytes: Map<number, number>;
-  /**
-   * Set once identifyDualSpeaker() has biometrically confirmed which Deepgram
-   * speaker is the owner. Prevents autoVoiceCalibration from racing with
-   * identifyDualSpeaker and double-flipping the ownerSpeakerId.
-   */
   ownerBiometricallyConfirmed: boolean;
-  /**
-   * The very first audio chunk received for this session.
-   * Browser MediaRecorder embeds the WebM/container header ONLY in chunk 0.
-   * Prepending this chunk to any per-speaker buffer ensures the assembled
-   * audio is a valid WebM file that Cloudinary and SpeechBrain can parse.
-   */
   audioHeaderChunk: Buffer | null;
 
   // ── Backend voice calibration ─────────────────────────────────────────────
-  /**
-   * Raw audio chunks buffered for the auto-calibration upload.
-   * Capped at AUDIO_BUFFER_CAP bytes — cleared once calibration fires.
-   */
   audioBuffer: Buffer[];
   audioBufferBytes: number;
-  /** Accumulated speech seconds per Deepgram speaker ID (from word timestamps). */
   speakerWordSeconds: Map<number, number>;
-  /** True once calibration has been triggered — prevents re-triggering. */
   voiceCalibrationTriggered: boolean;
 
   // ── Single-speaker voice profile building ────────────────────────────────
-  /**
-   * Accumulated speech seconds from single-speaker (non-dual) sessions.
-   * Clean owner-only audio is the highest-quality training signal — no other
-   * speaker's voice contaminates it. Once the threshold is reached, the audio
-   * is uploaded and used to enroll or reinforce the owner's voice profile.
-   */
   singleSpeakerSpeechSeconds: number;
-  /** True once the single-speaker profile build has been dispatched this session. */
   singleSpeakerProfileTriggered: boolean;
+
+  // ── Idle timeout ─────────────────────────────────────────────────────────
+  idleTimeoutHandle: ReturnType<typeof setTimeout> | null;
+
+  // ── Audio chunk sequencing (Gap 7) ───────────────────────────────────────
+  lastAudioSequence: number | null;
+  audioGapCount: number;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
 
 @WebSocketGateway({
   namespace: '/voice',
-  // origin:'*' with credentials:true is rejected by every browser (CORS spec).
-  // origin:true tells the cors middleware to reflect the request's Origin header,
-  // which is valid with credentials and works across all deployment environments.
   cors: { origin: true, credentials: true },
-  // Default pingTimeout is 20 s — shorter than a cold Claude response (10-40 s).
-  // Raise to 60 s so the connection is not dropped while streaming is in progress.
   pingTimeout: 60_000,
-  // Keep pingInterval at 25 s (Socket.IO default) for normal connections.
   pingInterval: 25_000,
 })
 export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
@@ -189,15 +182,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
   private readonly FILLER_WORDS = new Set([
-    // Pure noise / hesitation sounds — never carry intent
     'um', 'uh', 'hmm', 'hm', 'ah', 'er', 'erm', 'mhm',
   ]);
 
-  /**
-   * Short phrases that are intentional voice commands.
-   * These bypass the minimum-length check so "yes", "continue", etc. reach Claude.
-   * They are NOT filtered by filler_only because they carry clear conversational intent.
-   */
   private readonly VOICE_COMMANDS = new Set([
     'yes', 'no', 'sure', 'okay', 'ok', 'right', 'got it',
     'continue', 'expand', 'more', 'go on', 'keep going', 'tell me more',
@@ -206,12 +193,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     'stop', 'pause', 'thanks', 'thank you',
   ]);
 
-  /**
-   * Returns true only if the transcript is worth sending to Claude.
-   * Checks: minimum length (with voice-command bypass), Deepgram confidence, and filler-word-only content.
-   */
-  // Regex: ends with comma OR ends with a bare conjunction/incomplete word (≤10 words total).
-  // Catches "how about," and "In Nigeria. And, I want to also" without over-filtering.
   private readonly INCOMPLETE_FRAGMENT_RE =
     /[,]$|[\s](and|or|but|so|because|when|if|as|while|then|also|to|the|a|an)\.?$/i;
 
@@ -223,25 +204,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const lower = trimmed.toLowerCase().replace(/[^a-z\s]/g, '').trim();
     const words = trimmed.split(/\s+/).filter(Boolean);
 
-    // Layer 0 — dangling fragment (trailing comma or bare conjunction at end of short utterance)
     if (words.length <= 10 && this.INCOMPLETE_FRAGMENT_RE.test(trimmed)) {
       return { pass: false, reason: 'incomplete_fragment' };
     }
 
-    // Layer 1 — too short, but allow known voice commands through unconditionally
     if (words.length < 2 || trimmed.replace(/\s/g, '').length < 6) {
-      if (this.VOICE_COMMANDS.has(lower)) {
-        return { pass: true }; // Intentional command — skip remaining checks
-      }
+      if (this.VOICE_COMMANDS.has(lower)) return { pass: true };
       return { pass: false, reason: 'too_short' };
     }
 
-    // Layer 2 — Deepgram wasn't confident enough (likely noise or mumbling)
     if (avgConfidence < 0.65) {
       return { pass: false, reason: 'low_confidence' };
     }
 
-    // Layer 3 — every word is a filler/non-word
     const meaningfulWords = words.filter(
       (w) => !this.FILLER_WORDS.has(w.toLowerCase().replace(/[^a-z]/g, '')),
     );
@@ -268,14 +243,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly speakersService: SpeakersService,
   ) {}
 
-  /**
-   * Classifies an AI error, notifies admins if it's a billing/critical issue,
-   * and always returns a safe client-facing message — never the raw API error.
-   */
-  /**
-   * Central error emitter — logs internally, sends a safe message to the client.
-   * Raw technical errors are NEVER forwarded to the frontend.
-   */
   private emitError(
     client: Socket,
     code: string,
@@ -285,7 +252,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const severity = opts.severity ?? 'error';
     const clientMessage = opts.clientMessage ?? 'Something went wrong. Please try again.';
 
-    // Respect the severity level — don't log every recoverable warning as ERROR.
     if (severity === 'warn') {
       this.logger.warn(`[${code}] ${internalMessage}`);
     } else if (severity === 'info') {
@@ -357,27 +323,28 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── session:start ──────────────────────────────────────────────────────────
-  /**
-   * Starts a voice session.
-   *
-   * Authenticated:  pass `accessToken` (JWT).
-   * Guest:          pass `guestSessionId` (UUID stored in client localStorage).
-   *
-   * The backend validates which path to take based on what is present.
-   */
+
   @SubscribeMessage('session:start')
   async handleSessionStart(
     @ConnectedSocket() client: Socket,
     @MessageBody()
     payload: {
-      /** JWT access token for authenticated users */
       accessToken?: string;
-      /** UUID stored in localStorage for guest users */
       guestSessionId?: string;
       conversationId?: string;
-      mode?: ConversationMode;
+      mode?: RealtimeMode;
       fieldId?: string;
       fieldName?: string;
+      secondSpeakerName?: string;
+      /** Pre-selected speakers for this session (multi-speaker mode) */
+      speakerRoster?: Array<{
+        speakerId: string;
+        displayName: string;
+        role?: 'owner' | 'participant';
+      }>;
+      expectedSpeakerCount?: number;
+      /** Audio source hint from the client (Gap 9 Phase 1) */
+      audioSource?: 'mic_only' | 'mixed_mic_tab';
     },
   ): Promise<void> {
     try {
@@ -389,7 +356,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       let guestSessionId: string | undefined;
 
       if (payload.accessToken) {
-        // Authenticated path — verify JWT
         try {
           const decoded = this.jwtService.verify<{ sub: string }>(payload.accessToken, {
             secret: this.configService.get<string>('jwt.secret'),
@@ -401,16 +367,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           return;
         }
       } else if (payload.guestSessionId) {
-        // Guest path — use guestSessionId as pseudo userId
         guestSessionId = payload.guestSessionId;
-        userId = guestSessionId; // conversations store this UUID as user_id
+        userId = guestSessionId;
 
-        // Single DB call instead of the previous canSendPrompt() + getPromptStatus()
         const guestStatus = await this.guestSessionService.getStatus(guestSessionId);
-
         isGuest = true;
 
-        // Emit current prompt status so the frontend can show the counter
         client.emit('guest:status', {
           used: guestStatus.used,
           limit: guestStatus.limit,
@@ -431,8 +393,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }
 
       // ── Resolve field context ─────────────────────────────────────────────
-      // If the client didn't send fieldId/fieldName, look up the user's
-      // primary field automatically so it's always saved on the conversation.
       let resolvedFieldId = payload.fieldId;
       let resolvedFieldName = payload.fieldName;
 
@@ -444,8 +404,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         }
       }
 
-      // ── Load user data once — cached for the session lifetime ───────────────
-      // Avoids repeated findById() on every AI prompt within this session.
+      // ── Load user data once ───────────────────────────────────────────────
       let cachedAiMemory: string | null = null;
       let cachedVoiceSpeakerId: string | null = null;
       let cachedOwnerName = 'You';
@@ -460,38 +419,46 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // ── Create or resume conversation ─────────────────────────────────────
       let conversationId = payload.conversationId;
       if (conversationId) {
-        // Validate ownership before attaching — prevents session hijacking
         try {
           await this.conversationService.assertOwnership(conversationId, userId);
         } catch {
-          // Ownership check failed; silently create a fresh conversation
           this.logger.warn(`session:start: conversationId ${conversationId} not owned by ${userId} — creating new`);
           conversationId = undefined;
         }
       }
+
+      const mode: RealtimeMode = payload.mode ?? 'single';
+      const isDualSpeaker = mode === 'dual_speaker';
+      const isMultiSpeaker = mode === 'multiple_speaker';
+      const shouldDiarize = isDualSpeaker || isMultiSpeaker;
+
       if (!conversationId) {
+        const dbMode: ConversationMode = mode === 'multiple_speaker' ? 'multiple_speaker' : (mode as ConversationMode);
         const conv = await this.conversationService.createConversation(
           userId,
-          payload.mode ?? 'single',
+          dbMode,
           resolvedFieldId,
         );
         conversationId = conv.id;
       }
 
+      // ── Resolve speaker roster (multi-speaker) ────────────────────────────
+      const speakerRoster = (!isGuest && isMultiSpeaker)
+        ? await this.resolveSpeakerRoster(userId, payload.speakerRoster)
+        : [];
+      const speakerRosterByVoiceId = new Map<string, SpeakerRosterEntry>(
+        speakerRoster
+          .filter((e) => e.voiceSpeakerId)
+          .map((e) => [e.voiceSpeakerId!, e]),
+      );
+
       // ── Open Deepgram live session ────────────────────────────────────────
-      const isDualSpeaker = payload.mode === 'dual_speaker';
       const { emitter, sendAudio, close } = await this.deepgramService.createLiveSession(
         client.id,
         {
-          diarize: isDualSpeaker,
-          // Dual-speaker/capture-call sessions need a larger utterance window
-          // so conversational back-and-forth accumulates into full sentences
-          // rather than fragmenting on every brief pause.
-          utteranceEndMs: isDualSpeaker ? 2000 : 1500,
-          // Switch to nova-2-meeting for diarized sessions — it is trained on
-          // multi-speaker meeting recordings and handles echo/background noise
-          // much better than the general-purpose nova-2 model.
-          meetingMode: isDualSpeaker,
+          diarize: shouldDiarize,
+          utteranceEndMs: shouldDiarize ? 2000 : 1500,
+          meetingMode: shouldDiarize,
         },
       );
 
@@ -508,21 +475,28 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         pendingInterimTranscript: '',
         transcriptConfidences: [],
         isProcessingAI: false,
+        mode,
         isDualSpeaker,
+        isMultiSpeaker,
         ownerSpeakerId: null,
         calibrationPhase: isDualSpeaker,
         dualSpeakerHistory: [],
         pendingOtherText: '',
-        // Single-speaker: 3 s to avoid triggering on mid-thought pauses.
-        // Dual-speaker/capture-call: 8 s so a full conversational exchange can
-        // accumulate before Claude generates an insight.
-        utteranceDebounceMs: isDualSpeaker ? 8_000 : 3_000,
+        pendingOwnerText: '',
+        utteranceDebounceMs: shouldDiarize ? 8_000 : 3_000,
         utteranceDebounceTimer: null,
+        speakerRoster,
+        speakerRosterByVoiceId,
+        resolvedSpeakers: new Map(),
+        multiSpeakerHistory: [],
+        pendingMultiSpeakerTurns: [],
+        anonymousSpeakerLabels: new Map(),
+        nextAnonymousSpeakerNumber: 1,
+        audioSource: payload.audioSource ?? 'mic_only',
         cachedAiMemory,
         cachedVoiceSpeakerId,
-        otherSpeakerName: null,
         cachedOwnerName,
-        pendingOwnerText: '',
+        otherSpeakerName: payload.secondSpeakerName?.trim() || null,
         identifiedDeepgramSpeakers: new Map(),
         speakerIdentificationTriggered: new Set(),
         currentDominantSpeaker: 0,
@@ -530,21 +504,21 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerAudioBytes: new Map(),
         ownerBiometricallyConfirmed: false,
         audioHeaderChunk: null,
-        idleTimeoutHandle: null,
         audioBuffer: [],
         audioBufferBytes: 0,
         speakerWordSeconds: new Map(),
         voiceCalibrationTriggered: false,
         singleSpeakerSpeechSeconds: 0,
         singleSpeakerProfileTriggered: false,
+        idleTimeoutHandle: null,
+        lastAudioSequence: null,
+        audioGapCount: 0,
       };
 
-      // Forward Deepgram transcript events → client
+      // ── Deepgram transcript handler ───────────────────────────────────────
       emitter.on('transcript', (result) => {
         if (!result.isFinal) {
-          // Keep the latest interim text so audio:stop can use it as a fallback
-          // if no final result has arrived yet (race condition).
-          if (!session.isDualSpeaker) {
+          if (!shouldDiarize) {
             session.pendingInterimTranscript = result.transcript;
           }
           client.emit('transcript:update', {
@@ -555,16 +529,76 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           return;
         }
 
-        // Final result arrived — interim is now superseded
         session.pendingInterimTranscript = '';
 
         if (typeof result.confidence === 'number') {
           session.transcriptConfidences.push(result.confidence);
         }
 
+        // ── Multi-speaker path ────────────────────────────────────────────
+        if (session.isMultiSpeaker) {
+          const words: TranscriptWord[] = result.words ?? [];
+          const turns = this.buildMultiSpeakerTurns(session, words, result.confidence);
+
+          // Track per-speaker accumulated speech duration
+          for (const w of words) {
+            const spk = w.speaker ?? 0;
+            const dur = (w.end ?? 0) - (w.start ?? 0);
+            session.speakerWordSeconds.set(spk, (session.speakerWordSeconds.get(spk) ?? 0) + dur);
+          }
+
+          // Update dominant speaker for audio tagging
+          const dominantInResult = words.reduce((acc, w) => {
+            const spk = w.speaker ?? 0;
+            acc.set(spk, (acc.get(spk) ?? 0) + 1);
+            return acc;
+          }, new Map<number, number>());
+          if (dominantInResult.size > 0) {
+            session.currentDominantSpeaker = [...dominantInResult.entries()].sort((a, b) => b[1] - a[1])[0][0];
+          }
+
+          session.multiSpeakerHistory.push(...turns);
+          session.pendingMultiSpeakerTurns.push(...turns);
+          session.accumulatedTranscript = turns.map((t) => t.text).join(' ');
+
+          // Trigger per-speaker identification
+          if (!session.isGuest && this.voiceVerificationService.isEnabled) {
+            for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
+              if (
+                seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S &&
+                !session.speakerIdentificationTriggered.has(spkId)
+              ) {
+                session.speakerIdentificationTriggered.add(spkId);
+                this.identifyMultiSpeaker(client, session, spkId).catch((err) =>
+                  this.logger.error(`[${client.id}] identifyMultiSpeaker error (speaker ${spkId}):`, err),
+                );
+              }
+            }
+          }
+
+          // Trigger backend calibration
+          if (!session.voiceCalibrationTriggered && !session.isGuest) {
+            const totalSpeech = [...session.speakerWordSeconds.values()].reduce((a, b) => a + b, 0);
+            if (totalSpeech >= this.CALIBRATION_SPEECH_THRESHOLD_S && session.audioBuffer.length > 0) {
+              session.voiceCalibrationTriggered = true;
+              this.autoVoiceCalibration(client, session).catch((err) =>
+                this.logger.error(`[${client.id}] Auto voice calibration error:`, err),
+              );
+            }
+          }
+
+          client.emit('transcript:update', {
+            mode: 'multiple_speaker',
+            isFinal: true,
+            confidence: result.confidence,
+            transcript: session.accumulatedTranscript,
+            segments: turns,
+          });
+          return;
+        }
+
         // ── Dual-speaker path ─────────────────────────────────────────────
         if (session.isDualSpeaker) {
-          // Reconstruct per-speaker text from word-level speaker tags
           const words: TranscriptWord[] = result.words ?? [];
           const speakerTexts = new Map<number, string>();
           for (const w of words) {
@@ -572,31 +606,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             speakerTexts.set(spk, ((speakerTexts.get(spk) ?? '') + ' ' + w.word).trim());
           }
 
-          // Update the dominant speaker so incoming audio chunks get tagged to the
-          // right per-speaker buffer (drives identifyDualSpeaker audio accuracy).
           const dominantInResult = [...speakerTexts.entries()]
             .sort((a, b) => b[1].length - a[1].length)[0]?.[0];
           if (dominantInResult !== undefined) {
             session.currentDominantSpeaker = dominantInResult;
           }
 
-          // Track per-speaker accumulated speech duration (from word timestamps).
-          // This feeds both the auto-calibration threshold and the per-speaker
-          // identification trigger below.
           for (const w of words) {
             const spk = w.speaker ?? 0;
             const dur = (w.end ?? 0) - (w.start ?? 0);
-            session.speakerWordSeconds.set(
-              spk,
-              (session.speakerWordSeconds.get(spk) ?? 0) + dur,
-            );
+            session.speakerWordSeconds.set(spk, (session.speakerWordSeconds.get(spk) ?? 0) + dur);
           }
 
-          // ── Per-speaker real-time identification ─────────────────────────
-          // After word-count calibration has given an initial owner guess, run
-          // 1:N identification for EVERY Deepgram speaker (owner included) once
-          // they have crossed the speech threshold. identifyDualSpeaker() will
-          // confirm the owner biometrically and correct any word-count mistake.
           if (!session.calibrationPhase && !session.isGuest && this.voiceVerificationService.isEnabled) {
             for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
               if (
@@ -611,10 +632,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             }
           }
 
-          // ── Calibration: identify the owner as whoever speaks the most
-          // in the first meaningful transcript (≥3 words from one speaker).
-          // This is an initial word-count guess; backend voice biometrics will
-          // confirm or correct it asynchronously once enough audio is buffered.
           if (session.calibrationPhase && words.length >= 3) {
             const wordCounts = new Map<number, number>();
             for (const w of words) {
@@ -624,8 +641,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             const sorted = [...wordCounts.entries()].sort((a, b) => b[1] - a[1]);
             const dominantSpeaker = sorted[0][0];
             const totalWords = [...wordCounts.values()].reduce((a, b) => a + b, 0);
-            // Confidence: ratio of dominant speaker's words. 1.0 = only one speaker
-            // heard, 0.5 = equal split (least reliable).
             const calibrationConfidence = totalWords > 0 ? sorted[0][1] / totalWords : 1;
 
             session.ownerSpeakerId = dominantSpeaker;
@@ -644,18 +659,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             });
           }
 
-          // ── Trigger backend biometric calibration once we have enough speech ──
-          // Runs asynchronously after the initial word-count guess, and will
-          // correct `ownerSpeakerId` if the biometric result differs.
           if (!session.voiceCalibrationTriggered && !session.isGuest) {
-            const totalSpeech = [...session.speakerWordSeconds.values()].reduce(
-              (a, b) => a + b,
-              0,
-            );
-            if (
-              totalSpeech >= this.CALIBRATION_SPEECH_THRESHOLD_S &&
-              session.audioBuffer.length > 0
-            ) {
+            const totalSpeech = [...session.speakerWordSeconds.values()].reduce((a, b) => a + b, 0);
+            if (totalSpeech >= this.CALIBRATION_SPEECH_THRESHOLD_S && session.audioBuffer.length > 0) {
               session.voiceCalibrationTriggered = true;
               this.autoVoiceCalibration(client, session).catch((err) =>
                 this.logger.error(`[${client.id}] Auto voice calibration error:`, err),
@@ -669,7 +675,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             if (!text) continue;
             const label: 'owner' | 'other' = spkId === ownerSpk ? 'owner' : 'other';
             session.dualSpeakerHistory.push({ speaker: label, text });
-
             if (label === 'other') {
               session.pendingOtherText = (session.pendingOtherText + ' ' + text).trim();
             } else {
@@ -677,15 +682,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             }
           }
 
-          // Grow the shared accumulator so the live-transcript area on the
-          // frontend shows the full rolling conversation rather than only the
-          // latest Deepgram utterance fragment. The accumulator is cleared when
-          // the utteranceEnd debounce fires and processDualSpeakerPrompt runs.
           session.accumulatedTranscript =
             (session.accumulatedTranscript + ' ' + result.transcript).trim();
 
           client.emit('transcript:update', {
-            // Send the ACCUMULATED text, not just the latest utterance.
             transcript: session.accumulatedTranscript,
             isFinal: true,
             confidence: result.confidence,
@@ -695,8 +695,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                 text,
               ]),
             ),
-            // Stable display names — frontend maps these to colors and labels.
-            // Always included so the UI never needs a separate lookup call.
             speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
           });
           return;
@@ -712,11 +710,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           confidence: result.confidence,
         });
 
-        // ── Owner voice profile building from single-speaker sessions ─────
-        // Single-speaker audio is 100% guaranteed to be the owner's voice —
-        // the highest-quality training signal we have. Accumulate speech
-        // duration and build/reinforce the profile once enough is buffered.
-        // This runs silently in the background and never blocks the conversation.
         if (
           !session.isGuest &&
           !session.singleSpeakerProfileTriggered &&
@@ -728,7 +721,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               session.singleSpeakerSpeechSeconds += (w.end ?? 0) - (w.start ?? 0);
             }
           } else {
-            // Fallback estimate when word timestamps are absent (~2.5 words/sec)
             session.singleSpeakerSpeechSeconds +=
               (result.transcript?.split(/\s+/).filter(Boolean).length ?? 0) / 2.5;
           }
@@ -745,14 +737,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         }
       });
 
-      // ── Debounced Claude trigger ───────────────────────────────────────────
-      // Each utteranceEnd resets the timer. Claude only fires after
-      // `utteranceDebounceMs` of continuous silence — giving the conversation
-      // time to accumulate enough context before generating an insight.
+      // ── Debounced Claude trigger ──────────────────────────────────────────
       emitter.on('utteranceEnd', () => {
         if (session.isProcessingAI) return;
 
-        // Clear any previously scheduled trigger
         if (session.utteranceDebounceTimer) {
           clearTimeout(session.utteranceDebounceTimer);
           session.utteranceDebounceTimer = null;
@@ -762,40 +750,50 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           session.utteranceDebounceTimer = null;
           if (session.isProcessingAI) return;
 
-          // ── Dual-speaker / capture-call path ────────────────────────────
+          // ── Multi-speaker path ──────────────────────────────────────────
+          if (session.isMultiSpeaker) {
+            if (session.pendingMultiSpeakerTurns.length === 0) return;
+
+            const turns = session.pendingMultiSpeakerTurns.splice(0);
+            const combinedWords = turns
+              .map((t) => t.text)
+              .join(' ')
+              .split(/\s+/)
+              .filter(Boolean).length;
+
+            if (combinedWords < 8) return;
+
+            session.accumulatedTranscript = '';
+            client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
+
+            await this.processMultiSpeakerPrompt(client, session, turns);
+            return;
+          }
+
+          // ── Dual-speaker path ───────────────────────────────────────────
           if (session.isDualSpeaker) {
             if (session.calibrationPhase) return;
 
             const otherText = session.pendingOtherText.trim();
             const ownerText = session.pendingOwnerText.trim();
 
-            // Count every meaningful word from either speaker.
             const combinedWords = `${ownerText} ${otherText}`
               .trim()
               .split(/\s+/)
               .filter(Boolean).length;
 
-            // Need at least 8 combined words before spending a Claude call.
-            // Short phrases ("okay", "hi") are not worth an insight.
             if (combinedWords < 8) return;
 
             session.pendingOtherText = '';
             session.pendingOwnerText = '';
-            // Also clear the display accumulator so the live transcript resets
-            // after each insight cycle, matching single-speaker behaviour.
             session.accumulatedTranscript = '';
+            client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
 
-            // If Deepgram detected a genuine second speaker, pass the other
-            // person's text as the primary payload; otherwise treat the
-            // accumulated owner text as the conversation fragment to analyse
-            // (common when diarization merges both streams into speaker 0).
             const primaryText = otherText || ownerText;
-            const contextText  = otherText ? ownerText : '';
+            const contextText = otherText ? ownerText : '';
             const speakerDetected = Boolean(otherText);
 
-            await this.processDualSpeakerPrompt(
-              client, session, primaryText, contextText, speakerDetected,
-            );
+            await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected);
             return;
           }
 
@@ -804,10 +802,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           if (!transcript) return;
 
           const wordCount = transcript.split(/\s+/).filter(Boolean).length;
-
-          // If fewer than 6 words have accumulated, keep them in the buffer
-          // and wait for the next utteranceEnd. This prevents "okay", "hi" etc.
-          // from firing a solo Claude call — they'll merge with the next phrase.
           if (wordCount < 6) return;
 
           const confidences = [...session.transcriptConfidences];
@@ -843,7 +837,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
 
       emitter.on('error', (err: Error) => {
-        if (!this.sessions.has(client.id)) return; // already cleaned up by 'close' handler
+        if (!this.sessions.has(client.id)) return;
         this.logger.warn(`Deepgram error for session ${client.id}: ${err.message}`);
         client.emit('session:degraded', {
           reason: 'deepgram_error',
@@ -852,11 +846,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         this.cleanupSession(client.id);
       });
 
-      // Deepgram closed the WS (readyState → 3). Without this handler audio chunks
-      // keep arriving and spam "sendAudio skipped — readyState=3" indefinitely.
-      // cleanupSession removes listeners first, so only ONE of 'error'/'close' wins.
       emitter.on('close', () => {
-        if (!this.sessions.has(client.id)) return; // already cleaned up by 'error' handler
+        if (!this.sessions.has(client.id)) return;
         this.logger.warn(`[${client.id}] Deepgram connection closed unexpectedly — degrading session`);
         client.emit('session:degraded', {
           reason: 'deepgram_closed',
@@ -867,19 +858,29 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       this.sessions.set(client.id, session);
 
+      const rosterCount = speakerRoster.length;
+      this.logger.log(
+        `Session started — user: ${userId} (${isGuest ? 'guest' : 'auth'}), ` +
+        `conv: ${conversationId}, mode: ${mode}, roster: ${rosterCount}, ` +
+        `audioSource: ${session.audioSource}`,
+      );
+
       client.emit('session:ready', {
         conversationId,
         isGuest,
+        mode,
         isDualSpeaker,
-        message: isDualSpeaker
-          ? 'Dual-speaker mode active. Please say a short phrase so we can identify your voice.'
-          : 'Session ready. Start speaking or type a message.',
+        isMultiSpeaker,
+        message: isMultiSpeaker
+          ? `Multi-speaker mode active. Capturing ${rosterCount > 0 ? rosterCount + ' expected speakers' : 'meeting audio'}.`
+          : isDualSpeaker
+            ? 'Dual-speaker mode active. Please say a short phrase so we can identify your voice.'
+            : 'Session ready. Start speaking or type a message.',
         ...(isDualSpeaker ? { calibrationRequired: true } : {}),
+        ...(isMultiSpeaker && rosterCount > 0 ? {
+          rosterSpeakers: speakerRoster.map((e) => ({ speakerId: e.speakerId, displayName: e.displayName, role: e.role })),
+        } : {}),
       });
-
-      this.logger.log(
-        `Session started — user: ${userId} (${isGuest ? 'guest' : 'auth'}), conv: ${conversationId}`,
-      );
     } catch (err) {
       this.logger.error('session:start failed', err);
       this.emitError(client, 'SESSION_START_FAILED', (err as Error).message, { clientMessage: 'Failed to start session. Please refresh and try again.' });
@@ -887,18 +888,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── audio:chunk ────────────────────────────────────────────────────────────
+
   @SubscribeMessage('audio:chunk')
   handleAudioChunk(
     @ConnectedSocket() client: Socket,
-    @MessageBody() payload: { chunk: ArrayBuffer | Buffer },
+    @MessageBody() payload: { chunk: ArrayBuffer | Buffer; sequence?: number; recordingId?: string },
   ): void {
     const session = this.sessions.get(client.id);
-    if (!session) {
-      // Silently discard audio chunks that arrive in the brief window between
-      // session:degraded being emitted and the frontend's MediaRecorder fully
-      // stopping. Emitting NO_SESSION here causes a confusing error toast.
-      return;
-    }
+    if (!session) return;
 
     const buffer = Buffer.isBuffer(payload.chunk)
       ? payload.chunk
@@ -906,18 +903,34 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.sendAudio(buffer);
 
-    // Capture the container header — present only in the very first WebM chunk.
+    // Capture the container header for per-speaker audio reconstruction
     if (!session.audioHeaderChunk) {
       session.audioHeaderChunk = buffer;
     }
 
-    // ── Per-speaker audio tagging ──────────────────────────────────────────────
-    // Tag each incoming chunk to the speaker that was dominant in the last final
-    // transcript result. This builds speaker-separated audio buffers that give
-    // identifyDualSpeaker() much cleaner input than the full mixed stream.
-    // The tag is approximate at speaker transitions (a few hundred ms of overlap)
-    // but over 3+ seconds of speech the buffers are dominated by the right voice.
-    if (session.isDualSpeaker && !session.isGuest && this.voiceVerificationService.isEnabled) {
+    // ── Sequence tracking / gap detection (Gap 7) ─────────────────────────
+    if (payload.sequence != null) {
+      const expected =
+        session.lastAudioSequence != null ? session.lastAudioSequence + 1 : payload.sequence;
+
+      if (payload.sequence !== expected) {
+        session.audioGapCount += 1;
+        this.logger.warn(
+          `[${client.id}] Audio sequence gap: expected=${expected} actual=${payload.sequence} (gaps=${session.audioGapCount})`,
+        );
+        client.emit('session:degraded', {
+          reason: 'audio_gap',
+          message: 'Network instability detected. Some audio may be missing.',
+        });
+      }
+
+      session.lastAudioSequence = payload.sequence;
+      client.emit('audio:ack', { sequence: payload.sequence });
+    }
+
+    // ── Per-speaker audio tagging ─────────────────────────────────────────
+    const shouldDiarize = session.isDualSpeaker || session.isMultiSpeaker;
+    if (shouldDiarize && !session.isGuest && this.voiceVerificationService.isEnabled) {
       const spk = session.currentDominantSpeaker;
       const spkBufs = session.speakerAudioBuffers.get(spk) ?? [];
       const spkBytes = session.speakerAudioBytes.get(spk) ?? 0;
@@ -928,30 +941,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }
     }
 
-    // Buffer audio for voice profile work in both single- and dual-speaker sessions.
-    // Dual-speaker: feeds biometric calibration AND per-speaker identification.
-    //   Buffering continues after calibration fires so that speakers who appear
-    //   mid-session still have recent audio available for identifyDualSpeaker().
-    //   autoVoiceCalibration() clears the buffer after grabbing it; it refills
-    //   automatically on the next chunks.
-    // Single-speaker: feeds owner voice profile build/reinforce (clean owner-only audio).
+    // ── General audio buffering ───────────────────────────────────────────
     const shouldBuffer = !session.isGuest && session.audioBufferBytes < this.AUDIO_BUFFER_CAP;
-    const dualSpeakerNeedsBuffer = session.isDualSpeaker;
-    const singleSpeakerNeedsBuffer =
-      !session.isDualSpeaker &&
-      !session.singleSpeakerProfileTriggered &&
-      this.voiceVerificationService.isEnabled;
+    const needsBuffer =
+      shouldDiarize ||
+      (!session.isDualSpeaker && !session.isMultiSpeaker && !session.singleSpeakerProfileTriggered && this.voiceVerificationService.isEnabled);
 
-    if (shouldBuffer && (dualSpeakerNeedsBuffer || singleSpeakerNeedsBuffer)) {
+    if (shouldBuffer && needsBuffer) {
       session.audioBuffer.push(buffer);
       session.audioBufferBytes += buffer.length;
     }
 
-    // Reset the idle timeout on every audio chunk — session stays alive while
-    // the microphone is active. If no audio arrives for 30 minutes, clean up.
-    if (session.idleTimeoutHandle) {
-      clearTimeout(session.idleTimeoutHandle);
-    }
+    // ── Reset idle timeout ────────────────────────────────────────────────
+    if (session.idleTimeoutHandle) clearTimeout(session.idleTimeoutHandle);
     session.idleTimeoutHandle = setTimeout(() => {
       this.logger.warn(`[${client.id}] Session idle for 30 min — auto-closing`);
       this.cleanupSession(client.id);
@@ -960,27 +962,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── audio:stop ─────────────────────────────────────────────────────────────
-  /**
-   * User releases mic → flush any transcript not yet sent by utteranceEnd.
-   * utteranceEnd handles mid-speech responses; audio:stop catches the remainder.
-   *
-   * Race-condition fix: Deepgram only marks segments as is_final after a silence
-   * gap (~utterance_end_ms). If the user stops the mic quickly, accumulatedTranscript
-   * may be empty even though interim text exists. We fall back to pendingInterimTranscript
-   * so the user always gets a response on short recordings.
-   */
+
   @SubscribeMessage('audio:stop')
   async handleAudioStop(@ConnectedSocket() client: Socket): Promise<void> {
     const session = this.sessions.get(client.id);
     if (!session) return;
 
-    // Prefer finalized text; fall back to the latest rolling interim if nothing finalized yet
     const transcript = (
       session.accumulatedTranscript.trim() || session.pendingInterimTranscript.trim()
     );
     const confidences = session.transcriptConfidences;
 
-    // Reset accumulated state regardless of filter outcome
     session.accumulatedTranscript = '';
     session.pendingInterimTranscript = '';
     session.transcriptConfidences = [];
@@ -995,7 +987,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // ── Quality filter — skip low-value transcripts before touching Claude ──
     const avgConfidence =
       confidences.length > 0
         ? confidences.reduce((a, b) => a + b, 0) / confidences.length
@@ -1008,7 +999,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // ── Guest prompt limit check ───────────────────────────────────────────
     if (session.isGuest && session.guestSessionId) {
       const gs = await this.guestSessionService.getStatus(session.guestSessionId);
       if (!gs.canSend) {
@@ -1025,9 +1015,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── text:send ──────────────────────────────────────────────────────────────
-  /**
-   * User types a text prompt — skip Deepgram, send directly to Claude.
-   */
+
   @SubscribeMessage('text:send')
   async handleTextSend(
     @ConnectedSocket() client: Socket,
@@ -1050,7 +1038,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // ── Guest prompt limit check ───────────────────────────────────────────
     if (session.isGuest && session.guestSessionId) {
       const gs = await this.guestSessionService.getStatus(session.guestSessionId);
       if (!gs.canSend) {
@@ -1067,14 +1054,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── session:swap_speakers ───────────────────────────────────────────────────
-  /**
-   * Swaps owner ↔ other labels when calibration assigned them incorrectly.
-   * Safe to call at any point during a dual-speaker session.
-   *
-   * The client sends this when the user says "that's wrong, swap speakers".
-   * After swapping, all future transcripts and the existing dualSpeakerHistory
-   * are relabelled so Claude context stays consistent.
-   */
+
   @SubscribeMessage('session:swap_speakers')
   handleSwapSpeakers(@ConnectedSocket() client: Socket): void {
     const session = this.sessions.get(client.id);
@@ -1083,7 +1063,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // Flip the ownerSpeakerId (0 → 1 or 1 → 0)
     if (session.ownerSpeakerId === null) {
       this.emitError(client, 'SWAP_INVALID', 'swap_speakers called before calibration complete', { clientMessage: 'Please say a phrase first so we can identify your voice, then swap.', severity: 'warn' });
       return;
@@ -1091,18 +1070,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.ownerSpeakerId = session.ownerSpeakerId === 0 ? 1 : 0;
 
-    // Relabel the existing in-memory history so Claude context is consistent
     session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
       ...turn,
       speaker: turn.speaker === 'owner' ? 'other' : 'owner',
     }));
 
-    // Relabel already-saved conversation_messages in the DB (fire-and-forget)
     this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
       this.logger.error(`[${client.id}] relabelSpeakers (swap) failed:`, err),
     );
 
-    // Reset pending state — it was from the wrong speaker
     session.pendingOtherText = '';
 
     this.logger.log(`[${client.id}] Speakers swapped — owner is now speaker ${session.ownerSpeakerId}`);
@@ -1117,16 +1093,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── session:name_speaker ────────────────────────────────────────────────────
-  /**
-   * Sets a display name for one of the speakers.
-   *
-   * The owner is always "You" internally, but the other speaker defaults to "Other".
-   * The frontend can send this at any point (e.g. after the user types the other
-   * person's name in a UI field) to give the conversation a human-readable identity.
-   *
-   * The name is included in every subsequent transcript:update and calibration event
-   * so the frontend never needs to maintain its own name lookup.
-   */
+
   @SubscribeMessage('session:name_speaker')
   handleNameSpeaker(
     @ConnectedSocket() client: Socket,
@@ -1153,7 +1120,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (payload.speaker === 'other') {
       session.otherSpeakerName = name;
     }
-    // 'owner' name is always "You" — silently ignore attempts to rename it
 
     this.logger.log(`[${client.id}] Speaker named: ${payload.speaker}="${name}"`);
 
@@ -1165,20 +1131,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   // ─── session:verify_owner ────────────────────────────────────────────────────
-  /**
-   * Manual override for voice calibration.
-   *
-   * The backend drives calibration automatically via `autoVoiceCalibration()`,
-   * which buffers the live audio and verifies/enrolls without any client action.
-   *
-   * This event exists as an optional escape hatch — the frontend can send it
-   * if the user explicitly wants to re-verify using a specific audio clip they
-   * recorded and uploaded themselves.
-   *
-   * Falls back silently to word-count calibration if:
-   *   - The user has no registered voice profile
-   *   - The voice verification service is unavailable
-   */
+
   @SubscribeMessage('session:verify_owner')
   async handleVerifyOwner(
     @ConnectedSocket() client: Socket,
@@ -1238,16 +1191,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         audioUrl,
       );
 
-      // Map from voice match → Deepgram speaker ID
       const confirmedOwnerSpeakerId = result.verified
-        ? deepgramSpeakerId         // the clip IS the owner
-        : deepgramSpeakerId === 0 ? 1 : 0; // the clip is NOT the owner → flip
+        ? deepgramSpeakerId
+        : deepgramSpeakerId === 0 ? 1 : 0;
 
-      // Update session state
       session.ownerSpeakerId = confirmedOwnerSpeakerId;
       session.calibrationPhase = false;
 
-      // Relabel any history that was accumulated before this verification
       session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => {
         const deepgramId = turn.speaker === 'owner'
           ? (confirmedOwnerSpeakerId === 0 ? 0 : 1)
@@ -1280,7 +1230,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
     } catch (err) {
       this.logger.error('Voice ID verification error:', err);
-      // Non-fatal — fall back gracefully, don't break the session
       client.emit('voice_id:result', {
         verified: false,
         method: 'word_count',
@@ -1289,12 +1238,138 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
   }
 
+  // ─── transcript:correct_speaker (Gap 6) ─────────────────────────────────────
+
+  @SubscribeMessage('transcript:correct_speaker')
+  async handleCorrectSpeaker(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: {
+      deepgramSpeakerId?: number;
+      segmentId?: string;
+      speakerId: string;
+      applyTo?: 'segment' | 'session_speaker' | 'conversation_speaker';
+    },
+  ): Promise<void> {
+    const session = this.sessions.get(client.id);
+    if (!session) {
+      this.emitError(client, 'NO_SESSION', 'transcript:correct_speaker called with no active session', {
+        clientMessage: 'No active session. Please start a session first.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    const speaker = await this.speakersService.getSpeakerById(session.userId, payload.speakerId);
+    if (!speaker) {
+      this.emitError(client, 'SPEAKER_NOT_FOUND', `Speaker ${payload.speakerId} not found`, {
+        clientMessage: 'Speaker not found.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    if (payload.deepgramSpeakerId != null) {
+      session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
+        speakerId: speaker.id,
+        label: speaker.name,
+        voiceSpeakerId: speaker.voice_speaker_id,
+        method: 'manual',
+        confidence: 1,
+      });
+    }
+
+    try {
+      await this.conversationService.correctTranscriptSpeaker({
+        conversationId: session.conversationId,
+        deepgramSpeakerId: payload.deepgramSpeakerId,
+        segmentId: payload.segmentId,
+        speakerId: speaker.id,
+        speakerLabel: speaker.name,
+        applyTo: payload.applyTo ?? 'session_speaker',
+      });
+    } catch (err) {
+      this.logger.warn(`[${client.id}] correctTranscriptSpeaker DB error: ${(err as Error).message}`);
+    }
+
+    this.logger.log(
+      `[${client.id}] Speaker corrected: deepgramId=${payload.deepgramSpeakerId}, speaker="${speaker.name}", applyTo=${payload.applyTo ?? 'session_speaker'}`,
+    );
+
+    client.emit('transcript:speaker_corrected', {
+      deepgramSpeakerId: payload.deepgramSpeakerId,
+      segmentId: payload.segmentId,
+      speakerId: speaker.id,
+      speakerLabel: speaker.name,
+      applyTo: payload.applyTo ?? 'session_speaker',
+    });
+  }
+
+  // ─── transcript:rename_guest (Gap 11) ────────────────────────────────────────
+
+  @SubscribeMessage('transcript:rename_guest')
+  async handleRenameGuest(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: {
+      deepgramSpeakerId: number;
+      displayName: string;
+      applyTo?: 'session_speaker' | 'conversation_speaker';
+    },
+  ): Promise<void> {
+    const session = this.sessions.get(client.id);
+    if (!session?.isMultiSpeaker) {
+      this.emitError(client, 'RENAME_INVALID', 'transcript:rename_guest requires an active multi-speaker session', {
+        clientMessage: 'Guest renaming is only available in multi-speaker mode.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    const name = (payload.displayName ?? '').trim().slice(0, 50);
+    if (!name) {
+      this.emitError(client, 'RENAME_INVALID', 'transcript:rename_guest received empty displayName', {
+        clientMessage: 'Display name cannot be empty.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
+      speakerId: null,
+      label: name,
+      voiceSpeakerId: null,
+      method: 'manual',
+      confidence: 1,
+    });
+
+    // Also update the anonymous label map so future turns show the right name
+    session.anonymousSpeakerLabels.set(payload.deepgramSpeakerId, name);
+
+    try {
+      await this.conversationService.renameAnonymousSpeaker({
+        conversationId: session.conversationId,
+        deepgramSpeakerId: payload.deepgramSpeakerId,
+        speakerLabel: name,
+      });
+    } catch (err) {
+      this.logger.warn(`[${client.id}] renameAnonymousSpeaker DB error: ${(err as Error).message}`);
+    }
+
+    this.logger.log(`[${client.id}] Guest renamed: deepgramId=${payload.deepgramSpeakerId} → "${name}"`);
+
+    client.emit('transcript:speaker_corrected', {
+      deepgramSpeakerId: payload.deepgramSpeakerId,
+      speakerId: null,
+      speakerLabel: name,
+      method: 'manual',
+    });
+  }
+
   // ─── session:end ─────────────────────────────────────────────────────────────
+
   @SubscribeMessage('session:end')
   async handleSessionEnd(@ConnectedSocket() client: Socket): Promise<void> {
     const session = this.sessions.get(client.id);
 
-    // Save memory for authenticated (non-guest) users in background
     if (session && !session.isGuest) {
       this.saveSessionMemory(session).catch((err) =>
         this.logger.error('Memory save failed:', err),
@@ -1305,7 +1380,104 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     client.emit('session:ended');
   }
 
+  // ─── Multi-speaker prompt processing (Gap 4) ─────────────────────────────────
+
+  private async processMultiSpeakerPrompt(
+    client: Socket,
+    session: ActiveSession,
+    turns: MultiSpeakerTurn[],
+  ): Promise<void> {
+    session.isProcessingAI = true;
+    const aiStartTime = Date.now();
+    let aiStarted = false;
+
+    try {
+      const recentHistory = session.multiSpeakerHistory.slice(-60);
+      const conversationContext = recentHistory
+        .map((t) => `[${t.speakerLabel}]: ${t.text}`)
+        .join('\n');
+
+      const latestExchange = turns
+        .map((t) => `[${t.speakerLabel}]: ${t.text}`)
+        .join('\n');
+
+      const uncertainty = turns.some((t) => t.identificationMethod === 'diarization')
+        ? ' If speaker attribution is uncertain, avoid overclaiming who said what.'
+        : '';
+
+      const userMessage =
+        `Conversation so far:\n${conversationContext}\n\n` +
+        `Latest exchange:\n${latestExchange}\n\n` +
+        `Give the owner a brief, useful insight.${uncertainty}`;
+
+      const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
+        session.fieldName,
+        session.cachedAiMemory ?? undefined,
+      );
+
+      client.emit('transcript:confirmed', {
+        mode: 'multiple_speaker',
+        inputType: 'voice',
+        transcript: turns.map((t) => t.text).join(' '),
+        segments: turns,
+      });
+      client.emit('ai:start');
+      aiStarted = true;
+
+      let firstToken = true;
+
+      await this.claudeService.streamResponse(userMessage, [], systemPrompt, {
+        onToken: (token) => {
+          if (firstToken) {
+            client.emit('ai:latency', { latencyMs: Date.now() - aiStartTime });
+            firstToken = false;
+          }
+          client.emit('ai:token', { token });
+        },
+
+        onDone: async (fullText, inputTokens, outputTokens) => {
+          await this.saveMultiSpeakerTurns(session, turns);
+
+          await this.conversationService.saveMessage({
+            conversationId: session.conversationId,
+            role: 'assistant',
+            content: fullText,
+            tokensUsed: inputTokens + outputTokens,
+            latencyMs: Date.now() - aiStartTime,
+          });
+
+          this.claudeService
+            .generateConversationTitle(turns.map((t) => t.text).join(' '), fullText, session.fieldName)
+            .then((title) => this.conversationService.setTitle(session.conversationId, title))
+            .catch((err) => this.logger.error('Multi-speaker title generation failed:', err));
+
+          client.emit('ai:done', {
+            response: fullText,
+            tokensUsed: inputTokens + outputTokens,
+            latencyMs: Date.now() - aiStartTime,
+            multiSpeaker: { segments: turns },
+          });
+          session.isProcessingAI = false;
+        },
+
+        onError: (err) => {
+          this.handleAiError(client, err, `multiple-speaker [${client.id}]`);
+          if (aiStarted) client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
+          session.isProcessingAI = false;
+        },
+      },
+      { enableWebSearch: false },
+      );
+    } catch (err) {
+      this.logger.error('processMultiSpeakerPrompt error:', err);
+      this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
+      if (aiStarted) client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
+      session.isProcessingAI = false;
+    }
+  }
+
   // ─── Dual-speaker prompt processing ──────────────────────────────────────────
+
   private async processDualSpeakerPrompt(
     client: Socket,
     session: ActiveSession,
@@ -1321,29 +1493,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const ownerName = session.cachedOwnerName;
 
     try {
-      // Cap context at the last 40 turns so Claude input doesn't grow unbounded
       const recentHistory = session.dualSpeakerHistory.slice(-40);
       const conversationContext = recentHistory
         .map((t) => `[${t.speaker === 'owner' ? ownerName : speakerName}]: ${t.text}`)
         .join('\n');
 
-      // When diarization detected a second speaker use the "other person said"
-      // framing; when the audio stream wasn't separated (capture-call mode where
-      // both voices appear as speaker 0) fall back to a neutral summary prompt.
       const userMessage = speakerDetected
         ? `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`
         : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${otherPersonText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
 
-      // Use cached ai_memory — no additional DB call needed
       const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
       );
 
-      // Emit transcript so the frontend can render the turn.
-      // When a real second speaker was detected, use 'other' as the speaker label
-      // so the frontend shows their name. When only owner speech was available
-      // (capture-call with merged streams), emit as 'owner'.
       client.emit('transcript:confirmed', {
         transcript: otherPersonText,
         inputType: 'voice',
@@ -1366,7 +1529,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         },
 
         onDone: async (fullText, inputTokens, outputTokens) => {
-          // Save owner turn if they spoke this round
           if (ownerText) {
             await this.conversationService.saveMessage({
               conversationId: session.conversationId,
@@ -1391,7 +1553,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             latencyMs: Date.now() - aiStartTime,
           });
 
-          // Generate AI title after first exchange (fire-and-forget)
           this.claudeService
             .generateConversationTitle(otherPersonText, fullText, session.fieldName)
             .then((title) => this.conversationService.setTitle(session.conversationId, title))
@@ -1401,7 +1562,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             response: fullText,
             tokensUsed: inputTokens + outputTokens,
             latencyMs: Date.now() - aiStartTime,
-            // Structured turn data so the frontend can render all three segments
             dualSpeaker: {
               owner: { transcript: ownerText, name: ownerName },
               speaker: { transcript: otherPersonText, name: speakerName },
@@ -1412,9 +1572,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         onError: (err) => {
           this.handleAiError(client, err, `dual-speaker [${client.id}]`);
-          if (aiStarted) {
-            client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
-          }
+          if (aiStarted) client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
           session.isProcessingAI = false;
         },
       },
@@ -1423,25 +1581,24 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     } catch (err) {
       this.logger.error('processDualSpeakerPrompt error:', err);
       this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
-      if (aiStarted) {
-        client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
-      }
+      if (aiStarted) client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
       session.isProcessingAI = false;
     }
   }
 
-  // ─── Save session memory after session ends ───────────────────────────────────
+  // ─── Save session memory ──────────────────────────────────────────────────────
+
   private async saveSessionMemory(session: ActiveSession): Promise<void> {
     try {
       const history = await this.conversationService.getRecentHistoryForAI(
         session.conversationId,
-        80, // use more context for memory summarisation than for live prompts
+        80,
       );
-      if (history.length < 2) return; // not enough content to memorise
+      if (history.length < 2) return;
 
       const updatedMemory = await this.claudeService.summarizeConversationForMemory(
         history,
-        session.cachedAiMemory, // use cached value — avoids another findById
+        session.cachedAiMemory,
         session.fieldName,
       );
 
@@ -1450,16 +1607,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         ai_memory_updated_at: new Date(),
       });
 
-      // Keep the in-session cache up to date in case the session continues
       session.cachedAiMemory = updatedMemory;
-
       this.logger.log(`Memory saved for user ${session.userId}`);
     } catch (err) {
       this.logger.error('saveSessionMemory error:', err);
     }
   }
 
-  // ─── Core prompt processing (shared by voice and text paths) ─────────────────
+  // ─── Core single-speaker prompt processing ───────────────────────────────────
+
   private async processPrompt(
     client: Socket,
     session: ActiveSession,
@@ -1468,20 +1624,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   ): Promise<void> {
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
-    // Track whether ai:start was emitted so every exit path can emit ai:done.
-    // The frontend relies on ai:done to stop the spinner and unlock the input.
     let aiStarted = false;
 
     try {
-      // 1. Load conversation history FIRST — needed for both topic check and Claude context.
-      //    No ownership re-check needed; established at session:start.
-      const history = await this.conversationService.getRecentHistoryForAI(
-        session.conversationId,
-        40,
-      );
+      const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 40);
 
-      // 2. Topic relevance gate (voice only, after ≥4 messages = 2 full turns).
-      //    Catches ambient speech directed at a third person in the room, not topic filtering.
       if (inputType === 'voice' && history.length >= 4) {
         const relevant = await this.claudeService.checkTopicRelevance(userMessage, history, session.fieldName);
         if (!relevant) {
@@ -1492,7 +1639,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         }
       }
 
-      // 3. Persist user message (only after passing relevance check)
       await this.conversationService.saveMessage({
         conversationId: session.conversationId,
         role: 'user',
@@ -1504,9 +1650,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       client.emit('ai:start');
       aiStarted = true;
 
-      // 4. Build system prompt using cached ai_memory (set at session:start).
-      //    `history` was loaded before the user message was saved, so it already
-      //    excludes the current turn — no slice needed.
       const systemPrompt = this.claudeService.buildSystemPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
@@ -1514,9 +1657,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       let firstToken = true;
 
-      // 5. Stream Claude response.
-      //    Voice disables web search — tool use adds 500ms+ and is incompatible
-      //    with near-instant voice UX. Text keeps it for current-events queries.
       await this.claudeService.streamResponse(
         userMessage,
         history,
@@ -1531,7 +1671,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           },
 
           onDone: async (fullText: string, inputTokens: number, outputTokens: number) => {
-            // 6. Persist assistant message
             await this.conversationService.saveMessage({
               conversationId: session.conversationId,
               role: 'assistant',
@@ -1540,13 +1679,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               latencyMs: Date.now() - aiStartTime,
             });
 
-            // 7. Generate AI title after the first exchange (fire-and-forget)
             this.claudeService
               .generateConversationTitle(userMessage, fullText, session.fieldName)
               .then((title) => this.conversationService.setTitle(session.conversationId, title))
               .catch((err) => this.logger.error('Title generation failed:', err));
 
-            // 8. Increment guest prompt count and emit updated status
             if (session.isGuest && session.guestSessionId) {
               const updated = await this.guestSessionService.incrementPromptCount(session.guestSessionId);
               const remaining = Math.max(0, updated.prompt_limit - updated.prompt_count);
@@ -1575,10 +1712,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           onError: (err: Error) => {
             this.handleAiError(client, err, `single-speaker [${client.id}]`);
-            // Always emit ai:done so the frontend spinner stops and input unlocks.
-            if (aiStarted) {
-              client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
-            }
+            if (aiStarted) client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
             session.isProcessingAI = false;
           },
         },
@@ -1587,25 +1721,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     } catch (err) {
       this.logger.error('processPrompt error:', err);
       this.emitError(client, 'PROCESSING_FAILED', (err as Error).message, { clientMessage: 'Something went wrong. Please try again.' });
-      if (aiStarted) {
-        client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
-      }
+      if (aiStarted) client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
       session.isProcessingAI = false;
     }
   }
 
   // ─── Single-speaker owner voice profile ──────────────────────────────────────
-  /**
-   * Builds or reinforces the owner's voice profile from a single-speaker session.
-   *
-   * Single-speaker mode is the highest-quality training signal: the audio
-   * contains only the owner's voice with no other speaker contaminating it.
-   * Every qualifying single-speaker session improves the biometric model used
-   * in future dual-speaker calibration.
-   *
-   * - No profile yet → enroll the owner (first-time setup).
-   * - Profile exists  → add new samples to reinforce the existing embedding.
-   */
+
   private async buildSingleSpeakerVoiceProfile(client: Socket, session: ActiveSession): Promise<void> {
     this.logger.log(
       `[${client.id}] Building owner voice profile from single-speaker session (${session.audioBufferBytes} bytes, ${session.singleSpeakerSpeechSeconds.toFixed(1)} s speech)`,
@@ -1626,18 +1748,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const voiceSpeakerId = session.cachedVoiceSpeakerId;
 
       if (voiceSpeakerId) {
-        // Reinforce existing profile — pass the known ID so the service updates
-        // the existing embedding rather than creating a duplicate entry.
         await this.voiceVerificationService.registerSpeaker(
           session.cachedOwnerName,
           audioUrl,
           voiceSpeakerId,
         );
-        this.logger.log(
-          `[${client.id}] Owner voice profile reinforced from single-speaker session (id=${voiceSpeakerId})`,
-        );
+        this.logger.log(`[${client.id}] Owner voice profile reinforced from single-speaker session (id=${voiceSpeakerId})`);
       } else {
-        // No profile yet — this single-speaker audio gives us a clean first enrollment.
         const regResult = await this.voiceVerificationService.registerSpeaker(
           session.cachedOwnerName,
           audioUrl,
@@ -1647,42 +1764,26 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           voice_embedding_id: regResult.embeddingId,
         });
         session.cachedVoiceSpeakerId = regResult.speakerId;
-        this.logger.log(
-          `[${client.id}] Owner voice profile enrolled from single-speaker session (id=${regResult.speakerId})`,
-        );
+        this.logger.log(`[${client.id}] Owner voice profile enrolled from single-speaker session (id=${regResult.speakerId})`);
       }
     } catch (err) {
-      // Non-fatal — the conversation continues; profile just wasn't updated this session.
       this.logger.error(`[${client.id}] Single-speaker voice profile build failed:`, err);
     }
   }
 
   // ─── Backend auto voice calibration ──────────────────────────────────────────
-  /**
-   * Uploads the buffered session audio to Cloudinary, then either:
-   *  - VERIFICATION: Checks whether the owner's registered voice is present.
-   *    If the biometric result differs from the initial word-count guess, the
-   *    ownerSpeakerId and conversation history are corrected automatically.
-   *  - ENROLLMENT: No voice profile exists yet → registers the dominant speaker
-   *    as the owner and persists the profile to the users table (one-time).
-   *
-   * This runs entirely on the backend — the frontend never needs to upload audio.
-   * Falls back silently to the word-count result if the service is unavailable.
-   */
+
   private async autoVoiceCalibration(client: Socket, session: ActiveSession): Promise<void> {
     this.logger.log(`[${client.id}] Auto voice calibration triggered (${session.audioBufferBytes} bytes buffered)`);
 
-    // Grab and free the buffer immediately so GC can reclaim memory
     const audioData = Buffer.concat(session.audioBuffer);
     session.audioBuffer = [];
     session.audioBufferBytes = 0;
 
-    // Dominant speaker by accumulated word-time (same speaker word-count picked as owner)
     const dominantSpeaker =
       [...session.speakerWordSeconds.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 0;
 
     try {
-      // Upload to Cloudinary
       const uploadResult = await this.uploadService.uploadBuffer(
         audioData,
         UploadFolder.VOICE_SAMPLES,
@@ -1691,48 +1792,26 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
       const audioUrl = uploadResult.secure_url;
 
-      // Per-speaker identification is now driven from the transcript handler
-      // via identifyDualSpeaker() — no separate call needed here.
-
-      // Use cached voice_speaker_id — avoids a findById round trip
       const voiceSpeakerId = session.cachedVoiceSpeakerId;
 
       if (voiceSpeakerId && this.voiceVerificationService.isEnabled) {
-        // ── PROFILE REINFORCEMENT ─────────────────────────────────────────────
-        // Speaker identification and owner correction are now handled entirely by
-        // identifyDualSpeaker(), which runs per-speaker with cleaner, separated
-        // audio and a full 1:N comparison (owner + contacts).
-        //
-        // autoVoiceCalibration's only remaining job here is to add this session's
-        // mixed audio to the owner's voice profile so the model improves over time.
-        // Fire-and-forget — failure is non-fatal.
         this.voiceVerificationService
           .registerSpeaker(session.cachedOwnerName, audioUrl, voiceSpeakerId)
           .then(() => this.logger.log(`[${client.id}] Owner voice profile reinforced`))
           .catch((err) => this.logger.warn(`[${client.id}] Profile reinforcement failed (non-fatal):`, err));
       } else if (!voiceSpeakerId && this.voiceVerificationService.isEnabled) {
-        // ── ENROLLMENT MODE ───────────────────────────────────────────────────
-        // First session ever — fetch user only here (enrollment is a one-time event).
         const user = await this.usersService.findById(session.userId);
         if (!user) return;
 
         const userName = user.name || user.email.split('@')[0];
+        const regResult = await this.voiceVerificationService.registerSpeaker(userName, audioUrl);
 
-        const regResult = await this.voiceVerificationService.registerSpeaker(
-          userName,
-          audioUrl,
-        );
-
-        // Persist voice profile to the database
         await this.usersService.update(session.userId, {
           voice_speaker_id: regResult.speakerId,
           voice_embedding_id: regResult.embeddingId,
         });
 
-        // Update session cache so subsequent calibration checks use the new ID
         session.cachedVoiceSpeakerId = regResult.speakerId;
-
-        // Dominant speaker = owner (assumption: the app user speaks the most)
         session.ownerSpeakerId = dominantSpeaker;
         session.calibrationPhase = false;
 
@@ -1756,27 +1835,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           message: 'Voice enrolled and speaker identified.',
         });
       }
-      // else: voice verification service not enabled → word-count result stands
     } catch (err) {
-      // Non-fatal — word-count calibration already ran, session continues normally
       this.logger.error(`[${client.id}] Auto voice calibration failed:`, err);
     }
   }
 
-  /**
-   * Identifies a single Deepgram speaker number using a single 1:N identify call
-   * against ALL of this user's registered voice profiles — both the owner's profile
-   * and their registered contacts.
-   *
-   * Uses per-speaker audio (chunks tagged to this speaker while they were dominant)
-   * rather than the full mixed stream, producing much cleaner embeddings and higher
-   * identification accuracy.
-   *
-   * If the result matches the owner's registered voice profile, the ownerSpeakerId
-   * is confirmed (or corrected if word-count calibration was wrong) and history is
-   * relabelled. If it matches a contact, they are named. Either way, a
-   * `speaker:identified` event is emitted for the frontend.
-   */
+  // ─── Dual-speaker 1:N identification ─────────────────────────────────────────
+
   private async identifyDualSpeaker(
     client: Socket,
     session: ActiveSession,
@@ -1784,25 +1849,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   ): Promise<void> {
     if (session.isGuest) return;
 
-    // ── Build candidate list (owner + contacts) ───────────────────────────────
-    // Fetch the user's registered contacts that have a biometric profile.
     const allSpeakers = await this.speakersService.getUserSpeakers(session.userId);
     const contactCandidates = allSpeakers.filter((s) => !s.is_owner && s.voice_speaker_id);
 
-    // Include the owner's profile so identification can distinguish owner from
-    // contacts in one pass — this is what allows biometric owner correction.
     const candidateIds: string[] = [];
-    if (session.cachedVoiceSpeakerId) {
-      candidateIds.push(session.cachedVoiceSpeakerId);
-    }
-    for (const s of contactCandidates) {
-      candidateIds.push(s.voice_speaker_id!);
-    }
+    if (session.cachedVoiceSpeakerId) candidateIds.push(session.cachedVoiceSpeakerId);
+    for (const s of contactCandidates) candidateIds.push(s.voice_speaker_id!);
 
     const fallbackName = 'Guest Speaker';
 
     if (candidateIds.length === 0) {
-      // No registered profiles at all — nothing to compare against
       session.identifiedDeepgramSpeakers.set(deepgramSpeakerId, fallbackName);
       if (!session.otherSpeakerName) session.otherSpeakerName = fallbackName;
       client.emit('speaker:identified', {
@@ -1814,14 +1870,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // ── Choose audio: per-speaker buffer is primary, mixed buffer is fallback ─
-    // Per-speaker buffers contain only chunks tagged to this speaker while they
-    // were the dominant voice, giving the embedding model a much cleaner signal.
-    //
-    // WebM streams embed the container header (EBML/Tracks metadata) ONLY in the
-    // very first chunk of the session. Per-speaker buffers start mid-stream and
-    // lack this header, causing Cloudinary to reject them. We prepend the captured
-    // audioHeaderChunk to restore a valid WebM structure before uploading.
     const perSpeakerBufs = session.speakerAudioBuffers.get(deepgramSpeakerId);
     const hasPerSpeakerAudio = !!(perSpeakerBufs && perSpeakerBufs.length > 0);
     let audioData: Buffer;
@@ -1837,7 +1885,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // ── Upload audio for SpeechBrain to process ───────────────────────────────
     let audioUrl: string;
     try {
       const uploadResult = await this.uploadService.uploadBuffer(
@@ -1852,12 +1899,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // ── Single 1:N identify call ──────────────────────────────────────────────
     let result: SpeakerIdentificationResult;
     try {
       result = await this.voiceVerificationService.identifySpeaker(audioUrl, candidateIds);
     } catch (err) {
-      this.logger.warn(`[${client.id}] identifyDualSpeaker: identify call failed for speaker ${deepgramSpeakerId} (non-fatal):`, err);
+      this.logger.warn(`[${client.id}] identifyDualSpeaker: identify call failed (non-fatal):`, err);
       return;
     }
 
@@ -1869,7 +1915,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       `candidates=${result.candidatesChecked}`,
     );
 
-    // ── Resolve who this Deepgram speaker is ─────────────────────────────────
     const isOwner = result.identified && result.speakerId === session.cachedVoiceSpeakerId;
     const matchedContact = result.identified && !isOwner
       ? contactCandidates.find((s) => s.voice_speaker_id === result.speakerId)
@@ -1891,11 +1936,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.identifiedDeepgramSpeakers.set(deepgramSpeakerId, resolvedName);
 
-    // ── Owner correction ──────────────────────────────────────────────────────
-    // If biometrics say this Deepgram speaker IS the owner but word-count picked
-    // a different speaker, correct it now. Only the first biometric confirmation
-    // wins (ownerBiometricallyConfirmed flag prevents a second identification
-    // call from double-flipping if both speakers finish identification close together).
     if (isOwner && !session.ownerBiometricallyConfirmed) {
       session.ownerBiometricallyConfirmed = true;
 
@@ -1903,13 +1943,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         const previousOwner = session.ownerSpeakerId;
         session.ownerSpeakerId = deepgramSpeakerId;
 
-        // Relabel in-memory history so Claude context stays correct
         session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
           ...turn,
           speaker: turn.speaker === 'owner' ? 'other' : 'owner',
         }));
 
-        // Relabel DB messages fire-and-forget
         this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
           this.logger.error(`[${client.id}] relabelSpeakers (biometric correction) failed:`, err),
         );
@@ -1936,8 +1974,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
     }
 
-    // If this speaker turned out to be a contact but word-count had them as owner,
-    // the OTHER Deepgram speaker must be the real owner — flip if not yet confirmed.
     if (matchedContact && !session.ownerBiometricallyConfirmed && session.ownerSpeakerId === deepgramSpeakerId) {
       const correctedOwner = deepgramSpeakerId === 0 ? 1 : 0;
       session.ownerSpeakerId = correctedOwner;
@@ -1964,7 +2000,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
     }
 
-    // Keep otherSpeakerName updated for dual-speaker prompt code that reads it
     if (!isOwner && (!session.otherSpeakerName || session.otherSpeakerName === fallbackName)) {
       session.otherSpeakerName = resolvedName;
     }
@@ -1983,20 +2018,265 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     });
   }
 
+  // ─── Multi-speaker 1:N identification (Gap 3 / Gap 11) ───────────────────────
+
+  private async identifyMultiSpeaker(
+    client: Socket,
+    session: ActiveSession,
+    deepgramSpeakerId: number,
+  ): Promise<void> {
+    if (session.isGuest) return;
+
+    // Prefer roster candidates; fall back to all enrolled speakers
+    const candidateIds: string[] = session.speakerRoster
+      .map((e) => e.voiceSpeakerId)
+      .filter((id): id is string => Boolean(id));
+
+    if (candidateIds.length === 0) {
+      this.logger.warn(`[${client.id}] identifyMultiSpeaker: no roster voice IDs — falling back to account-wide matching`);
+      const allSpeakers = await this.speakersService.getUserSpeakers(session.userId);
+      for (const s of allSpeakers) {
+        if (s.voice_speaker_id) candidateIds.push(s.voice_speaker_id);
+      }
+    }
+
+    const anonymousLabel = this.getAnonymousSpeakerLabel(session, deepgramSpeakerId);
+
+    if (candidateIds.length === 0) {
+      const resolved: ResolvedSpeaker = {
+        speakerId: null,
+        label: anonymousLabel,
+        voiceSpeakerId: null,
+        method: 'diarization',
+      };
+      session.resolvedSpeakers.set(deepgramSpeakerId, resolved);
+      client.emit('speaker:identified', {
+        deepgramSpeakerId,
+        speakerId: null,
+        speakerLabel: anonymousLabel,
+        method: 'diarization',
+      });
+      return;
+    }
+
+    const perSpeakerBufs = session.speakerAudioBuffers.get(deepgramSpeakerId);
+    const hasPerSpeakerAudio = !!(perSpeakerBufs && perSpeakerBufs.length > 0);
+    let audioData: Buffer;
+    if (hasPerSpeakerAudio) {
+      const headerChunks = session.audioHeaderChunk ? [session.audioHeaderChunk] : [];
+      audioData = Buffer.concat([...headerChunks, ...perSpeakerBufs!]);
+    } else {
+      audioData = Buffer.concat(session.audioBuffer);
+    }
+
+    if (audioData.length === 0) {
+      this.logger.warn(`[${client.id}] identifyMultiSpeaker: no audio for speaker ${deepgramSpeakerId}`);
+      return;
+    }
+
+    let audioUrl: string;
+    try {
+      const uploadResult = await this.uploadService.uploadBuffer(
+        audioData,
+        UploadFolder.VOICE_SAMPLES,
+        `multi-spk-id-${client.id}-${deepgramSpeakerId}`,
+        'video',
+      );
+      audioUrl = uploadResult.secure_url;
+    } catch (err) {
+      this.logger.warn(`[${client.id}] identifyMultiSpeaker: upload failed for speaker ${deepgramSpeakerId}:`, err);
+      return;
+    }
+
+    let result: SpeakerIdentificationResult;
+    try {
+      result = await this.voiceVerificationService.identifySpeaker(audioUrl, candidateIds);
+    } catch (err) {
+      this.logger.warn(`[${client.id}] identifyMultiSpeaker: identify call failed (non-fatal):`, err);
+      return;
+    }
+
+    this.logger.log(
+      `[${client.id}] Multi-speaker ${deepgramSpeakerId} identify: ` +
+      `identified=${result.identified}, matchedId=${result.speakerId ?? 'none'}, ` +
+      `score=${result.similarityScore.toFixed(3)}, candidates=${result.candidatesChecked}`,
+    );
+
+    let resolvedName: string;
+    let resolvedSpeakerId: string | null = null;
+    let method: 'voice_id' | 'diarization' = 'diarization';
+
+    if (result.identified && result.speakerId) {
+      const matchedRosterEntry = session.speakerRosterByVoiceId.get(result.speakerId);
+      if (matchedRosterEntry) {
+        resolvedName = matchedRosterEntry.displayName;
+        resolvedSpeakerId = matchedRosterEntry.speakerId;
+      } else {
+        // Matched against account-wide fallback
+        resolvedName = result.speakerName ?? anonymousLabel;
+        resolvedSpeakerId = result.speakerId;
+      }
+      method = 'voice_id';
+    } else {
+      resolvedName = anonymousLabel;
+    }
+
+    const resolved: ResolvedSpeaker = {
+      speakerId: resolvedSpeakerId,
+      label: resolvedName,
+      voiceSpeakerId: result.identified ? result.speakerId : null,
+      method,
+      confidence: result.similarityScore,
+    };
+    session.resolvedSpeakers.set(deepgramSpeakerId, resolved);
+
+    client.emit('speaker:identified', {
+      deepgramSpeakerId,
+      speakerId: resolvedSpeakerId,
+      previousLabel: anonymousLabel,
+      speakerLabel: resolvedName,
+      method,
+      ...(result.identified ? { similarityScore: result.similarityScore } : {}),
+      audioSource: hasPerSpeakerAudio ? 'per_speaker' : 'mixed',
+    });
+  }
+
   // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Builds per-speaker transcript turns for multi-speaker mode.
+   * Each Deepgram speaker ID gets its own turn, resolved against the
+   * anonymous label map or a voice-ID match (Gap 3 + Gap 11).
+   */
+  private buildMultiSpeakerTurns(
+    session: ActiveSession,
+    words: TranscriptWord[],
+    confidence: number,
+  ): MultiSpeakerTurn[] {
+    const grouped = new Map<number, TranscriptWord[]>();
+    for (const word of words) {
+      const spk = word.speaker ?? 0;
+      const group = grouped.get(spk) ?? [];
+      group.push(word);
+      grouped.set(spk, group);
+    }
+
+    const turns: MultiSpeakerTurn[] = [];
+    for (const [deepgramSpeakerId, speakerWords] of grouped.entries()) {
+      const text = speakerWords.map((w) => w.word).join(' ').trim();
+      if (!text) continue;
+
+      const identity = this.resolveSpeakerLabel(session, deepgramSpeakerId);
+
+      turns.push({
+        deepgramSpeakerId,
+        speakerId: identity.speakerId,
+        speakerLabel: identity.speakerLabel,
+        text,
+        confidence,
+        startMs: speakerWords[0]?.start != null ? Math.round(speakerWords[0].start * 1000) : null,
+        endMs: speakerWords.at(-1)?.end != null ? Math.round(speakerWords.at(-1)!.end * 1000) : null,
+        identificationMethod: identity.identificationMethod,
+      });
+    }
+
+    return turns;
+  }
+
+  /** Returns the current resolved identity for a Deepgram speaker ID (multi-speaker). */
+  private resolveSpeakerLabel(
+    session: ActiveSession,
+    deepgramSpeakerId: number,
+  ): {
+    speakerId: string | null;
+    speakerLabel: string;
+    voiceSpeakerId: string | null;
+    identificationMethod: 'voice_id' | 'manual' | 'diarization' | 'unknown';
+    confidence?: number;
+  } {
+    const resolved = session.resolvedSpeakers.get(deepgramSpeakerId);
+    if (resolved) {
+      return {
+        speakerId: resolved.speakerId,
+        speakerLabel: resolved.label,
+        voiceSpeakerId: resolved.voiceSpeakerId,
+        identificationMethod: resolved.method,
+        confidence: resolved.confidence,
+      };
+    }
+
+    return {
+      speakerId: null,
+      speakerLabel: this.getAnonymousSpeakerLabel(session, deepgramSpeakerId),
+      voiceSpeakerId: null,
+      identificationMethod: 'diarization',
+    };
+  }
+
+  /** Returns a stable session-local anonymous label (Guest 1, Guest 2 …) for an unresolved speaker. */
+  private getAnonymousSpeakerLabel(session: ActiveSession, deepgramSpeakerId: number): string {
+    const existing = session.anonymousSpeakerLabels.get(deepgramSpeakerId);
+    if (existing) return existing;
+
+    const label = `Guest ${session.nextAnonymousSpeakerNumber}`;
+    session.nextAnonymousSpeakerNumber += 1;
+    session.anonymousSpeakerLabels.set(deepgramSpeakerId, label);
+    return label;
+  }
+
+  /** Resolves and validates the session speaker roster against the user's saved speakers. */
+  private async resolveSpeakerRoster(
+    userId: string,
+    roster?: Array<{ speakerId: string; displayName: string; role?: 'owner' | 'participant' }>,
+  ): Promise<SpeakerRosterEntry[]> {
+    if (!roster?.length) return [];
+
+    const allSpeakers = await this.speakersService.getUserSpeakers(userId);
+    const byId = new Map(allSpeakers.map((s) => [s.id, s]));
+
+    return roster
+      .map((entry): SpeakerRosterEntry | null => {
+        const speaker = byId.get(entry.speakerId);
+        if (!speaker) return null;
+        return {
+          speakerId: speaker.id,
+          displayName: entry.displayName || speaker.name,
+          voiceSpeakerId: speaker.voice_speaker_id,
+          role: entry.role ?? (speaker.is_owner ? 'owner' : 'participant'),
+        };
+      })
+      .filter((e): e is SpeakerRosterEntry => Boolean(e));
+  }
+
+  /** Persists multi-speaker transcript turns to the segments table. */
+  private async saveMultiSpeakerTurns(
+    session: ActiveSession,
+    turns: MultiSpeakerTurn[],
+  ): Promise<void> {
+    if (!turns.length) return;
+    const segments: SaveTranscriptSegmentDto[] = turns.map((t) => ({
+      conversationId: session.conversationId,
+      speakerId: t.speakerId,
+      deepgramSpeakerId: t.deepgramSpeakerId,
+      speakerLabel: t.speakerLabel,
+      transcript: t.text,
+      startMs: t.startMs,
+      endMs: t.endMs,
+      confidence: t.confidence,
+      identificationMethod: t.identificationMethod,
+    }));
+    await this.conversationService.saveTranscriptSegments(segments).catch((err) =>
+      this.logger.error(`[${session.conversationId}] saveMultiSpeakerTurns failed:`, err),
+    );
+  }
+
   private cleanupSession(socketId: string): void {
     const session = this.sessions.get(socketId);
     if (!session) return;
 
-    // Delete from the map FIRST so any re-entrant calls (e.g. from closeDeepgram
-    // firing a synchronous 'close'/'error' event) find no session and return early.
     this.sessions.delete(socketId);
-
-    // Remove all emitter listeners BEFORE closing so the 'close'/'error' events
-    // emitted by socket.close() do not re-trigger the gateway handlers.
     session.deepgramEmitter.removeAllListeners();
 
-    // Cancel all pending timers
     if (session.utteranceDebounceTimer) {
       clearTimeout(session.utteranceDebounceTimer);
       session.utteranceDebounceTimer = null;
@@ -2006,11 +2286,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.idleTimeoutHandle = null;
     }
 
-    // Explicitly free audio buffers to release memory before GC
     session.audioBuffer = [];
     session.audioBufferBytes = 0;
     session.speakerAudioBuffers.clear();
     session.speakerAudioBytes.clear();
+    session.resolvedSpeakers.clear();
+    session.anonymousSpeakerLabels.clear();
 
     session.closeDeepgram();
     this.logger.log(`Session cleaned up: ${socketId}`);
