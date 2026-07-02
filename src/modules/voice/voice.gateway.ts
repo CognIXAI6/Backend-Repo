@@ -1371,10 +1371,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     try {
+      const applyTo = payload.applyTo ?? 'session_speaker';
       await this.conversationService.renameAnonymousSpeaker({
         conversationId: session.conversationId,
         deepgramSpeakerId: payload.deepgramSpeakerId,
         speakerLabel: name,
+        applyTo,
         recordingSessionId: session.recordingSessionId,
       });
     } catch (err) {
@@ -1402,6 +1404,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       deepgramSpeakerId: payload.deepgramSpeakerId,
       speakerId: null,
       speakerLabel: name,
+      applyTo: payload.applyTo ?? 'session_speaker',
       method: 'manual',
       persisted: true,
     });
@@ -1477,15 +1480,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const userContent = turns.map((t) => `[${t.speakerLabel}]: ${t.text}`).join('\n');
       const rawTranscript = turns.map((t) => t.text).join(' ');
 
-      const userMsg = await this.conversationService.saveMessage({
-        conversationId: session.conversationId,
-        role: 'user',
-        content: userContent,
-        transcript: rawTranscript,
-        speakerLabel: 'multiple_speakers',
-      });
-
-      await this.saveMultiSpeakerTurns(session, turns, userMsg.id);
+      const segments = this.buildMultiSpeakerSegmentDtos(session, turns);
+      await this.conversationService.saveMessageWithTranscriptSegments(
+        {
+          conversationId: session.conversationId,
+          role: 'user',
+          content: userContent,
+          transcript: rawTranscript,
+          speakerLabel: 'multiple_speakers',
+        },
+        segments,
+      );
 
       client.emit('transcript:confirmed', {
         mode: 'multiple_speaker',
@@ -2355,16 +2360,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       .filter((e): e is SpeakerRosterEntry => Boolean(e));
   }
 
-  /** Persists multi-speaker transcript turns to the segments table. */
-  private async saveMultiSpeakerTurns(
+  /** Builds DB rows for multi-speaker transcript turns. */
+  private buildMultiSpeakerSegmentDtos(
     session: ActiveSession,
     turns: MultiSpeakerTurn[],
-    messageId?: string,
-  ): Promise<void> {
-    if (!turns.length) return;
-    const segments: SaveTranscriptSegmentDto[] = turns.map((t) => ({
+  ): SaveTranscriptSegmentDto[] {
+    return turns.map((t) => ({
       conversationId: session.conversationId,
-      messageId: messageId ?? null,
+      messageId: null,
       speakerId: t.speakerId,
       deepgramSpeakerId: t.deepgramSpeakerId,
       speakerLabel: t.speakerLabel,
@@ -2375,9 +2378,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       identificationMethod: t.identificationMethod,
       recordingSessionId: session.recordingSessionId,
     }));
-    await this.conversationService.saveTranscriptSegments(segments).catch((err) =>
-      this.logger.error(`[${session.conversationId}] saveMultiSpeakerTurns failed:`, err),
-    );
   }
 
   /** Counts total words across all pending multi-speaker turns. */
