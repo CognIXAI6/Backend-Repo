@@ -14,7 +14,7 @@ import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
 import { EventEmitter } from 'events';
 
-import { DeepgramService, TranscriptWord } from './services/deepgram.service';
+import { DeepgramLiveAudioFormat, DeepgramService, TranscriptWord } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService, ConversationMode, SaveTranscriptSegmentDto } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
@@ -29,6 +29,13 @@ import { ErrorLogService } from '@/modules/error-log/error-log.service';
 // ─── Mode types ───────────────────────────────────────────────────────────────
 
 type RealtimeMode = 'single' | 'dual_speaker' | 'multiple_speaker';
+
+interface ClientAudioFormatHint {
+  mimeType?: string;
+  encoding?: string;
+  sampleRate?: number;
+  channels?: number;
+}
 
 // ─── Per-socket session state ─────────────────────────────────────────────────
 
@@ -227,6 +234,24 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     return { pass: true };
   }
 
+  private normalizeAudioFormatHint(input?: ClientAudioFormatHint): DeepgramLiveAudioFormat | undefined {
+    const encoding = String(input?.encoding ?? '').trim().toLowerCase();
+    const mimeType = String(input?.mimeType ?? '').trim().toLowerCase();
+
+    if (encoding !== 'linear16' && mimeType !== 'audio/linear16') {
+      return undefined;
+    }
+
+    const sampleRate = Number(input?.sampleRate);
+    const channels = Number(input?.channels);
+
+    return {
+      encoding: 'linear16',
+      sampleRate: Number.isFinite(sampleRate) ? Math.min(Math.max(Math.round(sampleRate), 8000), 48000) : 16000,
+      channels: channels === 2 ? 2 : 1,
+    };
+  }
+
   constructor(
     private readonly deepgramService: DeepgramService,
     private readonly claudeService: ClaudeService,
@@ -345,6 +370,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       expectedSpeakerCount?: number;
       /** Audio source hint from the client (Gap 9 Phase 1) */
       audioSource?: 'mic_only' | 'mixed_mic_tab';
+      /** Native mobile raw PCM format hint. Web/container uploads omit this. */
+      audioFormat?: ClientAudioFormatHint;
     },
   ): Promise<void> {
     try {
@@ -431,6 +458,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const isDualSpeaker = mode === 'dual_speaker';
       const isMultiSpeaker = mode === 'multiple_speaker';
       const shouldDiarize = isDualSpeaker || isMultiSpeaker;
+      const audioFormat = this.normalizeAudioFormatHint(payload.audioFormat);
 
       if (!conversationId) {
         const dbMode: ConversationMode = mode === 'multiple_speaker' ? 'multiple_speaker' : (mode as ConversationMode);
@@ -459,6 +487,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           diarize: shouldDiarize,
           utteranceEndMs: shouldDiarize ? 2000 : 1500,
           meetingMode: shouldDiarize,
+          audioFormat,
         },
       );
 
