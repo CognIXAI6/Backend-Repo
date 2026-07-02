@@ -18,6 +18,12 @@ export interface TranscriptResult {
   words: TranscriptWord[];
 }
 
+export interface DeepgramLiveAudioFormat {
+  encoding?: 'linear16';
+  sampleRate?: number;
+  channels?: number;
+}
+
 interface DeepgramMessagePayload {
   type?: string;
   is_final?: boolean;
@@ -60,7 +66,7 @@ export class DeepgramService implements OnModuleInit {
     this.logger.log('Deepgram client initialized (SDK v5)');
   }
 
-  async createLiveSession(sessionId: string, options?: { diarize?: boolean; utteranceEndMs?: number; meetingMode?: boolean }): Promise<{
+  async createLiveSession(sessionId: string, options?: { diarize?: boolean; utteranceEndMs?: number; meetingMode?: boolean; audioFormat?: DeepgramLiveAudioFormat }): Promise<{
     emitter: EventEmitter;
     sendAudio: (chunk: Buffer) => void;
     close: () => void;
@@ -81,6 +87,13 @@ export class DeepgramService implements OnModuleInit {
       // back-and-forth conversation doesn't fragment into word-sized chunks.
       utterance_end_ms:        String(options?.utteranceEndMs ?? 1500),
       vad_events:              'true',
+      ...(options?.audioFormat?.encoding === 'linear16'
+        ? {
+            encoding: 'linear16',
+            sample_rate: String(options.audioFormat.sampleRate ?? 16000),
+            channels: String(options.audioFormat.channels ?? 1),
+          }
+        : {}),
       // Enable speaker diarization when requested (dual-speaker mode)
       ...(options?.diarize ? { diarize: 'true' } : {}),
       // Fail fast: don't retry on connection failure during session start.
