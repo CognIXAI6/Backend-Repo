@@ -17,6 +17,24 @@ export interface SaveTranscriptSegmentDto {
   endMs?: number | null;
   confidence?: number | null;
   identificationMethod: string;
+  recordingSessionId?: string | null;
+}
+
+export interface TranscriptSegment {
+  id: string;
+  conversation_id: string;
+  message_id: string | null;
+  speaker_id: string | null;
+  deepgram_speaker_id: number | null;
+  speaker_label: string;
+  transcript: string;
+  start_ms: number | null;
+  end_ms: number | null;
+  confidence: number | null;
+  identification_method: string;
+  is_corrected: boolean;
+  recording_session_id: string | null;
+  created_at: Date;
 }
 
 export interface Conversation {
@@ -178,7 +196,10 @@ export class ConversationService {
 
   // ── Get single conversation ─────────────────────────────────────────────────
 
-  async getConversation(conversationId: string, userId: string): Promise<Conversation & { messages: ConversationMessage[] }> {
+  async getConversation(
+    conversationId: string,
+    userId: string,
+  ): Promise<Conversation & { messages: ConversationMessage[]; transcriptSegments: TranscriptSegment[] }> {
     const conversation = await this.knex('conversations')
       .where({ id: conversationId, user_id: userId })
       .whereNull('deleted_at')
@@ -186,12 +207,18 @@ export class ConversationService {
 
     if (!conversation) throw new NotFoundException('Conversation not found');
 
-    const messages = await this.knex('conversation_messages')
-      .where('conversation_id', conversationId)
-      .orderBy('created_at', 'asc')
-      .select('*');
+    const [messages, transcriptSegments] = await Promise.all([
+      this.knex('conversation_messages')
+        .where('conversation_id', conversationId)
+        .orderBy('created_at', 'asc')
+        .select('*'),
+      this.knex('conversation_transcript_segments')
+        .where('conversation_id', conversationId)
+        .orderByRaw('created_at ASC, COALESCE(start_ms, 999999999) ASC')
+        .select('*'),
+    ]);
 
-    return { ...conversation, messages };
+    return { ...conversation, messages, transcriptSegments };
   }
 
   // ── Get messages only ───────────────────────────────────────────────────────
@@ -285,6 +312,7 @@ export class ConversationService {
         end_ms: s.endMs ?? null,
         confidence: s.confidence ?? null,
         identification_method: s.identificationMethod,
+        recording_session_id: s.recordingSessionId ?? null,
       })),
     );
   }
@@ -296,6 +324,7 @@ export class ConversationService {
     speakerId: string;
     speakerLabel: string;
     applyTo: 'segment' | 'session_speaker' | 'conversation_speaker';
+    recordingSessionId?: string | null;
   }): Promise<void> {
     const query = this.knex('conversation_transcript_segments').where(
       'conversation_id',
@@ -304,7 +333,14 @@ export class ConversationService {
 
     if (input.applyTo === 'segment' && input.segmentId) {
       query.andWhere('id', input.segmentId);
+    } else if (input.applyTo === 'session_speaker' && input.deepgramSpeakerId != null && input.recordingSessionId) {
+      // Scope to the current recording so speaker 0 in one recording doesn't
+      // accidentally relabel speaker 0 from a different recording in the same conversation.
+      query
+        .andWhere('deepgram_speaker_id', input.deepgramSpeakerId)
+        .andWhere('recording_session_id', input.recordingSessionId);
     } else if (input.deepgramSpeakerId != null) {
+      // conversation_speaker or no recordingSessionId — update all matching rows
       query.andWhere('deepgram_speaker_id', input.deepgramSpeakerId);
     } else {
       throw new Error('Correction requires segmentId or deepgramSpeakerId');
@@ -322,14 +358,60 @@ export class ConversationService {
     conversationId: string;
     deepgramSpeakerId: number;
     speakerLabel: string;
+    recordingSessionId?: string | null;
   }): Promise<void> {
-    await this.knex('conversation_transcript_segments')
+    const query = this.knex('conversation_transcript_segments')
+      .where('conversation_id', input.conversationId)
+      .andWhere('deepgram_speaker_id', input.deepgramSpeakerId);
+
+    if (input.recordingSessionId) {
+      query.andWhere('recording_session_id', input.recordingSessionId);
+    }
+
+    await query.update({
+      speaker_label: input.speakerLabel,
+      identification_method: 'manual',
+      is_corrected: true,
+    });
+  }
+
+  // ── Gap 6: retroactive segment update after voice ID resolves a speaker ────
+
+  async updateTranscriptSpeakerByDeepgramId(input: {
+    conversationId: string;
+    deepgramSpeakerId: number;
+    speakerId: string | null;
+    speakerLabel: string;
+    identificationMethod: 'voice_id' | 'manual' | 'diarization' | 'unknown';
+    recordingSessionId?: string | null;
+  }): Promise<void> {
+    const query = this.knex('conversation_transcript_segments')
       .where('conversation_id', input.conversationId)
       .andWhere('deepgram_speaker_id', input.deepgramSpeakerId)
-      .update({
-        speaker_label: input.speakerLabel,
-        identification_method: 'manual',
-        is_corrected: true,
-      });
+      .andWhere('is_corrected', false);
+
+    if (input.recordingSessionId) {
+      query.andWhere('recording_session_id', input.recordingSessionId);
+    }
+
+    await query.update({
+      speaker_id: input.speakerId,
+      speaker_label: input.speakerLabel,
+      identification_method: input.identificationMethod,
+    });
+  }
+
+  // ── Gap 3: dedicated segment read ─────────────────────────────────────────
+
+  async getTranscriptSegments(
+    conversationId: string,
+    userId: string,
+  ): Promise<TranscriptSegment[]> {
+    await this.assertOwnership(conversationId, userId);
+
+    return this.knex('conversation_transcript_segments')
+      .where('conversation_id', conversationId)
+      .orderByRaw('created_at ASC, COALESCE(start_ms, 999999999) ASC')
+      .select('*');
   }
 }

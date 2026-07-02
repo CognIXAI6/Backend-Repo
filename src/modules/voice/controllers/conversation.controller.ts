@@ -50,6 +50,14 @@ export class ConversationController {
     return this.conversationService.getConversationMessages(id, userId);
   }
 
+  @Get(':id/transcript-segments')
+  getTranscriptSegments(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('userId') userId: string,
+  ) {
+    return this.conversationService.getTranscriptSegments(id, userId);
+  }
+
   @Patch(':id')
   rename(
     @Param('id', ParseUUIDPipe) id: string,

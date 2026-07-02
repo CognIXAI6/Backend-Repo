@@ -14,6 +14,7 @@ import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
 import { EventEmitter } from 'events';
 
+import { randomUUID } from 'crypto';
 import { DeepgramService, TranscriptWord } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService, ConversationMode, SaveTranscriptSegmentDto } from './services/conversation.service';
@@ -153,6 +154,8 @@ interface ActiveSession {
   // ── Audio chunk sequencing (Gap 7) ───────────────────────────────────────
   lastAudioSequence: number | null;
   audioGapCount: number;
+  /** Stable UUID for this recording session — used to scope segment corrections. */
+  recordingSessionId: string;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
@@ -513,6 +516,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         idleTimeoutHandle: null,
         lastAudioSequence: null,
         audioGapCount: 0,
+        recordingSessionId: randomUUID(),
       };
 
       // ── Deepgram transcript handler ───────────────────────────────────────
@@ -538,7 +542,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // ── Multi-speaker path ────────────────────────────────────────────
         if (session.isMultiSpeaker) {
           const words: TranscriptWord[] = result.words ?? [];
-          const turns = this.buildMultiSpeakerTurns(session, words, result.confidence);
+          const turns = this.buildMultiSpeakerTurns(session, words, result.confidence, result.transcript);
 
           // Track per-speaker accumulated speech duration
           for (const w of words) {
@@ -752,21 +756,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           // ── Multi-speaker path ──────────────────────────────────────────
           if (session.isMultiSpeaker) {
-            if (session.pendingMultiSpeakerTurns.length === 0) return;
-
-            const turns = session.pendingMultiSpeakerTurns.splice(0);
-            const combinedWords = turns
-              .map((t) => t.text)
-              .join(' ')
-              .split(/\s+/)
-              .filter(Boolean).length;
-
-            if (combinedWords < 8) return;
-
-            session.accumulatedTranscript = '';
-            client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
-
-            await this.processMultiSpeakerPrompt(client, session, turns);
+            await this.flushMultiSpeakerTurns(client, session, {
+              reason: 'utterance_end',
+              minWords: 8,
+            });
             return;
           }
 
@@ -968,6 +961,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const session = this.sessions.get(client.id);
     if (!session) return;
 
+    // Multi-speaker: flush pending turns (minWords=1 so stop never silently discards).
+    if (session.isMultiSpeaker) {
+      await this.flushMultiSpeakerTurns(client, session, { reason: 'audio_stop', minWords: 1 });
+      return;
+    }
+
+    // Single / dual-speaker path
     const transcript = (
       session.accumulatedTranscript.trim() || session.pendingInterimTranscript.trim()
     );
@@ -1268,16 +1268,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    if (payload.deepgramSpeakerId != null) {
-      session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
-        speakerId: speaker.id,
-        label: speaker.name,
-        voiceSpeakerId: speaker.voice_speaker_id,
-        method: 'manual',
-        confidence: 1,
-      });
-    }
-
     try {
       await this.conversationService.correctTranscriptSpeaker({
         conversationId: session.conversationId,
@@ -1286,9 +1276,26 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerId: speaker.id,
         speakerLabel: speaker.name,
         applyTo: payload.applyTo ?? 'session_speaker',
+        recordingSessionId: session.recordingSessionId,
       });
     } catch (err) {
       this.logger.warn(`[${client.id}] correctTranscriptSpeaker DB error: ${(err as Error).message}`);
+      this.emitError(client, 'SPEAKER_CORRECTION_FAILED', (err as Error).message, {
+        clientMessage: 'Could not save the speaker correction. Please try again.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    // Update in-memory state only after DB confirms
+    if (payload.deepgramSpeakerId != null) {
+      session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
+        speakerId: speaker.id,
+        label: speaker.name,
+        voiceSpeakerId: speaker.voice_speaker_id,
+        method: 'manual',
+        confidence: 1,
+      });
     }
 
     this.logger.log(
@@ -1301,6 +1308,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       speakerId: speaker.id,
       speakerLabel: speaker.name,
       applyTo: payload.applyTo ?? 'session_speaker',
+      persisted: true,
     });
   }
 
@@ -1333,6 +1341,23 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
+    try {
+      await this.conversationService.renameAnonymousSpeaker({
+        conversationId: session.conversationId,
+        deepgramSpeakerId: payload.deepgramSpeakerId,
+        speakerLabel: name,
+        recordingSessionId: session.recordingSessionId,
+      });
+    } catch (err) {
+      this.logger.warn(`[${client.id}] renameAnonymousSpeaker DB error: ${(err as Error).message}`);
+      this.emitError(client, 'GUEST_RENAME_FAILED', (err as Error).message, {
+        clientMessage: 'Could not save the guest name. Please try again.',
+        severity: 'warn',
+      });
+      return;
+    }
+
+    // Update in-memory state only after DB confirms
     session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
       speakerId: null,
       label: name,
@@ -1340,19 +1365,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       method: 'manual',
       confidence: 1,
     });
-
-    // Also update the anonymous label map so future turns show the right name
     session.anonymousSpeakerLabels.set(payload.deepgramSpeakerId, name);
-
-    try {
-      await this.conversationService.renameAnonymousSpeaker({
-        conversationId: session.conversationId,
-        deepgramSpeakerId: payload.deepgramSpeakerId,
-        speakerLabel: name,
-      });
-    } catch (err) {
-      this.logger.warn(`[${client.id}] renameAnonymousSpeaker DB error: ${(err as Error).message}`);
-    }
 
     this.logger.log(`[${client.id}] Guest renamed: deepgramId=${payload.deepgramSpeakerId} → "${name}"`);
 
@@ -1361,6 +1374,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       speakerId: null,
       speakerLabel: name,
       method: 'manual',
+      persisted: true,
     });
   }
 
@@ -1369,6 +1383,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   @SubscribeMessage('session:end')
   async handleSessionEnd(@ConnectedSocket() client: Socket): Promise<void> {
     const session = this.sessions.get(client.id);
+
+    // Flush any pending multi-speaker turns before tearing down so they are
+    // not silently discarded when the user stops recording.
+    if (session?.isMultiSpeaker && session.pendingMultiSpeakerTurns.length > 0) {
+      await this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 }).catch(
+        (err) => this.logger.error('session:end flush failed:', err),
+      );
+    }
 
     if (session && !session.isGuest) {
       this.saveSessionMemory(session).catch((err) =>
@@ -1392,7 +1414,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let aiStarted = false;
 
     try {
-      const recentHistory = session.multiSpeakerHistory.slice(-60);
+      // Gap 9: exclude the current turns from the history context so they only
+      // appear once in the prompt (under "Latest exchange"), not twice.
+      const historyWithoutCurrent = session.multiSpeakerHistory.slice(
+        0,
+        Math.max(0, session.multiSpeakerHistory.length - turns.length),
+      );
+      const recentHistory = historyWithoutCurrent.slice(-60);
       const conversationContext = recentHistory
         .map((t) => `[${t.speakerLabel}]: ${t.text}`)
         .join('\n');
@@ -1405,7 +1433,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         ? ' If speaker attribution is uncertain, avoid overclaiming who said what.'
         : '';
 
-      const userMessage =
+      const claudePrompt =
         `Conversation so far:\n${conversationContext}\n\n` +
         `Latest exchange:\n${latestExchange}\n\n` +
         `Give the owner a brief, useful insight.${uncertainty}`;
@@ -1415,10 +1443,25 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.cachedAiMemory ?? undefined,
       );
 
+      // Gap 8: persist the user message and segments BEFORE starting the AI stream
+      // so they are never lost if the stream errors or the client disconnects.
+      const userContent = turns.map((t) => `[${t.speakerLabel}]: ${t.text}`).join('\n');
+      const rawTranscript = turns.map((t) => t.text).join(' ');
+
+      const userMsg = await this.conversationService.saveMessage({
+        conversationId: session.conversationId,
+        role: 'user',
+        content: userContent,
+        transcript: rawTranscript,
+        speakerLabel: 'multiple_speakers',
+      });
+
+      await this.saveMultiSpeakerTurns(session, turns, userMsg.id);
+
       client.emit('transcript:confirmed', {
         mode: 'multiple_speaker',
         inputType: 'voice',
-        transcript: turns.map((t) => t.text).join(' '),
+        transcript: rawTranscript,
         segments: turns,
       });
       client.emit('ai:start');
@@ -1426,7 +1469,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       let firstToken = true;
 
-      await this.claudeService.streamResponse(userMessage, [], systemPrompt, {
+      await this.claudeService.streamResponse(claudePrompt, [], systemPrompt, {
         onToken: (token) => {
           if (firstToken) {
             client.emit('ai:latency', { latencyMs: Date.now() - aiStartTime });
@@ -1436,8 +1479,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         },
 
         onDone: async (fullText, inputTokens, outputTokens) => {
-          await this.saveMultiSpeakerTurns(session, turns);
-
           await this.conversationService.saveMessage({
             conversationId: session.conversationId,
             role: 'assistant',
@@ -1447,7 +1488,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           });
 
           this.claudeService
-            .generateConversationTitle(turns.map((t) => t.text).join(' '), fullText, session.fieldName)
+            .generateConversationTitle(rawTranscript, fullText, session.fieldName)
             .then((title) => this.conversationService.setTitle(session.conversationId, title))
             .catch((err) => this.logger.error('Multi-speaker title generation failed:', err));
 
@@ -2027,35 +2068,34 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   ): Promise<void> {
     if (session.isGuest) return;
 
-    // Prefer roster candidates; fall back to all enrolled speakers
+    // Build candidate voice IDs from session roster first.
+    // When no roster was provided, fall back to all account-wide enrolled speakers
+    // and build a map from external voiceSpeakerId → local speakers.id so we
+    // never store an external ID in the speakers_id FK column (Gap 4).
     const candidateIds: string[] = session.speakerRoster
       .map((e) => e.voiceSpeakerId)
       .filter((id): id is string => Boolean(id));
+
+    // voiceId → local speaker entry for account-wide fallback resolution
+    const accountSpeakerByVoiceId = new Map<string, { id: string; name: string }>();
 
     if (candidateIds.length === 0) {
       this.logger.warn(`[${client.id}] identifyMultiSpeaker: no roster voice IDs — falling back to account-wide matching`);
       const allSpeakers = await this.speakersService.getUserSpeakers(session.userId);
       for (const s of allSpeakers) {
-        if (s.voice_speaker_id) candidateIds.push(s.voice_speaker_id);
+        if (s.voice_speaker_id) {
+          candidateIds.push(s.voice_speaker_id);
+          accountSpeakerByVoiceId.set(s.voice_speaker_id, { id: s.id, name: s.name });
+        }
       }
     }
 
     const anonymousLabel = this.getAnonymousSpeakerLabel(session, deepgramSpeakerId);
 
     if (candidateIds.length === 0) {
-      const resolved: ResolvedSpeaker = {
-        speakerId: null,
-        label: anonymousLabel,
-        voiceSpeakerId: null,
-        method: 'diarization',
-      };
+      const resolved: ResolvedSpeaker = { speakerId: null, label: anonymousLabel, voiceSpeakerId: null, method: 'diarization' };
       session.resolvedSpeakers.set(deepgramSpeakerId, resolved);
-      client.emit('speaker:identified', {
-        deepgramSpeakerId,
-        speakerId: null,
-        speakerLabel: anonymousLabel,
-        method: 'diarization',
-      });
+      client.emit('speaker:identified', { deepgramSpeakerId, speakerId: null, speakerLabel: anonymousLabel, method: 'diarization' });
       return;
     }
 
@@ -2077,10 +2117,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let audioUrl: string;
     try {
       const uploadResult = await this.uploadService.uploadBuffer(
-        audioData,
-        UploadFolder.VOICE_SAMPLES,
-        `multi-spk-id-${client.id}-${deepgramSpeakerId}`,
-        'video',
+        audioData, UploadFolder.VOICE_SAMPLES, `multi-spk-id-${client.id}-${deepgramSpeakerId}`, 'video',
       );
       audioUrl = uploadResult.secure_url;
     } catch (err) {
@@ -2102,19 +2139,27 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       `score=${result.similarityScore.toFixed(3)}, candidates=${result.candidatesChecked}`,
     );
 
+    // ── Gap 4: always resolve to local speakers.id, never the external voice ID ──
     let resolvedName: string;
     let resolvedSpeakerId: string | null = null;
     let method: 'voice_id' | 'diarization' = 'diarization';
 
     if (result.identified && result.speakerId) {
-      const matchedRosterEntry = session.speakerRosterByVoiceId.get(result.speakerId);
-      if (matchedRosterEntry) {
-        resolvedName = matchedRosterEntry.displayName;
-        resolvedSpeakerId = matchedRosterEntry.speakerId;
+      // 1. Check session roster (voice_speaker_id → local speaker ID)
+      const rosterEntry = session.speakerRosterByVoiceId.get(result.speakerId);
+      // 2. Fall back to account-wide map (also maps voice_speaker_id → local speaker ID)
+      const accountEntry = accountSpeakerByVoiceId.get(result.speakerId);
+
+      if (rosterEntry) {
+        resolvedName = rosterEntry.displayName;
+        resolvedSpeakerId = rosterEntry.speakerId;          // local speakers.id
+      } else if (accountEntry) {
+        resolvedName = accountEntry.name;
+        resolvedSpeakerId = accountEntry.id;                // local speakers.id
       } else {
-        // Matched against account-wide fallback
+        // External name only, no local record — do not store a FK
         resolvedName = result.speakerName ?? anonymousLabel;
-        resolvedSpeakerId = result.speakerId;
+        resolvedSpeakerId = null;
       }
       method = 'voice_id';
     } else {
@@ -2130,6 +2175,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     };
     session.resolvedSpeakers.set(deepgramSpeakerId, resolved);
 
+    // ── Gap 6: retroactively update segment rows saved before identification ──
+    if (method === 'voice_id') {
+      this.conversationService.updateTranscriptSpeakerByDeepgramId({
+        conversationId: session.conversationId,
+        deepgramSpeakerId,
+        speakerId: resolvedSpeakerId,
+        speakerLabel: resolvedName,
+        identificationMethod: 'voice_id',
+        recordingSessionId: session.recordingSessionId,
+      }).catch((err) =>
+        this.logger.warn(`[${client.id}] retroactive segment update failed (non-fatal): ${(err as Error).message}`),
+      );
+    }
+
     client.emit('speaker:identified', {
       deepgramSpeakerId,
       speakerId: resolvedSpeakerId,
@@ -2138,6 +2197,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       method,
       ...(result.identified ? { similarityScore: result.similarityScore } : {}),
       audioSource: hasPerSpeakerAudio ? 'per_speaker' : 'mixed',
+      persisted: method === 'voice_id',
     });
   }
 
@@ -2152,6 +2212,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session: ActiveSession,
     words: TranscriptWord[],
     confidence: number,
+    fallbackTranscript?: string,
   ): MultiSpeakerTurn[] {
     const grouped = new Map<number, TranscriptWord[]>();
     for (const word of words) {
@@ -2176,6 +2237,23 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         confidence,
         startMs: speakerWords[0]?.start != null ? Math.round(speakerWords[0].start * 1000) : null,
         endMs: speakerWords.at(-1)?.end != null ? Math.round(speakerWords.at(-1)!.end * 1000) : null,
+        identificationMethod: identity.identificationMethod,
+      });
+    }
+
+    // Gap 7: Deepgram occasionally returns a transcript without word-level data.
+    // When that happens emit a single fallback turn attributed to the dominant speaker.
+    if (turns.length === 0 && fallbackTranscript?.trim()) {
+      const spkId = session.currentDominantSpeaker ?? 0;
+      const identity = this.resolveSpeakerLabel(session, spkId);
+      turns.push({
+        deepgramSpeakerId: spkId,
+        speakerId: identity.speakerId,
+        speakerLabel: identity.speakerLabel,
+        text: fallbackTranscript.trim(),
+        confidence,
+        startMs: null,
+        endMs: null,
         identificationMethod: identity.identificationMethod,
       });
     }
@@ -2252,10 +2330,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private async saveMultiSpeakerTurns(
     session: ActiveSession,
     turns: MultiSpeakerTurn[],
+    messageId?: string,
   ): Promise<void> {
     if (!turns.length) return;
     const segments: SaveTranscriptSegmentDto[] = turns.map((t) => ({
       conversationId: session.conversationId,
+      messageId: messageId ?? null,
       speakerId: t.speakerId,
       deepgramSpeakerId: t.deepgramSpeakerId,
       speakerLabel: t.speakerLabel,
@@ -2264,10 +2344,77 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       endMs: t.endMs,
       confidence: t.confidence,
       identificationMethod: t.identificationMethod,
+      recordingSessionId: session.recordingSessionId,
     }));
     await this.conversationService.saveTranscriptSegments(segments).catch((err) =>
       this.logger.error(`[${session.conversationId}] saveMultiSpeakerTurns failed:`, err),
     );
+  }
+
+  /** Counts total words across all pending multi-speaker turns. */
+  private countTurnWords(turns: MultiSpeakerTurn[]): number {
+    return turns
+      .map((t) => t.text)
+      .join(' ')
+      .split(/\s+/)
+      .filter(Boolean).length;
+  }
+
+  /**
+   * Drains `pendingMultiSpeakerTurns` and fires `processMultiSpeakerPrompt`.
+   * Returns true if a prompt was dispatched, false if skipped.
+   * Short turns (< minWords) are KEPT in the queue so they can accumulate
+   * with the next utterance instead of being silently discarded.
+   */
+  private async flushMultiSpeakerTurns(
+    client: Socket,
+    session: ActiveSession,
+    options: { minWords?: number; reason: 'utterance_end' | 'audio_stop' | 'session_end' },
+  ): Promise<boolean> {
+    if (!session.isMultiSpeaker) return false;
+
+    if (session.isProcessingAI) {
+      client.emit('ai:skipped', { reason: 'already_processing' });
+      return false;
+    }
+
+    const turns = [...session.pendingMultiSpeakerTurns];
+    if (turns.length === 0) {
+      if (options.reason !== 'utterance_end') {
+        client.emit('ai:skipped', { reason: 'empty_transcript' });
+      }
+      return false;
+    }
+
+    const wordCount = this.countTurnWords(turns);
+    const minWords = options.minWords ?? 8;
+
+    if (wordCount < minWords) {
+      // Do NOT splice — keep turns so the next utterance can accumulate with them.
+      if (options.reason !== 'utterance_end') {
+        client.emit('ai:skipped', {
+          reason: 'too_short',
+          mode: 'multiple_speaker',
+          transcript: turns.map((t) => t.text).join(' '),
+          segments: turns,
+        });
+      }
+      return false;
+    }
+
+    // Commit the drain only after threshold is confirmed
+    session.pendingMultiSpeakerTurns = [];
+    session.accumulatedTranscript = '';
+    session.transcriptConfidences = [];
+    client.emit('transcript:update', {
+      mode: 'multiple_speaker',
+      transcript: '',
+      isFinal: true,
+      cleared: true,
+    });
+
+    await this.processMultiSpeakerPrompt(client, session, turns);
+    return true;
   }
 
   private cleanupSession(socketId: string): void {
