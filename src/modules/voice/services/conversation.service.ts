@@ -137,6 +137,55 @@ export class ConversationService {
     return message;
   }
 
+  async saveMessageWithTranscriptSegments(
+    dto: SaveMessageDto,
+    segments: SaveTranscriptSegmentDto[],
+  ): Promise<ConversationMessage> {
+    return this.knex.transaction(async (trx) => {
+      const [message] = await trx('conversation_messages')
+        .insert({
+          conversation_id: dto.conversationId,
+          role: dto.role,
+          content: dto.content,
+          transcript: dto.transcript ?? null,
+          audio_url: dto.audioUrl ?? null,
+          audio_duration_ms: dto.audioDurationMs ?? null,
+          speaker_label: dto.speakerLabel ?? null,
+          tokens_used: dto.tokensUsed ?? null,
+          latency_ms: dto.latencyMs ?? null,
+        })
+        .returning('*');
+
+      if (segments.length > 0) {
+        await trx('conversation_transcript_segments').insert(
+          segments.map((s) => ({
+            conversation_id: s.conversationId,
+            message_id: message.id,
+            speaker_id: s.speakerId ?? null,
+            deepgram_speaker_id: s.deepgramSpeakerId ?? null,
+            speaker_label: s.speakerLabel,
+            transcript: s.transcript,
+            start_ms: s.startMs ?? null,
+            end_ms: s.endMs ?? null,
+            confidence: s.confidence ?? null,
+            identification_method: s.identificationMethod,
+            recording_session_id: s.recordingSessionId ?? null,
+          })),
+        );
+      }
+
+      await trx('conversations')
+        .where('id', dto.conversationId)
+        .update({
+          total_messages: trx.raw('total_messages + 1'),
+          last_activity_at: new Date(),
+          updated_at: new Date(),
+        });
+
+      return message;
+    });
+  }
+
   /**
    * Flips all speaker_label values in a conversation between 'owner' and 'other'.
    * Called when biometric verification overrules the initial word-count calibration.
@@ -358,13 +407,14 @@ export class ConversationService {
     conversationId: string;
     deepgramSpeakerId: number;
     speakerLabel: string;
+    applyTo: 'session_speaker' | 'conversation_speaker';
     recordingSessionId?: string | null;
   }): Promise<void> {
     const query = this.knex('conversation_transcript_segments')
       .where('conversation_id', input.conversationId)
       .andWhere('deepgram_speaker_id', input.deepgramSpeakerId);
 
-    if (input.recordingSessionId) {
+    if (input.applyTo === 'session_speaker' && input.recordingSessionId) {
       query.andWhere('recording_session_id', input.recordingSessionId);
     }
 
