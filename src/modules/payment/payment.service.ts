@@ -130,6 +130,8 @@ export class PaymentService {
     email: string,
     name: string | null | undefined,
     billingCycle: BillingCycle,
+    successUrl?: string | null,
+    cancelUrl?: string | null,
   ): Promise<{ checkoutUrl: string }> {
     const existing = await this.knex('subscriptions')
       .where({ user_id: userId })
@@ -149,12 +151,23 @@ export class PaymentService {
     const customerId = await this.getOrCreateStripeCustomer(userId, email, name);
     const frontendUrl = this.configService.get<string>('app.frontendUrl') ?? '';
 
+    // Clients pass their own URLs so each platform gets the right redirect:
+    //   Web:     https://cognixai.ca/payment/success
+    //   Mobile:  cognix://payment/success   (deep link — OS opens the app)
+    // Falls back to the configured frontend URL if not provided.
+    // {CHECKOUT_SESSION_ID} is appended automatically so every platform receives
+    // the session ID and can poll GET /payment/my-subscription to confirm activation.
+    const baseSuccessUrl = successUrl ?? `${frontendUrl}/payment/success`;
+    const separator = baseSuccessUrl.includes('?') ? '&' : '?';
+    const resolvedSuccessUrl = `${baseSuccessUrl}${separator}session_id={CHECKOUT_SESSION_ID}`;
+    const resolvedCancelUrl = cancelUrl ?? `${frontendUrl}/payment/cancel`;
+
     const session = await this.stripe.checkout.sessions.create({
       customer: customerId,
       mode: 'subscription',
       line_items: [{ price: stripePriceId, quantity: 1 }],
-      success_url: `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${frontendUrl}/payment/cancel`,
+      success_url: resolvedSuccessUrl,
+      cancel_url: resolvedCancelUrl,
       metadata: { userId, billingCycle },
     });
 

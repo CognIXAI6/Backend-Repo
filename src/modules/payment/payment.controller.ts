@@ -40,12 +40,16 @@ export class PaymentController {
   createCheckoutSession(
     @CurrentUser() user: { id: string; email: string; name?: string | null },
     @Body('billingCycle') billingCycle: BillingCycle,
+    @Body('successUrl') successUrl?: string,
+    @Body('cancelUrl') cancelUrl?: string,
   ) {
     return this.paymentService.createCheckoutSession(
       user.id,
       user.email,
       user.name,
       billingCycle,
+      successUrl,
+      cancelUrl,
     );
   }
 
