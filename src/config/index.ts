@@ -48,12 +48,6 @@ export const cloudinaryConfig = registerAs('cloudinary', () => ({
 export const stripeConfig = registerAs('stripe', () => ({
   secretKey: process.env.STRIPE_SECRET_KEY,
   webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
-  prices: {
-    monthly: process.env.STRIPE_PRICE_MONTHLY,
-    quarterly: process.env.STRIPE_PRICE_QUARTERLY,
-    biannual: process.env.STRIPE_PRICE_BIANNUAL,
-    yearly: process.env.STRIPE_PRICE_YEARLY,
-  },
 }));
 
 export const clerkConfig = registerAs('clerk', () => ({
