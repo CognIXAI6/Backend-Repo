@@ -6,7 +6,6 @@ export async function seed(knex: Knex): Promise<void> {
   await knex('subscription_plans').insert([
     {
       billing_cycle: 'monthly',
-      stripe_price_id: null,
       amount_cents: 800,
       currency: 'usd',
       label: 'Monthly',
@@ -15,7 +14,6 @@ export async function seed(knex: Knex): Promise<void> {
     },
     {
       billing_cycle: 'quarterly',
-      stripe_price_id: null,
       amount_cents: 2200,
       currency: 'usd',
       label: '3 Months',
@@ -24,7 +22,6 @@ export async function seed(knex: Knex): Promise<void> {
     },
     {
       billing_cycle: 'biannual',
-      stripe_price_id: null,
       amount_cents: 4100,
       currency: 'usd',
       label: '6 Months',
@@ -33,7 +30,6 @@ export async function seed(knex: Knex): Promise<void> {
     },
     {
       billing_cycle: 'yearly',
-      stripe_price_id: null,
       amount_cents: 7700,
       currency: 'usd',
       label: 'Yearly',

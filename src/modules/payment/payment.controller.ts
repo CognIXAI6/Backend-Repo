@@ -51,8 +51,11 @@ export class PaymentController {
 
   @Post('cancel')
   @UseGuards(JwtAuthGuard)
-  cancelSubscription(@Body('subscriptionId') subscriptionId: string) {
-    return this.paymentService.cancelSubscription(subscriptionId);
+  cancelSubscription(
+    @CurrentUser('id') userId: string,
+    @Body('subscriptionId') subscriptionId: string,
+  ) {
+    return this.paymentService.cancelSubscription(userId, subscriptionId);
   }
 
   @Post('webhook')

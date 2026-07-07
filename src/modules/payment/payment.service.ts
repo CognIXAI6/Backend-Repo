@@ -1,4 +1,4 @@
-import { Injectable, Inject, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, Inject, BadRequestException, NotFoundException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { Knex } from 'knex';
@@ -9,7 +9,6 @@ export type BillingCycle = 'monthly' | 'quarterly' | 'biannual' | 'yearly';
 export interface SubscriptionPlan {
   id: string;
   billing_cycle: BillingCycle;
-  stripe_price_id: string | null;
   amount_cents: number;
   currency: string;
   label: string;
@@ -48,8 +47,7 @@ export class PaymentService {
       .select('*');
   }
 
-  // Kept for backwards compatibility with the existing frontend contract.
-  // Returns plans keyed by billing_cycle with amount in dollars (not cents).
+  // Backwards-compatible shape for the existing frontend contract.
   async getSubscriptionPrices(): Promise<Record<string, { label: string; amount: number; discount: number }>> {
     const plans = await this.getSubscriptionPlans();
     return Object.fromEntries(
@@ -72,34 +70,60 @@ export class PaymentService {
     return plan;
   }
 
-  // ── Customer ─────────────────────────────────────────────────────────────────
+  // ── Fix 4: price IDs come exclusively from env vars (single source of truth) ─
+
+  private getStripePriceId(billingCycle: BillingCycle): string {
+    const prices = this.configService.get<Record<string, string | undefined>>('stripe.prices') ?? {};
+    const priceId = prices[billingCycle];
+
+    if (!priceId) {
+      throw new BadRequestException(
+        `Stripe price ID not configured for "${billingCycle}". ` +
+          `Set STRIPE_PRICE_${billingCycle.toUpperCase()} in your environment.`,
+      );
+    }
+
+    return priceId;
+  }
+
+  // Reverse lookup: given a Stripe price ID, return the billing cycle.
+  // Used in syncSubscription so webhook events don't need a DB round-trip.
+  private getBillingCycleForPriceId(priceId: string): BillingCycle | null {
+    const prices = this.configService.get<Record<string, string | undefined>>('stripe.prices') ?? {};
+    const entry = Object.entries(prices).find(([, id]) => id === priceId);
+    return (entry?.[0] as BillingCycle) ?? null;
+  }
+
+  // ── Fix 2: customer creation serialised with SELECT FOR UPDATE ───────────────
 
   private async getOrCreateStripeCustomer(
     userId: string,
     email: string,
     name?: string | null,
   ): Promise<string> {
-    const user = await this.knex('users').where('id', userId).first();
+    return this.knex.transaction(async (trx) => {
+      // Lock the user row so concurrent requests for the same user serialise here
+      // instead of both reading stripe_customer_id = null and creating two customers.
+      const user = await trx('users').where('id', userId).forUpdate().first();
 
-    if (user?.stripe_customer_id) {
-      return user.stripe_customer_id as string;
-    }
+      if (user?.stripe_customer_id) return user.stripe_customer_id as string;
 
-    const customer = await this.stripe.customers.create({
-      email,
-      name: name ?? undefined,
+      // Fix 5: stable idempotency key — same user always maps to the same customer
+      // even if this call is retried after a network timeout.
+      const customer = await this.stripe.customers.create(
+        { email, name: name ?? undefined },
+        { idempotencyKey: `customer-create-${userId}` },
+      );
+
+      await trx('users')
+        .where('id', userId)
+        .update({ stripe_customer_id: customer.id, updated_at: new Date() });
+
+      return customer.id;
     });
-
-    await this.knex('users')
-      .where('id', userId)
-      .update({ stripe_customer_id: customer.id, updated_at: new Date() });
-
-    return customer.id;
   }
 
   // ── Checkout session ──────────────────────────────────────────────────────────
-  // The frontend opens checkoutUrl — Stripe hosts the payment page entirely.
-  // No Stripe.js integration needed on the frontend.
 
   async createCheckoutSession(
     userId: string,
@@ -118,14 +142,9 @@ export class PaymentService {
       );
     }
 
-    const plan = await this.getPlanByBillingCycle(billingCycle);
-
-    if (!plan.stripe_price_id) {
-      throw new BadRequestException(
-        `Stripe price ID not configured for the "${plan.label}" plan. ` +
-          'Please contact support or configure the plan in the dashboard.',
-      );
-    }
+    // Validates plan exists and price ID is configured — throws descriptive 400 if not
+    await this.getPlanByBillingCycle(billingCycle);
+    const stripePriceId = this.getStripePriceId(billingCycle);
 
     const customerId = await this.getOrCreateStripeCustomer(userId, email, name);
     const frontendUrl = this.configService.get<string>('app.frontendUrl') ?? '';
@@ -133,11 +152,9 @@ export class PaymentService {
     const session = await this.stripe.checkout.sessions.create({
       customer: customerId,
       mode: 'subscription',
-      line_items: [{ price: plan.stripe_price_id, quantity: 1 }],
+      line_items: [{ price: stripePriceId, quantity: 1 }],
       success_url: `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${frontendUrl}/payment/cancel`,
-      // Stored on the session so the checkout.session.completed webhook can
-      // create the subscriptions row without a second Stripe lookup.
       metadata: { userId, billingCycle },
     });
 
@@ -158,16 +175,30 @@ export class PaymentService {
       .first();
   }
 
-  async cancelSubscription(subscriptionId: string): Promise<{ canceled: boolean }> {
+  // Fix 1: ownership check — user can only cancel their own subscription
+  // Fix 3: immediately downgrade user tier; webhook acts as self-healing fallback
+  async cancelSubscription(
+    userId: string,
+    subscriptionId: string,
+  ): Promise<{ canceled: boolean }> {
+    const sub = await this.knex('subscriptions')
+      .where({ stripe_subscription_id: subscriptionId, user_id: userId })
+      .first();
+
+    if (!sub) {
+      throw new NotFoundException('Subscription not found');
+    }
+
     await this.stripe.subscriptions.cancel(subscriptionId);
 
     await this.knex('subscriptions')
       .where('stripe_subscription_id', subscriptionId)
-      .update({
-        status: 'canceled',
-        canceled_at: new Date(),
-        updated_at: new Date(),
-      });
+      .update({ status: 'canceled', canceled_at: new Date(), updated_at: new Date() });
+
+    // Downgrade immediately — don't wait for the webhook
+    await this.knex('users')
+      .where('id', userId)
+      .update({ subscription_tier: 'free', updated_at: new Date() });
 
     return { canceled: true };
   }
@@ -214,9 +245,8 @@ export class PaymentService {
     return { received: true };
   }
 
-  // Primary activation path — fires once, after the user completes payment on
-  // Stripe's hosted page. Creates (or updates) the subscriptions row using the
-  // userId and billingCycle stored in session.metadata.
+  // Primary activation path — fires once after the user completes payment on
+  // Stripe's hosted page.
   private async handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
     const { userId, billingCycle } = session.metadata ?? {};
 
@@ -259,8 +289,8 @@ export class PaymentService {
     this.logger.log(`Subscription activated for user ${userId} via checkout session ${session.id}`);
   }
 
-  // Self-healing fallback — keeps the subscriptions row in sync whenever Stripe
-  // sends a subscription lifecycle event (created, updated, renewed, etc.).
+  // Self-healing fallback — keeps the row in sync for renewals, plan changes,
+  // and any lifecycle event from the Stripe dashboard.
   private async syncSubscription(subscription: Stripe.Subscription): Promise<void> {
     const customerId =
       typeof subscription.customer === 'string'
@@ -273,10 +303,9 @@ export class PaymentService {
       return;
     }
 
+    // Fix 4: resolve billing_cycle from config (single source of truth for price IDs)
     const priceId = subscription.items.data[0]?.price.id ?? null;
-    const plan = priceId
-      ? await this.knex('subscription_plans').where('stripe_price_id', priceId).first()
-      : null;
+    const billingCycle = priceId ? this.getBillingCycleForPriceId(priceId) : null;
 
     const isActive = subscription.status === 'active' || subscription.status === 'trialing';
 
@@ -285,7 +314,7 @@ export class PaymentService {
         user_id: user.id,
         stripe_subscription_id: subscription.id,
         stripe_price_id: priceId,
-        billing_cycle: plan?.billing_cycle ?? null,
+        billing_cycle: billingCycle,
         status: subscription.status,
         current_period_start: new Date(subscription.current_period_start * 1000),
         current_period_end: new Date(subscription.current_period_end * 1000),

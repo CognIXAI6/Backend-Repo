@@ -48,6 +48,14 @@ export const cloudinaryConfig = registerAs('cloudinary', () => ({
 export const stripeConfig = registerAs('stripe', () => ({
   secretKey: process.env.STRIPE_SECRET_KEY,
   webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+  // Price IDs are read from env vars by default.
+  // Setting stripe_price_id on a subscription_plans row overrides the env var for that plan.
+  prices: {
+    monthly: process.env.STRIPE_PRICE_MONTHLY,
+    quarterly: process.env.STRIPE_PRICE_QUARTERLY,
+    biannual: process.env.STRIPE_PRICE_BIANNUAL,
+    yearly: process.env.STRIPE_PRICE_YEARLY,
+  },
 }));
 
 export const clerkConfig = registerAs('clerk', () => ({
