@@ -48,6 +48,18 @@ export class PaymentService {
       .select('*');
   }
 
+  // Kept for backwards compatibility with the existing frontend contract.
+  // Returns plans keyed by billing_cycle with amount in dollars (not cents).
+  async getSubscriptionPrices(): Promise<Record<string, { label: string; amount: number; discount: number }>> {
+    const plans = await this.getSubscriptionPlans();
+    return Object.fromEntries(
+      plans.map((p) => [
+        p.billing_cycle,
+        { label: p.label, amount: p.amount_cents / 100, discount: p.discount_percent },
+      ]),
+    );
+  }
+
   private async getPlanByBillingCycle(billingCycle: BillingCycle): Promise<SubscriptionPlan> {
     const plan = await this.knex('subscription_plans')
       .where({ billing_cycle: billingCycle, is_active: true })

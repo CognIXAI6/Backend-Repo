@@ -23,6 +23,11 @@ export class PaymentController {
     return this.paymentService.getSubscriptionPlans();
   }
 
+  @Get('subscription_prices')
+  getSubscriptionPrices() {
+    return this.paymentService.getSubscriptionPrices();
+  }
+
   @Get('my-subscription')
   @UseGuards(JwtAuthGuard)
   getMySubscription(@CurrentUser('id') userId: string) {
