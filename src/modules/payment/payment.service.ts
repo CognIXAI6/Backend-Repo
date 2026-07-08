@@ -281,6 +281,9 @@ export class PaymentService {
 
     let event: Stripe.Event;
     try {
+      console.log("=== Webhook Hits ===", payload);
+      console.log("=== Signature ===", signature);
+      console.log("=== Webhook Secret ===", webhookSecret);
       event = this.stripe.webhooks.constructEvent(payload, signature, webhookSecret ?? '');
     } catch (err) {
       this.logger.error(`Webhook signature verification failed: ${(err as Error).message}`);
