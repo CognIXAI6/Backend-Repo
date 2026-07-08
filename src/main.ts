@@ -6,7 +6,6 @@ import { ValidationPipe, VersioningType } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
-import * as express from 'express';
 import * as bodyParser from 'body-parser';
 
 // Prevent the Deepgram SDK's internal ws.WebSocket from crashing the process
@@ -34,18 +33,24 @@ process.on('unhandledRejection', (reason: unknown) => {
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
-    rawBody: true,
     bufferLogs: true,
   });
 
   // Use Pino logger
   app.useLogger(app.get(Logger));
-  // Increase JSON body size limit to 15MB
-  app.use(bodyParser.json({ limit: '15mb' }));
+
+  // Single JSON body parser: 15 MB limit + rawBody capture for Stripe webhook
+  // verification. Must be registered once — multiple body parsers on the same
+  // route consume the stream and leave req.rawBody undefined.
+  app.use(
+    bodyParser.json({
+      limit: '15mb',
+      verify: (req: any, _res, buf) => {
+        req.rawBody = buf;
+      },
+    }),
+  );
   app.use(bodyParser.urlencoded({ limit: '15mb', extended: true }));
-  
-  // If you're also handling raw data
-  app.use(bodyParser.raw({ limit: '15mb' }));
   const configService = app.get(ConfigService);
   const port = configService.get('app.port');
   const apiPrefix = configService.get('app.apiPrefix');
@@ -84,15 +89,6 @@ async function bootstrap() {
       whitelist: true,
       forbidNonWhitelisted: true,
       transform: true,
-    }),
-  );
-
-  // Raw body for Stripe webhooks
-  app.use(
-    express.json({
-      verify: (req: any, res, buf) => {
-        req.rawBody = buf;
-      },
     }),
   );
 
