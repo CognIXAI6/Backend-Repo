@@ -180,6 +180,35 @@ export class PaymentService {
 
   // ── Subscriptions ─────────────────────────────────────────────────────────────
 
+  async syncSubscriptionFromStripe(userId: string): Promise<{ synced: boolean; status: string | null }> {
+    const user = await this.knex('users').where('id', userId).first();
+
+    if (!user?.stripe_customer_id) {
+      return { synced: false, status: null };
+    }
+
+    // Fetch all non-canceled subscriptions for this customer from Stripe
+    const stripeSubscriptions = await this.stripe.subscriptions.list({
+      customer: user.stripe_customer_id,
+      status: 'all',
+      limit: 10,
+    });
+
+    const active = stripeSubscriptions.data.find(
+      (s) => s.status === 'active' || s.status === 'trialing',
+    );
+
+    const latest = active ?? stripeSubscriptions.data[0] ?? null;
+
+    if (!latest) {
+      return { synced: false, status: null };
+    }
+
+    await this.syncSubscription(latest);
+
+    return { synced: true, status: latest.status };
+  }
+
   async getUserSubscription(userId: string) {
     return this.knex('subscriptions')
       .where({ user_id: userId })
