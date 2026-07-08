@@ -34,6 +34,12 @@ export class PaymentController {
     return this.paymentService.getUserSubscription(userId);
   }
 
+  @Get('history')
+  @UseGuards(JwtAuthGuard)
+  getPaymentHistory(@CurrentUser('id') userId: string) {
+    return this.paymentService.getPaymentHistory(userId);
+  }
+
   // Returns a Stripe-hosted checkout URL. Frontend just opens it — no Stripe.js needed.
   @Post('subscribe')
   @UseGuards(JwtAuthGuard)

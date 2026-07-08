@@ -190,6 +190,61 @@ export class PaymentService {
 
   // Fix 1: ownership check — user can only cancel their own subscription
   // Fix 3: immediately downgrade user tier; webhook acts as self-healing fallback
+  async getPaymentHistory(userId: string): Promise<{
+    invoices: Array<{
+      id: string;
+      amount: number;
+      currency: string;
+      status: string;
+      billingCycle: string | null;
+      periodStart: Date;
+      periodEnd: Date;
+      invoiceUrl: string | null;
+      pdfUrl: string | null;
+      paidAt: Date | null;
+      createdAt: Date;
+    }>;
+    subscription: unknown;
+  }> {
+    const user = await this.knex('users').where('id', userId).first();
+
+    if (!user?.stripe_customer_id) {
+      return { invoices: [], subscription: null };
+    }
+
+    const [stripeInvoices, subscription] = await Promise.all([
+      this.stripe.invoices.list({
+        customer: user.stripe_customer_id,
+        limit: 24,
+        expand: ['data.subscription'],
+      }),
+      this.getUserSubscription(userId),
+    ]);
+
+    const prices = this.configService.get<Record<string, string | undefined>>('stripe.prices') ?? {};
+
+    const invoices = stripeInvoices.data.map((inv) => {
+      const priceId = inv.lines.data[0]?.price?.id ?? null;
+      const billingCycle = priceId ? (Object.entries(prices).find(([, id]) => id === priceId)?.[0] ?? null) : null;
+
+      return {
+        id: inv.id,
+        amount: inv.amount_paid / 100,
+        currency: inv.currency.toUpperCase(),
+        status: inv.status ?? 'unknown',
+        billingCycle,
+        periodStart: new Date((inv.period_start) * 1000),
+        periodEnd: new Date((inv.period_end) * 1000),
+        invoiceUrl: inv.hosted_invoice_url ?? null,
+        pdfUrl: inv.invoice_pdf ?? null,
+        paidAt: inv.status_transitions.paid_at ? new Date(inv.status_transitions.paid_at * 1000) : null,
+        createdAt: new Date(inv.created * 1000),
+      };
+    });
+
+    return { invoices, subscription };
+  }
+
   async cancelSubscription(
     userId: string,
     subscriptionId: string,
@@ -245,6 +300,7 @@ export class PaymentService {
       case 'customer.subscription.deleted':
         await this.handleSubscriptionDeleted(event.data.object as Stripe.Subscription);
         break;
+      case 'invoice.paid':
       case 'invoice.payment_succeeded':
         await this.handlePaymentSucceeded(event.data.object as Stripe.Invoice);
         break;
