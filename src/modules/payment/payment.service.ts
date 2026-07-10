@@ -102,17 +102,38 @@ export class PaymentService {
     name?: string | null,
   ): Promise<string> {
     return this.knex.transaction(async (trx) => {
-      // Lock the user row so concurrent requests for the same user serialise here
-      // instead of both reading stripe_customer_id = null and creating two customers.
       const user = await trx('users').where('id', userId).forUpdate().first();
+      const existingId = user?.stripe_customer_id as string | null;
 
-      if (user?.stripe_customer_id) return user.stripe_customer_id as string;
+      if (existingId) {
+        // Verify the stored ID still exists in the current Stripe mode.
+        // Fails when IDs were created in test mode but live key is now active (or vice versa),
+        // or when a customer was manually deleted in the Stripe dashboard.
+        let valid = false;
+        try {
+          const existing = await this.stripe.customers.retrieve(existingId);
+          valid = !(existing as Stripe.DeletedCustomer).deleted;
+        } catch (err) {
+          if ((err as any).code !== 'resource_missing') throw err;
+          // resource_missing = stale ID (test/live mismatch or deleted) — fall through
+        }
 
-      // Fix 5: stable idempotency key — same user always maps to the same customer
-      // even if this call is retried after a network timeout.
+        if (valid) return existingId;
+
+        this.logger.warn(
+          `Stale Stripe customer ${existingId} for user ${userId} (test/live mismatch or deleted) — creating a new one`,
+        );
+      }
+
+      // Use a different idempotency key for recreation vs first creation so Stripe
+      // doesn't return the cached (now-invalid) customer from the original key.
+      const idempotencyKey = existingId
+        ? `customer-recreate-${userId}`
+        : `customer-create-${userId}`;
+
       const customer = await this.stripe.customers.create(
         { email, name: name ?? undefined },
-        { idempotencyKey: `customer-create-${userId}` },
+        { idempotencyKey },
       );
 
       await trx('users')
@@ -194,12 +215,22 @@ export class PaymentService {
       return { synced: false, status: null };
     }
 
-    // Fetch all non-canceled subscriptions for this customer from Stripe
-    const stripeSubscriptions = await this.stripe.subscriptions.list({
-      customer: user.stripe_customer_id,
-      status: 'all',
-      limit: 10,
-    });
+    let stripeSubscriptions: Stripe.ApiList<Stripe.Subscription>;
+    try {
+      stripeSubscriptions = await this.stripe.subscriptions.list({
+        customer: user.stripe_customer_id,
+        status: 'all',
+        limit: 10,
+      });
+    } catch (err) {
+      if ((err as any).code === 'resource_missing') {
+        this.logger.warn(
+          `syncSubscriptionFromStripe: customer ${user.stripe_customer_id} not found in Stripe (test/live mismatch?) — user ${userId}`,
+        );
+        return { synced: false, status: null };
+      }
+      throw err;
+    }
 
     const active = stripeSubscriptions.data.find(
       (s) => s.status === 'active' || s.status === 'trialing',
