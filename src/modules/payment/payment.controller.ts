@@ -9,14 +9,19 @@ import {
   RawBodyRequest,
   HttpCode,
   HttpStatus,
+  ForbiddenException,
 } from '@nestjs/common';
 import { Request } from 'express';
+import { ConfigService } from '@nestjs/config';
 import { PaymentService, BillingCycle } from './payment.service';
 import { JwtAuthGuard, CurrentUser } from '@/common';
 
 @Controller('payment')
 export class PaymentController {
-  constructor(private paymentService: PaymentService) {}
+  constructor(
+    private paymentService: PaymentService,
+    private configService: ConfigService,
+  ) {}
 
   @Get('plans')
   getPlans() {
@@ -40,7 +45,7 @@ export class PaymentController {
     return this.paymentService.getPaymentHistory(userId);
   }
 
-  @Post('sync')
+  @Get('sync')
   @UseGuards(JwtAuthGuard)
   syncSubscription(@CurrentUser('id') userId: string) {
     return this.paymentService.syncSubscriptionFromStripe(userId);
@@ -72,6 +77,16 @@ export class PaymentController {
     @Body('subscriptionId') subscriptionId: string,
   ) {
     return this.paymentService.cancelSubscription(userId, subscriptionId);
+  }
+
+  @Post('admin/bulk-sync')
+  @HttpCode(HttpStatus.OK)
+  bulkSyncAffectedUsers(@Headers('x-admin-secret') secret: string) {
+    const expected = this.configService.get<string>('app.adminSecret');
+    if (!expected || secret !== expected) {
+      throw new ForbiddenException('Invalid admin secret');
+    }
+    return this.paymentService.bulkSyncAffectedUsers();
   }
 
   @Post('webhook')

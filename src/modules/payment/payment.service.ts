@@ -133,6 +133,13 @@ export class PaymentService {
     successUrl?: string | null,
     cancelUrl?: string | null,
   ): Promise<{ checkoutUrl: string }> {
+    // Pull the latest state from Stripe before the duplicate check so that
+    // users affected by missed webhooks get their tier fixed without repaying.
+    // For users with no stripe_customer_id this is a no-op (early return inside).
+    await this.syncSubscriptionFromStripe(userId).catch((err) =>
+      this.logger.warn(`Pre-subscribe sync failed (non-fatal): ${(err as Error).message}`),
+    );
+
     const existing = await this.knex('subscriptions')
       .where({ user_id: userId })
       .whereIn('status', ['active', 'trialing'])
@@ -140,7 +147,7 @@ export class PaymentService {
 
     if (existing) {
       throw new BadRequestException(
-        'You already have an active subscription. Cancel it before subscribing to a new plan.',
+        'You already have an active subscription. Your account should now reflect the correct plan — please refresh the app. If the issue persists, contact support.',
       );
     }
 
@@ -207,6 +214,50 @@ export class PaymentService {
     await this.syncSubscription(latest);
 
     return { synced: true, status: latest.status };
+  }
+
+  async bulkSyncAffectedUsers(): Promise<{
+    total: number;
+    synced: number;
+    alreadyCorrect: number;
+    failed: number;
+    details: Array<{ userId: string; email: string; result: string }>;
+  }> {
+    // Target: users who gave Stripe their payment details (have a stripe_customer_id)
+    // but whose account is still showing as free — i.e. the webhook never activated them.
+    const candidates = await this.knex('users')
+      .whereNotNull('stripe_customer_id')
+      .where('subscription_tier', 'free')
+      .select('id', 'email', 'stripe_customer_id');
+
+    this.logger.log(`bulkSync: found ${candidates.length} candidate users to check`);
+
+    let synced = 0;
+    let alreadyCorrect = 0;
+    let failed = 0;
+    const details: Array<{ userId: string; email: string; result: string }> = [];
+
+    for (const user of candidates) {
+      try {
+        const result = await this.syncSubscriptionFromStripe(user.id);
+        if (result.synced && (result.status === 'active' || result.status === 'trialing')) {
+          synced++;
+          details.push({ userId: user.id, email: user.email, result: `activated (${result.status})` });
+          this.logger.log(`bulkSync: activated user ${user.id} (${user.email}) — sub status: ${result.status}`);
+        } else {
+          alreadyCorrect++;
+          details.push({ userId: user.id, email: user.email, result: `no active Stripe sub (${result.status ?? 'none'})` });
+        }
+      } catch (err) {
+        failed++;
+        const msg = (err as Error).message;
+        details.push({ userId: user.id, email: user.email, result: `error: ${msg}` });
+        this.logger.error(`bulkSync: failed for user ${user.id} — ${msg}`);
+      }
+    }
+
+    this.logger.log(`bulkSync complete — synced=${synced}, no_sub=${alreadyCorrect}, failed=${failed}`);
+    return { total: candidates.length, synced, alreadyCorrect, failed, details };
   }
 
   async getUserSubscription(userId: string) {
@@ -310,16 +361,16 @@ export class PaymentService {
 
     let event: Stripe.Event;
     try {
-      console.log("=== Webhook Hits ===", payload);
-      console.log("=== Signature ===", signature);
-      console.log("=== Webhook Secret ===", webhookSecret);
+      this.logger.log(
+        `Webhook received — size=${payload.length}b, signature=${signature ? 'present' : 'MISSING'}, secret_configured=${!!webhookSecret}`,
+      );
       event = this.stripe.webhooks.constructEvent(payload, signature, webhookSecret ?? '');
     } catch (err) {
       this.logger.error(`Webhook signature verification failed: ${(err as Error).message}`);
       throw new BadRequestException('Webhook signature verification failed');
     }
 
-    this.logger.log(`Stripe event: ${event.type}`);
+    this.logger.log(`Stripe event received: ${event.type}`);
 
     switch (event.type) {
       case 'checkout.session.completed':
@@ -339,6 +390,19 @@ export class PaymentService {
       case 'invoice.payment_failed':
         await this.handlePaymentFailed(event.data.object as Stripe.Invoice);
         break;
+      // payment_intent.succeeded fires reliably even when checkout.session.completed
+      // or invoice.paid are not subscribed in the Stripe dashboard. We use it as an
+      // additional activation path via its linked invoice → subscription.
+      case 'payment_intent.succeeded': {
+        const pi = event.data.object as Stripe.PaymentIntent;
+        if (pi.invoice) {
+          const invoiceId = typeof pi.invoice === 'string' ? pi.invoice : (pi.invoice as Stripe.Invoice).id;
+          this.logger.log(`payment_intent.succeeded — retrieving invoice ${invoiceId}`);
+          const inv = await this.stripe.invoices.retrieve(invoiceId);
+          await this.handlePaymentSucceeded(inv);
+        }
+        break;
+      }
       default:
         this.logger.log(`Unhandled Stripe event: ${event.type}`);
     }
@@ -398,15 +462,26 @@ export class PaymentService {
         ? subscription.customer
         : subscription.customer.id;
 
+    this.logger.log(
+      `syncSubscription: sub=${subscription.id}, customer=${customerId}, status=${subscription.status}`,
+    );
+
     const user = await this.knex('users').where('stripe_customer_id', customerId).first();
     if (!user) {
-      this.logger.warn(`syncSubscription: no user found for Stripe customer ${customerId}`);
+      this.logger.warn(`syncSubscription: no user found for Stripe customer ${customerId} — cannot activate`);
       return;
     }
 
-    // Fix 4: resolve billing_cycle from config (single source of truth for price IDs)
+    this.logger.log(`syncSubscription: matched user ${user.id} (${user.email})`);
+
     const priceId = subscription.items.data[0]?.price.id ?? null;
     const billingCycle = priceId ? this.getBillingCycleForPriceId(priceId) : null;
+
+    if (priceId && !billingCycle) {
+      this.logger.warn(
+        `syncSubscription: price ${priceId} not found in STRIPE_PRICE_* env vars — billing_cycle will be null`,
+      );
+    }
 
     const isActive = subscription.status === 'active' || subscription.status === 'trialing';
 
@@ -431,6 +506,10 @@ export class PaymentService {
     await this.knex('users')
       .where('id', user.id)
       .update({ subscription_tier: isActive ? 'premium' : 'free', updated_at: new Date() });
+
+    this.logger.log(
+      `syncSubscription: user ${user.id} → tier=${isActive ? 'premium' : 'free'}, sub=${subscription.id} upserted`,
+    );
   }
 
   private async handleSubscriptionDeleted(subscription: Stripe.Subscription): Promise<void> {

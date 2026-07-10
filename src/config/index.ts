@@ -6,6 +6,7 @@ export const appConfig = registerAs('app', () => ({
   apiPrefix: process.env.API_PREFIX || 'api',
   apiVersion: process.env.API_VERSION || 'v1',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:3001',
+  adminSecret: process.env.ADMIN_SECRET,
 }));
 
 export const databaseConfig = registerAs('database', () => ({
