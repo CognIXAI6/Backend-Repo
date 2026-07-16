@@ -3,6 +3,9 @@ import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
+import { GeoService, getCountryConfig } from './geo.service';
+import { FxService } from './fx.service';
+import { FlutterwaveService, FlutterwaveWebhookPayload } from './flutterwave.service';
 
 export type BillingCycle = 'monthly' | 'quarterly' | 'biannual' | 'yearly';
 
@@ -18,6 +21,17 @@ export interface SubscriptionPlan {
   updated_at: Date;
 }
 
+export interface LocalizedPlan {
+  billingCycle: BillingCycle;
+  label: string;
+  currency: string;
+  amount: number;           // major unit (e.g. 12400 NGN, not kobo)
+  amountDisplay: string;    // formatted: "₦12,400" / "$8"
+  discountPercent: number;
+  provider: 'stripe' | 'flutterwave';
+  isOverride: boolean;      // true = admin-pinned price, false = live FX rate
+}
+
 @Injectable()
 export class PaymentService {
   private readonly logger = new Logger(PaymentService.name);
@@ -26,6 +40,9 @@ export class PaymentService {
   constructor(
     private configService: ConfigService,
     @Inject(KNEX_CONNECTION) private knex: Knex,
+    private geoService: GeoService,
+    private fxService: FxService,
+    private flutterwaveService: FlutterwaveService,
   ) {
     const secretKey = this.configService.get<string>('stripe.secretKey');
     if (!secretKey) {
@@ -47,6 +64,50 @@ export class PaymentService {
       .select('*');
   }
 
+  // Geo-aware plans: returns prices in the user's local currency using live FX
+  // rates, or an admin-pinned override stored in subscription_plan_prices.
+  async getLocalizedPlans(clientIp: string, countryOverride?: string): Promise<LocalizedPlan[]> {
+    const country = countryOverride ?? (await this.geoService.detectCountry(clientIp)) ?? 'US';
+    const { currency, provider } = getCountryConfig(country);
+
+    this.logger.log(`getLocalizedPlans: ip=${clientIp} → country=${country} → currency=${currency} provider=${provider}`);
+
+    const plans = await this.getSubscriptionPlans();
+
+    // Load any admin overrides for this currency in one query
+    const overrides = await this.knex('subscription_plan_prices')
+      .whereIn('plan_id', plans.map((p) => p.id))
+      .where({ currency, is_active: true })
+      .select('plan_id', 'amount_override_cents');
+
+    const overrideMap = new Map(overrides.map((o: any) => [o.plan_id, o.amount_override_cents as number]));
+
+    const rate = currency !== 'USD' ? await this.fxService.getRate('USD', currency) : 1;
+
+    return plans.map((plan) => {
+      const overrideCents = overrideMap.get(plan.id) ?? null;
+
+      const amountCents =
+        overrideCents !== null
+          ? overrideCents
+          : this.fxService.convertFromUsdCents(plan.amount_cents, currency, rate);
+
+      const amount = amountCents / 100;
+      const amountDisplay = this.fxService.formatAmount(amountCents, currency);
+
+      return {
+        billingCycle: plan.billing_cycle,
+        label: plan.label,
+        currency,
+        amount,
+        amountDisplay,
+        discountPercent: plan.discount_percent,
+        provider,
+        isOverride: overrideCents !== null,
+      };
+    });
+  }
+
   // Backwards-compatible shape for the existing frontend contract.
   async getSubscriptionPrices(): Promise<Record<string, { label: string; amount: number; discount: number }>> {
     const plans = await this.getSubscriptionPlans();
@@ -56,6 +117,42 @@ export class PaymentService {
         { label: p.label, amount: p.amount_cents / 100, discount: p.discount_percent },
       ]),
     );
+  }
+
+  // ── Admin: FX rates + price overrides ────────────────────────────────────────
+
+  async getFxRatesPreview() {
+    return this.fxService.getAllRates();
+  }
+
+  async setPriceOverride(
+    billingCycle: BillingCycle,
+    currency: string,
+    amountMajorUnits: number,
+  ): Promise<{ updated: boolean }> {
+    const plan = await this.getPlanByBillingCycle(billingCycle);
+    const amountCents = Math.round(amountMajorUnits * 100);
+
+    await this.knex('subscription_plan_prices')
+      .insert({
+        plan_id: plan.id,
+        currency: currency.toUpperCase(),
+        amount_override_cents: amountCents,
+        is_active: true,
+      })
+      .onConflict(['plan_id', 'currency'])
+      .merge({ amount_override_cents: amountCents, updated_at: new Date() });
+
+    this.logger.log(`Price override set: ${billingCycle} / ${currency} = ${amountMajorUnits}`);
+    return { updated: true };
+  }
+
+  async clearPriceOverride(billingCycle: BillingCycle, currency: string): Promise<{ cleared: boolean }> {
+    const plan = await this.getPlanByBillingCycle(billingCycle);
+    await this.knex('subscription_plan_prices')
+      .where({ plan_id: plan.id, currency: currency.toUpperCase() })
+      .delete();
+    return { cleared: true };
   }
 
   private async getPlanByBillingCycle(billingCycle: BillingCycle): Promise<SubscriptionPlan> {
@@ -144,19 +241,20 @@ export class PaymentService {
     });
   }
 
-  // ── Checkout session ──────────────────────────────────────────────────────────
+  // ── Checkout session (geo-routed) ────────────────────────────────────────────
 
   async createCheckoutSession(
     userId: string,
     email: string,
     name: string | null | undefined,
     billingCycle: BillingCycle,
+    clientIp: string,
     successUrl?: string | null,
     cancelUrl?: string | null,
-  ): Promise<{ checkoutUrl: string }> {
-    // Pull the latest state from Stripe before the duplicate check so that
-    // users affected by missed webhooks get their tier fixed without repaying.
-    // For users with no stripe_customer_id this is a no-op (early return inside).
+    countryOverride?: string | null,
+  ): Promise<{ checkoutUrl: string; provider: 'stripe' | 'flutterwave'; currency: string }> {
+    // Sync existing Stripe subscription first so missed-webhook users are healed
+    // before the duplicate check runs (no-op when user has no stripe_customer_id).
     await this.syncSubscriptionFromStripe(userId).catch((err) =>
       this.logger.warn(`Pre-subscribe sync failed (non-fatal): ${(err as Error).message}`),
     );
@@ -172,38 +270,173 @@ export class PaymentService {
       );
     }
 
-    // Validates plan exists and price ID is configured — throws descriptive 400 if not
+    const country = countryOverride ?? (await this.geoService.detectCountry(clientIp)) ?? 'US';
+    const { provider, currency } = getCountryConfig(country);
+
+    this.logger.log(`createCheckoutSession: user=${userId} country=${country} provider=${provider} currency=${currency}`);
+
+    const frontendUrl = this.configService.get<string>('app.frontendUrl') ?? '';
+    const resolvedSuccessUrl = successUrl ?? `${frontendUrl}/payment/success`;
+    const resolvedCancelUrl = cancelUrl ?? `${frontendUrl}/payment/cancel`;
+
+    if (provider === 'flutterwave') {
+      const checkoutUrl = await this.createFlutterwaveCheckout({
+        userId, email, name, billingCycle, currency,
+        successUrl: resolvedSuccessUrl,
+        cancelUrl: resolvedCancelUrl,
+      });
+      return { checkoutUrl, provider, currency };
+    }
+
+    // ── Stripe path ───────────────────────────────────────────────────────────
     await this.getPlanByBillingCycle(billingCycle);
     const stripePriceId = this.getStripePriceId(billingCycle);
-
     const customerId = await this.getOrCreateStripeCustomer(userId, email, name);
-    const frontendUrl = this.configService.get<string>('app.frontendUrl') ?? '';
 
-    // Clients pass their own URLs so each platform gets the right redirect:
-    //   Web:     https://cognixai.ca/payment/success
-    //   Mobile:  cognix://payment/success   (deep link — OS opens the app)
-    // Falls back to the configured frontend URL if not provided.
-    // {CHECKOUT_SESSION_ID} is appended automatically so every platform receives
-    // the session ID and can poll GET /payment/my-subscription to confirm activation.
-    const baseSuccessUrl = successUrl ?? `${frontendUrl}/payment/success`;
+    const baseSuccessUrl = resolvedSuccessUrl;
     const separator = baseSuccessUrl.includes('?') ? '&' : '?';
-    const resolvedSuccessUrl = `${baseSuccessUrl}${separator}session_id={CHECKOUT_SESSION_ID}`;
-    const resolvedCancelUrl = cancelUrl ?? `${frontendUrl}/payment/cancel`;
+    const stripeSuccessUrl = `${baseSuccessUrl}${separator}session_id={CHECKOUT_SESSION_ID}`;
 
     const session = await this.stripe.checkout.sessions.create({
       customer: customerId,
       mode: 'subscription',
+      payment_method_types: ['card'],
       line_items: [{ price: stripePriceId, quantity: 1 }],
-      success_url: resolvedSuccessUrl,
+      success_url: stripeSuccessUrl,
       cancel_url: resolvedCancelUrl,
       metadata: { userId, billingCycle },
     });
 
-    if (!session.url) {
-      throw new Error('Stripe did not return a checkout URL');
+    if (!session.url) throw new Error('Stripe did not return a checkout URL');
+
+    return { checkoutUrl: session.url, provider, currency };
+  }
+
+  private async createFlutterwaveCheckout(params: {
+    userId: string;
+    email: string;
+    name: string | null | undefined;
+    billingCycle: BillingCycle;
+    currency: string;
+    successUrl: string;
+    cancelUrl: string;
+  }): Promise<string> {
+    const { userId, email, name, billingCycle, currency, successUrl } = params;
+
+    const plan = await this.getPlanByBillingCycle(billingCycle);
+
+    // Check for admin override first, then fall back to live FX rate
+    const override = await this.knex('subscription_plan_prices')
+      .where({ plan_id: plan.id, currency, is_active: true })
+      .first();
+
+    let amountMajorUnits: number;
+    if (override?.amount_override_cents != null) {
+      amountMajorUnits = override.amount_override_cents / 100;
+    } else {
+      const rate = await this.fxService.getRate('USD', currency);
+      const amountCents = this.fxService.convertFromUsdCents(plan.amount_cents, currency, rate);
+      amountMajorUnits = amountCents / 100;
     }
 
-    return { checkoutUrl: session.url };
+    const txRef = `cognix-${userId}-${billingCycle}-${Date.now()}`;
+
+    const link = await this.flutterwaveService.createPaymentLink({
+      txRef,
+      amount: amountMajorUnits,
+      currency,
+      email,
+      name: name ?? email,
+      redirectUrl: successUrl,
+      description: `CognIX ${plan.label} subscription`,
+      meta: { userId, billingCycle, provider: 'flutterwave' },
+    });
+
+    this.logger.log(`Flutterwave checkout created: txRef=${txRef} amount=${amountMajorUnits} ${currency}`);
+    return link;
+  }
+
+  // ── Flutterwave webhook ────────────────────────────────────────────────────
+
+  async handleFlutterwaveWebhook(
+    payload: FlutterwaveWebhookPayload,
+    secretHashHeader: string,
+  ): Promise<{ received: boolean }> {
+    if (!this.flutterwaveService.verifyWebhookSignature(secretHashHeader)) {
+      throw new BadRequestException('Invalid Flutterwave webhook signature');
+    }
+
+    this.logger.log(`Flutterwave event: ${payload.event}`);
+
+    if (payload.event === 'charge.completed') {
+      await this.handleFlutterwaveCharge(payload.data);
+    } else {
+      this.logger.log(`Unhandled Flutterwave event: ${payload.event}`);
+    }
+
+    return { received: true };
+  }
+
+  private async handleFlutterwaveCharge(data: FlutterwaveWebhookPayload['data']): Promise<void> {
+    if (data.status !== 'successful') {
+      this.logger.warn(`Flutterwave charge not successful: ${data.status} — txRef=${data.tx_ref}`);
+      return;
+    }
+
+    // Always verify server-side — never trust the webhook payload alone
+    const verified = await this.flutterwaveService.verifyTransaction(data.id);
+    if (verified.status !== 'successful') {
+      this.logger.warn(`Flutterwave transaction ${data.id} verification failed: ${verified.status}`);
+      return;
+    }
+
+    const meta = this.flutterwaveService.parseMeta(data.meta);
+    const { userId, billingCycle } = meta;
+
+    if (!userId || !billingCycle) {
+      this.logger.warn(`Flutterwave charge missing meta: txRef=${data.tx_ref}`);
+      return;
+    }
+
+    const user = await this.knex('users').where('id', userId).first();
+    if (!user) {
+      this.logger.warn(`Flutterwave charge: no user found for userId=${userId}`);
+      return;
+    }
+
+    // Calculate subscription period based on billing cycle
+    const periodDays: Record<string, number> = {
+      monthly: 30, quarterly: 90, biannual: 180, yearly: 365,
+    };
+    const days = periodDays[billingCycle] ?? 30;
+    const now = new Date();
+    const periodEnd = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+
+    await this.knex('subscriptions')
+      .insert({
+        user_id: userId,
+        stripe_subscription_id: `flw-${data.tx_ref}`, // unique reference in our DB
+        stripe_price_id: null,
+        billing_cycle: billingCycle,
+        status: 'active',
+        current_period_start: now,
+        current_period_end: periodEnd,
+      })
+      .onConflict('stripe_subscription_id')
+      .merge({
+        status: 'active',
+        current_period_start: now,
+        current_period_end: periodEnd,
+        updated_at: new Date(),
+      });
+
+    await this.knex('users')
+      .where('id', userId)
+      .update({ subscription_tier: 'premium', updated_at: new Date() });
+
+    this.logger.log(
+      `Flutterwave subscription activated: user=${userId} billingCycle=${billingCycle} periodEnd=${periodEnd.toISOString()}`,
+    );
   }
 
   // ── Subscriptions ─────────────────────────────────────────────────────────────

@@ -63,3 +63,15 @@ export const clerkConfig = registerAs('clerk', () => ({
   secretKey: process.env.CLERK_SECRET_KEY,
   publishableKey: process.env.CLERK_PUBLISHABLE_KEY,
 }));
+
+export const flutterwaveConfig = registerAs('flutterwave', () => ({
+  secretKey: process.env.FLUTTERWAVE_SECRET_KEY,
+  publicKey: process.env.FLUTTERWAVE_PUBLIC_KEY,
+  // Set this to the exact string configured as "Secret Hash" in the Flutterwave dashboard.
+  webhookSecret: process.env.FLUTTERWAVE_WEBHOOK_SECRET,
+}));
+
+export const geoConfig = registerAs('geo', () => ({
+  // Free at ipinfo.io — 50k req/month. Leave blank to use the unauthenticated endpoint.
+  ipinfoToken: process.env.IPINFO_TOKEN,
+}));

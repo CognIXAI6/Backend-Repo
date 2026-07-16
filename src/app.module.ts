@@ -13,6 +13,8 @@ import {
   cloudinaryConfig,
   stripeConfig,
   clerkConfig,
+  flutterwaveConfig,
+  geoConfig,
 } from './config';
 
 // Common
@@ -39,6 +41,7 @@ import { SettingsModule } from './modules/settings/settings.module';
 import { ResourcesModule } from './modules/resources/resources.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
 import { ErrorLogModule } from './modules/error-log/error-log.module';
+import { AdminModule } from './modules/admin/admin.module';
 
 @Module({
   imports: [
@@ -54,6 +57,8 @@ import { ErrorLogModule } from './modules/error-log/error-log.module';
         cloudinaryConfig,
         stripeConfig,
         clerkConfig,
+        flutterwaveConfig,
+        geoConfig,
       ],
     }),
     LoggerModule,
@@ -73,6 +78,7 @@ import { ErrorLogModule } from './modules/error-log/error-log.module';
     ResourcesModule,
     ConversationsModule,
     ErrorLogModule,
+    AdminModule,
   ],
   providers: [
     {
