@@ -3,6 +3,13 @@ import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { tavily } from '@tavily/core';
 
+export interface DocumentRequest {
+  title: string;
+  topic: string;
+  sections: Array<{ heading: string; content: string }>;
+  researchContext: string;
+}
+
 export interface ClaudeStreamCallbacks {
   onToken: (token: string) => void;
   // Declared as Promise<void> so callers can do async work (DB saves, etc.)
@@ -10,6 +17,8 @@ export interface ClaudeStreamCallbacks {
   // unhandled rejections that leave the session in a broken state.
   onDone: (fullText: string, inputTokens: number, outputTokens: number) => Promise<void> | void;
   onError: (error: Error) => void;
+  /** Called when Claude requests document generation. Must return the download URL. */
+  onDocumentRequest?: (req: DocumentRequest) => Promise<{ downloadUrl: string; docId: string }>;
 }
 
 export interface ConversationTurn {
@@ -32,6 +41,45 @@ const WEB_SEARCH_TOOL: Anthropic.Tool = {
       },
     },
     required: ['query'],
+  },
+};
+
+const GENERATE_DOCUMENT_TOOL: Anthropic.Tool = {
+  name: 'generate_document',
+  description:
+    'Generate a downloadable, professionally formatted Word document (.docx) on a specific topic. ' +
+    'Use this when the user asks to prepare, create, write, draft, or generate a document, report, ' +
+    'proposal, file, or paper. Before calling this tool, use web_search to research the topic so ' +
+    'sections are grounded in current information. Organize the research into clear sections.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {
+      title: {
+        type: 'string',
+        description: 'The full document title.',
+      },
+      topic: {
+        type: 'string',
+        description: 'The main topic — used for additional online research enrichment.',
+      },
+      sections: {
+        type: 'array',
+        description: 'Ordered list of document sections.',
+        items: {
+          type: 'object',
+          properties: {
+            heading: { type: 'string', description: 'Section heading.' },
+            content: {
+              type: 'string',
+              description:
+                'Section body. Use plain paragraphs or bullet points (each starting with "- ").',
+            },
+          },
+          required: ['heading', 'content'],
+        },
+      },
+    },
+    required: ['title', 'topic', 'sections'],
   },
 };
 
@@ -79,7 +127,7 @@ export class ClaudeService implements OnModuleInit {
     history: ConversationTurn[],
     systemPrompt: string,
     callbacks: ClaudeStreamCallbacks,
-    options: { enableWebSearch?: boolean } = {},
+    options: { enableWebSearch?: boolean; enableDocumentGeneration?: boolean; maxTokens?: number } = {},
   ): Promise<void> {
     // Sanitize history: if content is somehow an array (defensive against DB edge cases),
     // flatten to text-only so no tool_use blocks leak into the messages array.
@@ -107,10 +155,18 @@ export class ClaudeService implements OnModuleInit {
       },
     ];
 
-    // Voice mode disables tools — web search adds 500ms–2s and is incompatible
-    // with real-time voice. Text mode keeps tools for current-events queries.
-    const tools =
-      options.enableWebSearch !== false && this.tavilyClient ? [WEB_SEARCH_TOOL] : undefined;
+    // Build the tool list based on what's enabled for this request.
+    // Voice mode disables web search (too slow for real-time). Document generation
+    // is only enabled in text mode and increases max_tokens substantially.
+    const activeTools: Anthropic.Tool[] = [];
+    if (options.enableWebSearch !== false && this.tavilyClient) {
+      activeTools.push(WEB_SEARCH_TOOL);
+    }
+    if (options.enableDocumentGeneration && callbacks.onDocumentRequest) {
+      activeTools.push(GENERATE_DOCUMENT_TOOL);
+    }
+    const tools = activeTools.length > 0 ? activeTools : undefined;
+    const maxTokens = options.maxTokens ?? (options.enableDocumentGeneration ? 4000 : 300);
 
     try {
       // ── Single streaming call — stream from the very start ─────────────────
@@ -128,7 +184,7 @@ export class ClaudeService implements OnModuleInit {
 
       const stream = this.client.messages.stream({
         model: this.model,
-        max_tokens: 300,
+        max_tokens: maxTokens,
         system: systemWithCache,
         tools,
         messages,
@@ -169,19 +225,26 @@ export class ClaudeService implements OnModuleInit {
 
       const finalMessage = await stream.finalMessage();
 
-      // ── Tool use requested — run ALL Tavily searches then stream the follow-up ─
+      // ── Tool use requested — handle web_search and generate_document calls ──
       // Claude can emit multiple tool_use blocks in one response. We collect them
       // all above and must provide a tool_result for EACH one; missing any causes
       // a 400 "tool_use without tool_result" error from the Anthropic API.
       const webSearchCalls = collectedToolCalls.filter(
         (tc) => tc.name === 'web_search' && this.tavilyClient,
       );
+      const docGenCalls = collectedToolCalls.filter(
+        (tc) => tc.name === 'generate_document' && callbacks.onDocumentRequest,
+      );
 
-      if (finalMessage.stop_reason === 'tool_use' && webSearchCalls.length > 0) {
-        this.logger.log(`Web search triggered (${webSearchCalls.length} call(s))`);
+      if (finalMessage.stop_reason === 'tool_use' && (webSearchCalls.length > 0 || docGenCalls.length > 0)) {
+        this.logger.log(
+          `Tool use triggered — web_search: ${webSearchCalls.length}, generate_document: ${docGenCalls.length}`,
+        );
 
-        // Run all searches in parallel to keep latency low
-        const toolResults = await Promise.all(
+        // ── Step 1: Run all web searches in parallel ──────────────────────
+        const searchResultsMap = new Map<string, string>();
+
+        await Promise.all(
           webSearchCalls.map(async (tc) => {
             let query = userMessage;
             try { query = (JSON.parse(tc.inputJson) as { query: string }).query; } catch {}
@@ -198,22 +261,68 @@ export class ClaudeService implements OnModuleInit {
               this.logger.error(`Tavily search error for "${query}":`, err);
             }
 
-            return { type: 'tool_result' as const, tool_use_id: tc.id, content };
+            searchResultsMap.set(tc.id, content);
           }),
         );
+
+        // Combine all search results as research context for document generation
+        const researchContext = [...searchResultsMap.values()].join('\n\n---\n\n');
+
+        // ── Step 2: Handle document generation calls (sequential — uses search results) ──
+        const docResultsMap = new Map<string, string>();
+
+        for (const tc of docGenCalls) {
+          let docInput: { title: string; topic: string; sections: Array<{ heading: string; content: string }> } = {
+            title: 'Document',
+            topic: userMessage,
+            sections: [],
+          };
+          try { docInput = JSON.parse(tc.inputJson); } catch {}
+
+          this.logger.log(`  → generating document: "${docInput.title}"`);
+
+          try {
+            const result = await callbacks.onDocumentRequest!({
+              title: docInput.title,
+              topic: docInput.topic,
+              sections: docInput.sections,
+              researchContext,
+            });
+            docResultsMap.set(
+              tc.id,
+              `Document generated successfully.\nTitle: ${docInput.title}\nDownload URL: ${result.downloadUrl}\nDocument ID: ${result.docId}`,
+            );
+          } catch (err) {
+            this.logger.error(`Document generation error for "${docInput.title}":`, err);
+            docResultsMap.set(tc.id, 'Document generation failed. Please try again.');
+          }
+        }
+
+        // ── Step 3: Build tool_result array (one per tool_use block) ─────
+        const toolResults: Anthropic.ToolResultBlockParam[] = [
+          ...webSearchCalls.map((tc) => ({
+            type: 'tool_result' as const,
+            tool_use_id: tc.id,
+            content: searchResultsMap.get(tc.id) ?? 'Search failed.',
+          })),
+          ...docGenCalls.map((tc) => ({
+            type: 'tool_result' as const,
+            tool_use_id: tc.id,
+            content: docResultsMap.get(tc.id) ?? 'Document generation failed.',
+          })),
+        ];
 
         const messagesWithTool: Anthropic.MessageParam[] = [
           ...messages,
           { role: 'assistant', content: finalMessage.content },
-          // Single user message with ALL tool_results — one per tool_use block
           { role: 'user', content: toolResults },
         ];
 
-        // Stream the final answer — disable tools on follow-up to avoid recursion
+        // ── Step 4: Stream the final answer — no tools on follow-up (avoids recursion) ──
         fullText = '';
         const followUpStream = this.client.messages.stream({
           model: this.model,
-          max_tokens: 300,
+          max_tokens: maxTokens,
           system: systemWithCache,
           messages: messagesWithTool,
         });
@@ -289,7 +398,9 @@ Always use this date as ground truth when asked about the current date, time, da
 - [Read Isaiah 55:8-9](https://www.biblegateway.com/passage/?search=Isaiah+55:8-9&version=NIV)
 
 You have access to a web_search tool. Use it for current events, live data, or anything after your training cutoff.
-When search results are used, include the source as a bullet with a markdown link — no full article content.`;
+When search results are used, include the source as a bullet with a markdown link — no full article content.
+
+You also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. After the document is generated, respond with a brief confirmation and the download link.`;
 
     const memoryBlock = aiMemory
       ? `\n\n## What you remember about this user from past sessions\n${aiMemory}\n\nUse this context naturally — address the user by name if known, and build on what you already know about them.`

@@ -42,6 +42,7 @@ import { ResourcesModule } from './modules/resources/resources.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
 import { ErrorLogModule } from './modules/error-log/error-log.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { DocumentModule } from './modules/documents/document.module';
 
 @Module({
   imports: [
@@ -79,6 +80,7 @@ import { AdminModule } from './modules/admin/admin.module';
     ConversationsModule,
     ErrorLogModule,
     AdminModule,
+    DocumentModule,
   ],
   providers: [
     {

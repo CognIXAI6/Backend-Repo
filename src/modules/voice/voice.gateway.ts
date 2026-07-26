@@ -26,6 +26,7 @@ import { SpeakersService } from '@/modules/speakers/speakers.service';
 import { EmailService } from '@/modules/email/email.service';
 import { FieldsService } from '@/modules/fields/fields.service';
 import { ErrorLogService } from '@/modules/error-log/error-log.service';
+import { DocumentService } from '@/modules/documents/document.service';
 
 // ─── Mode types ───────────────────────────────────────────────────────────────
 
@@ -269,6 +270,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly speakersService: SpeakersService,
+    private readonly documentService: DocumentService,
   ) {}
 
   private emitError(
@@ -1730,6 +1732,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.cachedAiMemory ?? undefined,
       );
 
+      // Detect document generation intent so we can enable the tool and raise max_tokens.
+      const isDocumentRequest =
+        !session.isGuest &&
+        /\b(prepare|create|generate|write|make|draft|put together)\b.{0,30}\b(document|report|file|proposal|paper|essay|article|doc|write-up)\b/i.test(userMessage);
+
       let firstToken = true;
 
       await this.claudeService.streamResponse(
@@ -1790,8 +1797,37 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             if (aiStarted) client.emit('ai:done', { response: '', latencyMs: Date.now() - aiStartTime });
             session.isProcessingAI = false;
           },
+
+          onDocumentRequest: isDocumentRequest
+            ? async (req) => {
+                this.logger.log(`[${client.id}] Document generation requested: "${req.title}"`);
+                client.emit('document:generating', { title: req.title, topic: req.topic });
+
+                const result = await this.documentService.generateAndUpload({
+                  userId: session.userId,
+                  conversationId: session.conversationId,
+                  title: req.title,
+                  topic: req.topic,
+                  sections: req.sections,
+                  researchContext: req.researchContext,
+                });
+
+                client.emit('document:ready', {
+                  docId: result.docId,
+                  title: req.title,
+                  topic: req.topic,
+                  downloadUrl: result.downloadUrl,
+                });
+
+                this.logger.log(`[${client.id}] Document ready: ${result.downloadUrl}`);
+                return result;
+              }
+            : undefined,
         },
-        { enableWebSearch: inputType === 'text' },
+        {
+          enableWebSearch: inputType === 'text',
+          enableDocumentGeneration: isDocumentRequest,
+        },
       );
     } catch (err) {
       this.logger.error('processPrompt error:', err);

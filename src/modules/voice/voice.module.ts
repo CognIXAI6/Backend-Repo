@@ -17,6 +17,7 @@ import { UsersModule } from '@/modules/users/users.module';
 import { FieldsModule } from '@/modules/fields/fields.module';
 import { EmailModule } from '@/modules/email/email.module';
 import { SpeakersModule } from '@/modules/speakers/speakers.module';
+import { DocumentModule } from '@/modules/documents/document.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { SpeakersModule } from '@/modules/speakers/speakers.module';
     FieldsModule,
     EmailModule,
     SpeakersModule,
+    DocumentModule,
     JwtModule.registerAsync({
       useFactory: (configService: ConfigService) => ({
         secret: configService.get('jwt.secret'),
