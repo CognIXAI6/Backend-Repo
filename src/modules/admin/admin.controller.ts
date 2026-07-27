@@ -51,6 +51,13 @@ export class AdminController {
     return this.adminService.inviteAdmin(email, name, role, adminFromReq(req).id);
   }
 
+  @Post('auth/resend-invitations')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.OK)
+  resendPendingInvitations(@Req() req: Request) {
+    return this.adminService.resendPendingInvitations(adminFromReq(req).id);
+  }
+
   @Post('auth/accept-invite')
   @HttpCode(HttpStatus.CREATED)
   acceptInvite(@Body('token') token: string, @Body('password') password: string) {

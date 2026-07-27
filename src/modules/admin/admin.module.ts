@@ -4,9 +4,10 @@ import { AdminService } from './admin.service';
 import { AdminController } from './admin.controller';
 import { AdminGuard } from './admin.guard';
 import { FxService } from '../payment/fx.service';
+import { EmailModule } from '../email/email.module';
 
 @Module({
-  imports: [JwtModule.register({})],
+  imports: [JwtModule.register({}), EmailModule],
   controllers: [AdminController],
   providers: [AdminService, AdminGuard, FxService],
 })

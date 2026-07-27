@@ -14,6 +14,7 @@ import * as bcrypt from 'bcryptjs';
 import { randomBytes } from 'crypto';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { FxService } from '../payment/fx.service';
+import { EmailService } from '../email/email.service';
 
 export type AdminRole = 'super_admin' | 'admin';
 export type Period = '7d' | '30d' | '90d' | 'all';
@@ -34,6 +35,7 @@ export class AdminService {
     private jwtService: JwtService,
     private configService: ConfigService,
     private fxService: FxService,
+    private emailService: EmailService,
     @Inject(KNEX_CONNECTION) private knex: Knex,
   ) {}
 
@@ -88,8 +90,84 @@ export class AdminService {
       expires_at: expiresAt,
     });
 
+    const inviter = await this.knex('admins').where('id', invitedById).first();
+    const inviterName = inviter?.name ?? 'A CognIX administrator';
+
+    const adminPortalUrl = this.configService.get<string>('app.adminPortalUrl')
+      ?? `${this.configService.get<string>('app.frontendUrl')}/admin`;
+    const acceptUrl = `${adminPortalUrl}/accept-invite?token=${token}`;
+
+    this.emailService
+      .sendAdminInvitationEmail({ to: email, name, invitedByName: inviterName, role, token, acceptUrl, expiresAt })
+      .catch((err) => this.logger.error(`Failed to send invitation email to ${email}:`, err));
+
     this.logger.log(`Admin invitation created for ${email} by admin ${invitedById}`);
     return { message: `Invitation sent to ${email}`, token, expiresAt };
+  }
+
+  async resendPendingInvitations(requesterId: string) {
+    const pending = await this.knex('admin_invitations')
+      .whereNull('accepted_at')
+      .select('*');
+
+    if (pending.length === 0) {
+      return { sent: 0, refreshed: 0, failed: 0, skipped: 0, details: [] };
+    }
+
+    const inviter = await this.knex('admins').where('id', requesterId).first();
+    const inviterName = inviter?.name ?? 'A CognIX administrator';
+
+    const adminPortalUrl =
+      this.configService.get<string>('app.adminPortalUrl') ??
+      `${this.configService.get<string>('app.frontendUrl')}/admin`;
+
+    const now = new Date();
+    let sent = 0;
+    let refreshed = 0;
+    let failed = 0;
+    const details: Array<{ email: string; status: string; reason?: string }> = [];
+
+    for (const inv of pending) {
+      try {
+        let token = inv.token;
+        let expiresAt: Date = inv.expires_at;
+
+        // If the invitation has expired, issue a fresh token and extend the expiry.
+        if (new Date(inv.expires_at) < now) {
+          token = randomBytes(32).toString('hex');
+          expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+          await this.knex('admin_invitations')
+            .where('id', inv.id)
+            .update({ token, expires_at: expiresAt });
+          refreshed++;
+        }
+
+        const acceptUrl = `${adminPortalUrl}/accept-invite?token=${token}`;
+
+        await this.emailService.sendAdminInvitationEmail({
+          to: inv.email,
+          name: inv.name,
+          invitedByName: inviterName,
+          role: inv.role,
+          token,
+          acceptUrl,
+          expiresAt,
+        });
+
+        sent++;
+        details.push({ email: inv.email, status: 'sent' });
+      } catch (err) {
+        failed++;
+        details.push({ email: inv.email, status: 'failed', reason: (err as Error).message });
+        this.logger.error(`Failed to resend invitation to ${inv.email}:`, err);
+      }
+    }
+
+    this.logger.log(
+      `Resend pending invitations: total=${pending.length}, sent=${sent}, refreshed=${refreshed}, failed=${failed}`,
+    );
+
+    return { sent, refreshed, failed, skipped: 0, total: pending.length, details };
   }
 
   async acceptInvite(token: string, password: string) {
