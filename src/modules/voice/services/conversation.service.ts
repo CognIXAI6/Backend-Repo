@@ -50,6 +50,15 @@ export interface Conversation {
   deleted_at: Date | null;
 }
 
+export interface DocumentMeta {
+  id: string;
+  title: string;
+  topic: string | null;
+  download_url: string;
+  section_count: number;
+  created_at: Date;
+}
+
 export interface ConversationMessage {
   id: string;
   conversation_id: string;
@@ -61,6 +70,8 @@ export interface ConversationMessage {
   speaker_label: string | null;
   tokens_used: number | null;
   latency_ms: number | null;
+  document_id: string | null;
+  document: DocumentMeta | null;
   created_at: Date;
 }
 
@@ -74,6 +85,7 @@ export interface SaveMessageDto {
   speakerLabel?: string;
   tokensUsed?: number;
   latencyMs?: number;
+  documentId?: string;
 }
 
 // ─── Service ──────────────────────────────────────────────────────────────────
@@ -122,6 +134,7 @@ export class ConversationService {
         speaker_label: dto.speakerLabel ?? null,
         tokens_used: dto.tokensUsed ?? null,
         latency_ms: dto.latencyMs ?? null,
+        document_id: dto.documentId ?? null,
       })
       .returning('*');
 
@@ -257,10 +270,7 @@ export class ConversationService {
     if (!conversation) throw new NotFoundException('Conversation not found');
 
     const [messages, transcriptSegments] = await Promise.all([
-      this.knex('conversation_messages')
-        .where('conversation_id', conversationId)
-        .orderBy('created_at', 'asc')
-        .select('*'),
+      this.fetchMessagesWithDocuments(conversationId),
       this.knex('conversation_transcript_segments')
         .where('conversation_id', conversationId)
         .orderByRaw('created_at ASC, COALESCE(start_ms, 999999999) ASC')
@@ -274,11 +284,53 @@ export class ConversationService {
 
   async getConversationMessages(conversationId: string, userId: string): Promise<ConversationMessage[]> {
     await this.assertOwnership(conversationId, userId);
+    return this.fetchMessagesWithDocuments(conversationId);
+  }
 
-    return this.knex('conversation_messages')
-      .where('conversation_id', conversationId)
-      .orderBy('created_at', 'asc')
-      .select('*');
+  // ── Shared messages query with document join ─────────────────────────────────
+
+  private async fetchMessagesWithDocuments(conversationId: string): Promise<ConversationMessage[]> {
+    const rows = await this.knex('conversation_messages as m')
+      .leftJoin('generated_documents as d', 'm.document_id', 'd.id')
+      .where('m.conversation_id', conversationId)
+      .orderBy('m.created_at', 'asc')
+      .select(
+        'm.id',
+        'm.conversation_id',
+        'm.role',
+        'm.content',
+        'm.transcript',
+        'm.audio_url',
+        'm.audio_duration_ms',
+        'm.speaker_label',
+        'm.tokens_used',
+        'm.latency_ms',
+        'm.document_id',
+        'm.created_at',
+        'd.id as doc_id',
+        'd.title as doc_title',
+        'd.topic as doc_topic',
+        'd.download_url as doc_download_url',
+        'd.section_count as doc_section_count',
+        'd.created_at as doc_created_at',
+      );
+
+    return rows.map((row) => {
+      const { doc_id, doc_title, doc_topic, doc_download_url, doc_section_count, doc_created_at, ...msg } = row as Record<string, unknown>;
+
+      const document: DocumentMeta | null = doc_id
+        ? {
+            id: doc_id as string,
+            title: doc_title as string,
+            topic: doc_topic as string | null,
+            download_url: doc_download_url as string,
+            section_count: doc_section_count as number,
+            created_at: doc_created_at as Date,
+          }
+        : null;
+
+      return { ...(msg as Omit<ConversationMessage, 'document'>), document };
+    });
   }
 
   // ── Get history array for Claude context ────────────────────────────────────

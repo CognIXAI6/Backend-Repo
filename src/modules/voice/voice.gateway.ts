@@ -1737,6 +1737,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         !session.isGuest &&
         /\b(prepare|create|generate|write|make|draft|put together)\b.{0,30}\b(document|report|file|proposal|paper|essay|article|doc|write-up)\b/i.test(userMessage);
 
+      // Captured inside onDocumentRequest, read inside onDone to link the
+      // assistant message permanently to the generated document record.
+      let generatedDocId: string | null = null;
+
       let firstToken = true;
 
       await this.claudeService.streamResponse(
@@ -1759,6 +1763,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               content: fullText,
               tokensUsed: inputTokens + outputTokens,
               latencyMs: Date.now() - aiStartTime,
+              // Link this message to the generated document so it persists in history.
+              documentId: generatedDocId ?? undefined,
             });
 
             this.claudeService
@@ -1811,6 +1817,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                   sections: req.sections,
                   researchContext: req.researchContext,
                 });
+
+                // Capture docId — onDone picks it up to link the assistant message.
+                generatedDocId = result.docId;
 
                 client.emit('document:ready', {
                   docId: result.docId,
