@@ -140,6 +140,14 @@ interface ActiveSession {
   // ── Real-time speaker identification ─────────────────────────────────────
   identifiedDeepgramSpeakers: Map<number, string>;
   speakerIdentificationTriggered: Set<number>;
+  /**
+   * Tracks speech-seconds at the time of each identification attempt.
+   * When voice ID returns no match, the system waits until the speaker
+   * accumulates RETRY_IDENTIFICATION_EXTRA_S more seconds, then retries.
+   */
+  speakerIdentificationAtSeconds: Map<number, number>;
+  /** Deepgram speaker IDs whose last identification attempt returned no match. */
+  speakerIdentificationFailed: Set<number>;
   currentDominantSpeaker: number;
   speakerAudioBuffers: Map<number, Buffer[]>;
   speakerAudioBytes: Map<number, number>;
@@ -189,6 +197,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly SINGLE_SPEAKER_PROFILE_THRESHOLD_S = 10;
   /** Per-speaker speech seconds before triggering real-time 1:N identification. */
   private readonly SPEAKER_IDENTIFICATION_THRESHOLD_S = 3;
+  /**
+   * Additional speech seconds required after a failed identification attempt
+   * before the system retries. Prevents thrashing on low-audio windows.
+   */
+  private readonly RETRY_IDENTIFICATION_EXTRA_S = 6;
   /** Milliseconds of inactivity before a session is auto-closed (30 min). */
   private readonly SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -533,6 +546,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         otherSpeakerName: payload.secondSpeakerName?.trim() || null,
         identifiedDeepgramSpeakers: new Map(),
         speakerIdentificationTriggered: new Set(),
+        speakerIdentificationAtSeconds: new Map(),
+        speakerIdentificationFailed: new Set(),
         currentDominantSpeaker: 0,
         speakerAudioBuffers: new Map(),
         speakerAudioBytes: new Map(),
@@ -596,14 +611,23 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           session.pendingMultiSpeakerTurns.push(...turns);
           session.accumulatedTranscript = turns.map((t) => t.text).join(' ');
 
-          // Trigger per-speaker identification
+          // Trigger per-speaker identification (first attempt + retry on prior failure)
           if (!session.isGuest && this.voiceVerificationService.isEnabled) {
             for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
-              if (
-                seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S &&
-                !session.speakerIdentificationTriggered.has(spkId)
-              ) {
+              const alreadyTriggered = session.speakerIdentificationTriggered.has(spkId);
+              const prevFailed = session.speakerIdentificationFailed.has(spkId);
+              const attemptedAtSeconds = session.speakerIdentificationAtSeconds.get(spkId) ?? 0;
+
+              const isFirstAttempt = !alreadyTriggered && seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S;
+              // Retry after a failed attempt once they've spoken RETRY_IDENTIFICATION_EXTRA_S
+              // more seconds since the last attempt — avoids thrashing on poor-audio windows.
+              const isRetry = alreadyTriggered && prevFailed &&
+                seconds >= attemptedAtSeconds + this.RETRY_IDENTIFICATION_EXTRA_S;
+
+              if (isFirstAttempt || isRetry) {
                 session.speakerIdentificationTriggered.add(spkId);
+                session.speakerIdentificationFailed.delete(spkId);
+                session.speakerIdentificationAtSeconds.set(spkId, seconds);
                 this.identifyMultiSpeaker(client, session, spkId).catch((err) =>
                   this.logger.error(`[${client.id}] identifyMultiSpeaker error (speaker ${spkId}):`, err),
                 );
@@ -655,11 +679,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           if (!session.calibrationPhase && !session.isGuest && this.voiceVerificationService.isEnabled) {
             for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
-              if (
-                seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S &&
-                !session.speakerIdentificationTriggered.has(spkId)
-              ) {
+              const alreadyTriggered = session.speakerIdentificationTriggered.has(spkId);
+              const prevFailed = session.speakerIdentificationFailed.has(spkId);
+              const attemptedAtSeconds = session.speakerIdentificationAtSeconds.get(spkId) ?? 0;
+
+              const isFirstAttempt = !alreadyTriggered && seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S;
+              const isRetry = alreadyTriggered && prevFailed &&
+                seconds >= attemptedAtSeconds + this.RETRY_IDENTIFICATION_EXTRA_S;
+
+              if (isFirstAttempt || isRetry) {
                 session.speakerIdentificationTriggered.add(spkId);
+                session.speakerIdentificationFailed.delete(spkId);
+                session.speakerIdentificationAtSeconds.set(spkId, seconds);
                 this.identifyDualSpeaker(client, session, spkId).catch((err) =>
                   this.logger.error(`[${client.id}] identifyDualSpeaker error (speaker ${spkId}):`, err),
                 );
@@ -2052,6 +2083,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     } else {
       resolvedName = fallbackName;
       method = 'no_match';
+      // Mark as failed so the retry loop can re-attempt when more audio accumulates.
+      session.speakerIdentificationFailed.add(deepgramSpeakerId);
     }
 
     session.identifiedDeepgramSpeakers.set(deepgramSpeakerId, resolvedName);
@@ -2221,41 +2254,79 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // ── Gap 4: always resolve to local speakers.id, never the external voice ID ──
     let resolvedName: string;
     let resolvedSpeakerId: string | null = null;
+    let resolvedVoiceSpeakerId: string | null = null;
     let method: 'voice_id' | 'diarization' = 'diarization';
 
     if (result.identified && result.speakerId) {
-      // 1. Check session roster (voice_speaker_id → local speaker ID)
-      const rosterEntry = session.speakerRosterByVoiceId.get(result.speakerId);
-      // 2. Fall back to account-wide map (also maps voice_speaker_id → local speaker ID)
-      const accountEntry = accountSpeakerByVoiceId.get(result.speakerId);
+      resolvedVoiceSpeakerId = result.speakerId;
 
-      if (rosterEntry) {
-        resolvedName = rosterEntry.displayName;
-        resolvedSpeakerId = rosterEntry.speakerId;          // local speakers.id
-      } else if (accountEntry) {
-        resolvedName = accountEntry.name;
-        resolvedSpeakerId = accountEntry.id;                // local speakers.id
+      // ── Consolidation: check if this voiceSpeakerId is already resolved under
+      // a different Deepgram speaker ID. Deepgram re-numbers speakers in long sessions,
+      // so the same person may appear as Speaker 0 early on and Speaker 5 later.
+      // When that happens, reuse the existing resolution instead of creating a
+      // duplicate "Guest N" entry for the same person.
+      const priorEntry = [...session.resolvedSpeakers.entries()].find(
+        ([otherId, r]) => otherId !== deepgramSpeakerId && r.voiceSpeakerId === result.speakerId,
+      );
+
+      if (priorEntry) {
+        const [priorDgramId, priorResolved] = priorEntry;
+        resolvedName = priorResolved.label;
+        resolvedSpeakerId = priorResolved.speakerId;
+        method = 'voice_id';
+        this.logger.log(
+          `[${client.id}] Speaker ${deepgramSpeakerId} consolidated with prior speaker ${priorDgramId} ("${resolvedName}") — same voice print`,
+        );
       } else {
-        // External name only, no local record — do not store a FK
-        resolvedName = result.speakerName ?? anonymousLabel;
-        resolvedSpeakerId = null;
+        // 1. Check session roster (voice_speaker_id → local speaker ID)
+        const rosterEntry = session.speakerRosterByVoiceId.get(result.speakerId);
+        // 2. Fall back to account-wide map (also maps voice_speaker_id → local speaker ID)
+        const accountEntry = accountSpeakerByVoiceId.get(result.speakerId);
+
+        if (rosterEntry) {
+          resolvedName = rosterEntry.displayName;
+          resolvedSpeakerId = rosterEntry.speakerId;          // local speakers.id
+        } else if (accountEntry) {
+          resolvedName = accountEntry.name;
+          resolvedSpeakerId = accountEntry.id;                // local speakers.id
+        } else {
+          // External name only, no local record — do not store a FK
+          resolvedName = result.speakerName ?? anonymousLabel;
+          resolvedSpeakerId = null;
+        }
+        method = 'voice_id';
       }
-      method = 'voice_id';
     } else {
+      // No match — mark as failed so the retry loop can re-attempt later
       resolvedName = anonymousLabel;
+      session.speakerIdentificationFailed.add(deepgramSpeakerId);
+      this.logger.log(
+        `[${client.id}] Speaker ${deepgramSpeakerId} identification returned no match ` +
+        `(score=${result.similarityScore.toFixed(3)}) — will retry`,
+      );
     }
 
     const resolved: ResolvedSpeaker = {
       speakerId: resolvedSpeakerId,
       label: resolvedName,
-      voiceSpeakerId: result.identified ? result.speakerId : null,
+      voiceSpeakerId: resolvedVoiceSpeakerId,
       method,
       confidence: result.similarityScore,
     };
     session.resolvedSpeakers.set(deepgramSpeakerId, resolved);
 
-    // ── Gap 6: retroactively update segment rows saved before identification ──
     if (method === 'voice_id') {
+      // ── Update in-memory turn history so the AI context uses the correct name
+      // immediately — without waiting for the next transcript event to rebuild labels.
+      const updateTurn = (t: MultiSpeakerTurn): MultiSpeakerTurn =>
+        t.deepgramSpeakerId === deepgramSpeakerId
+          ? { ...t, speakerLabel: resolvedName, speakerId: resolvedSpeakerId, identificationMethod: 'voice_id' as const }
+          : t;
+
+      session.multiSpeakerHistory = session.multiSpeakerHistory.map(updateTurn);
+      session.pendingMultiSpeakerTurns = session.pendingMultiSpeakerTurns.map(updateTurn);
+
+      // ── Gap 6: retroactively update segment rows saved before identification ──
       this.conversationService.updateTranscriptSpeakerByDeepgramId({
         conversationId: session.conversationId,
         deepgramSpeakerId,
