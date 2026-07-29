@@ -482,12 +482,25 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       if (!conversationId) {
         const dbMode: ConversationMode = mode === 'multiple_speaker' ? 'multiple_speaker' : (mode as ConversationMode);
-        const conv = await this.conversationService.createConversation(
-          userId,
-          dbMode,
-          resolvedFieldId,
-        );
-        conversationId = conv.id;
+
+        // Reuse the most recent empty conversation for this user+mode rather than
+        // creating a new one — prevents accumulation of duplicate "Untitled conversation"
+        // rows when the user starts and stops recording without sending any messages.
+        const emptyConv = !isGuest
+          ? await this.conversationService.findRecentEmptyConversation(userId, dbMode)
+          : null;
+
+        if (emptyConv) {
+          conversationId = emptyConv.id;
+          this.logger.log(`session:start: reusing empty conversation ${conversationId} for user ${userId}`);
+        } else {
+          const conv = await this.conversationService.createConversation(
+            userId,
+            dbMode,
+            resolvedFieldId,
+          );
+          conversationId = conv.id;
+        }
       }
 
       // ── Resolve speaker roster (multi-speaker) ────────────────────────────
@@ -1505,9 +1518,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         `Latest exchange:\n${latestExchange}\n\n` +
         `Give the owner a brief, useful insight.${uncertainty}`;
 
+      const msDocContext = await this.conversationService.getConversationDocumentContext(session.conversationId).catch(() => null);
       const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
+        msDocContext,
       );
 
       // Gap 8: persist the user message and segments BEFORE starting the AI stream
@@ -1558,7 +1573,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           this.claudeService
             .generateConversationTitle(rawTranscript, fullText, session.fieldName)
-            .then((title) => this.conversationService.setTitle(session.conversationId, title))
+            .then(async (title) => {
+              const wasSet = await this.conversationService.setTitle(session.conversationId, title);
+              if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
+            })
             .catch((err) => this.logger.error('Multi-speaker title generation failed:', err));
 
           client.emit('ai:done', {
@@ -1612,9 +1630,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         ? `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`
         : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${otherPersonText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
 
+      const dsDocContext = await this.conversationService.getConversationDocumentContext(session.conversationId).catch(() => null);
       const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
+        dsDocContext,
       );
 
       client.emit('transcript:confirmed', {
@@ -1665,7 +1685,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           this.claudeService
             .generateConversationTitle(otherPersonText, fullText, session.fieldName)
-            .then((title) => this.conversationService.setTitle(session.conversationId, title))
+            .then(async (title) => {
+              const wasSet = await this.conversationService.setTitle(session.conversationId, title);
+              if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
+            })
             .catch((err) => this.logger.error('Dual-speaker title generation failed:', err));
 
           client.emit('ai:done', {
@@ -1760,9 +1783,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       client.emit('ai:start');
       aiStarted = true;
 
+      // Load any documents the user has attached to this conversation so they
+      // are injected into the system prompt and the AI can answer questions about them.
+      const documentContext = await this.conversationService
+        .getConversationDocumentContext(session.conversationId)
+        .catch((err) => {
+          this.logger.warn(`Failed to load conversation documents: ${err.message}`);
+          return null;
+        });
+
       const systemPrompt = this.claudeService.buildSystemPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
+        documentContext,
       );
 
       // Detect document generation intent so we can enable the tool and raise max_tokens.
@@ -1794,10 +1827,26 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           },
 
           onDone: async (fullText: string, inputTokens: number, outputTokens: number) => {
+            // Safety net: if Claude returned nothing (rare but possible with very garbled
+            // or ambiguous input), synthesise a clarification response so the user is
+            // never left staring at a blank screen. Emit it as a token first so the
+            // frontend renders it identically to a streamed response.
+            const UNCLEAR_FALLBACK =
+              `- I didn't quite catch that — could you rephrase?\n` +
+              `- Try asking something specific, like: "Explain [topic] step by step"\n` +
+              `- Or: "What are the key trends in ${session.fieldName ?? 'my industry'}?"`;
+
+            const responseText = fullText.trim() ? fullText : UNCLEAR_FALLBACK;
+
+            if (!fullText.trim()) {
+              this.logger.warn(`[${client.id}] Empty AI response — sending clarification fallback`);
+              client.emit('ai:token', { token: UNCLEAR_FALLBACK });
+            }
+
             await this.conversationService.saveMessage({
               conversationId: session.conversationId,
               role: 'assistant',
-              content: fullText,
+              content: responseText,
               tokensUsed: inputTokens + outputTokens,
               latencyMs: Date.now() - aiStartTime,
               // Link this message to the generated document so it persists in history.
@@ -1805,8 +1854,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             });
 
             this.claudeService
-              .generateConversationTitle(userMessage, fullText, session.fieldName)
-              .then((title) => this.conversationService.setTitle(session.conversationId, title))
+              .generateConversationTitle(userMessage, responseText, session.fieldName)
+              .then(async (title) => {
+                const wasSet = await this.conversationService.setTitle(session.conversationId, title);
+                if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
+              })
               .catch((err) => this.logger.error('Title generation failed:', err));
 
             if (session.isGuest && session.guestSessionId) {
@@ -1827,7 +1879,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             }
 
             client.emit('ai:done', {
-              response: fullText,
+              response: responseText,
               tokensUsed: inputTokens + outputTokens,
               latencyMs: Date.now() - aiStartTime,
             });

@@ -367,7 +367,7 @@ export class ClaudeService implements OnModuleInit {
   /**
    * Builds a system prompt based on user's professional field.
    */
-  buildSystemPrompt(fieldName?: string, aiMemory?: string): string {
+  buildSystemPrompt(fieldName?: string, aiMemory?: string, documentContext?: string | null): string {
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
@@ -402,10 +402,25 @@ Always use this date as ground truth when asked about the current date, time, da
 - No paragraphs — bullets only
 - If referencing a verse, article, or document: one bullet with a markdown link [Title](URL), no quoting
 
+## HANDLING UNCLEAR OR AMBIGUOUS INPUT — MANDATORY
+If you cannot understand what the user asked, you MUST still respond. NEVER return an empty or silent response.
+Instead, respond with 2-3 bullets following this exact pattern:
+- Acknowledge you didn't catch it clearly (one sentence, friendly tone)
+- Offer 1-2 specific rephrasing suggestions based on their field or the words you did catch
+
+Example for an unclear voice input:
+- I didn't quite catch that — could you rephrase?
+- Did you mean: "Summarise the key risks in my latest project"?
+- Or try: "What are the latest trends in [your field]?"
+
+This rule applies to: garbled audio transcriptions, single words with no context, nonsense strings, ambiguous fragments, or anything you genuinely cannot interpret.
+NEVER return silence. A short clarification is always better than no response.
+
 ## WRONG (never do this):
 "You're touching on one of the most profound truths in theology — the incomprehensibility of God. No matter how much we study..."
 "I don't have a persistent memory feature — I can't save info between sessions."
 "Consider tools like ChatGPT Memory or a CRM/notes system."
+(returning nothing when the input is unclear)
 
 ## RIGHT (always do this):
 - God's knowledge is infinite; human understanding has limits — Isaiah 55:8-9
@@ -437,7 +452,11 @@ When in doubt — answer. A Business professional asking about engineering, cons
 ${this.getFieldLinkGuide(fieldName)}`
       : '';
 
-    return basePrompt + fieldContext + memoryBlock;
+    const documentBlock = documentContext
+      ? `\n\n## DOCUMENTS ATTACHED TO THIS CONVERSATION\nThe user has uploaded the following document(s) into this conversation. Read them carefully. When the user asks any question about "the document", "the file", "the CV", "the report", etc., answer using the content below. Quote or reference specific sections when relevant.\n\n${documentContext}`
+      : '';
+
+    return basePrompt + fieldContext + memoryBlock + documentBlock;
   }
 
   private getFieldBreadthNote(fieldName: string): string {
@@ -523,7 +542,7 @@ so the user can read the full content directly. Keep your response to a short in
     return keywords.some((kw) => field.includes(kw));
   }
 
-  buildDualSpeakerPrompt(fieldName?: string, aiMemory?: string): string {
+  buildDualSpeakerPrompt(fieldName?: string, aiMemory?: string, documentContext?: string | null): string {
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
@@ -538,6 +557,10 @@ so the user can read the full content directly. Keep your response to a short in
 
     const fieldBlock = fieldName
       ? `\nThe owner is a professional in the field of: ${fieldName}. Tailor all insights to that context.`
+      : '';
+
+    const documentBlock = documentContext
+      ? `\n\n## DOCUMENTS ATTACHED TO THIS CONVERSATION\n${documentContext}`
       : '';
 
     return `You are CognIX AI, a real-time conversation assistant helping a professional during a live conversation.
@@ -569,7 +592,7 @@ Your job: give the OWNER a brief, actionable insight based on what the other per
 - They're questioning the tension between faith and doubt — a normal spiritual phase
 - Validate their honesty; doubt can deepen genuine faith
 - [Read Mark 9:24 — "I believe; help my unbelief"](https://www.biblegateway.com/passage/?search=Mark+9:24&version=NIV)
-${fieldBlock}${memoryBlock}`;
+${fieldBlock}${memoryBlock}${documentBlock}`;
   }
 
   /**

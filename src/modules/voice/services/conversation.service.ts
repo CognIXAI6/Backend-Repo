@@ -220,13 +220,35 @@ export class ConversationService {
 
   /**
    * Sets an AI-generated title on the conversation.
-   * Called once after the first AI response — fire-and-forget from the gateway.
+   * Only updates when the title is still NULL — never overwrites a user-set or
+   * previously generated title. Returns whether the update actually happened
+   * so the caller can emit a real-time event to the client.
    */
-  async setTitle(conversationId: string, title: string): Promise<void> {
-    await this.knex('conversations')
+  async setTitle(conversationId: string, title: string): Promise<boolean> {
+    const updated = await this.knex('conversations')
       .where('id', conversationId)
       .whereNull('title')
       .update({ title, updated_at: new Date() });
+    // Knex update() returns the number of rows affected.
+    return updated > 0;
+  }
+
+  /**
+   * Returns the most recent conversation for this user+mode that has zero messages.
+   * Used by session:start to reuse an existing empty conversation instead of
+   * creating a duplicate "Untitled conversation" every time the user presses Record.
+   */
+  async findRecentEmptyConversation(
+    userId: string,
+    mode: ConversationMode,
+  ): Promise<Conversation | null> {
+    return (
+      (await this.knex('conversations')
+        .where({ user_id: userId, mode, total_messages: 0 })
+        .whereNull('deleted_at')
+        .orderBy('created_at', 'desc')
+        .first()) ?? null
+    );
   }
 
   // ── Get paginated history list ──────────────────────────────────────────────
@@ -238,14 +260,18 @@ export class ConversationService {
   ): Promise<{ data: Conversation[]; total: number; page: number; lastPage: number }> {
     const offset = (page - 1) * limit;
 
-    const [{ count }] = await this.knex('conversations')
-      .where('user_id', userId)
-      .whereNull('deleted_at')
-      .count('id as count');
+    // Exclude empty conversations (total_messages = 0) — they are either brand-new
+    // sessions that haven't been used yet, or leftover duplicates. They have nothing
+    // meaningful to show in the history sidebar.
+    const baseQuery = () =>
+      this.knex('conversations')
+        .where('user_id', userId)
+        .whereNull('deleted_at')
+        .where('total_messages', '>', 0);
 
-    const data = await this.knex('conversations')
-      .where('user_id', userId)
-      .whereNull('deleted_at')
+    const [{ count }] = await baseQuery().count('id as count');
+
+    const data = await baseQuery()
       .orderBy('last_activity_at', 'desc')
       .limit(limit)
       .offset(offset)
@@ -254,6 +280,17 @@ export class ConversationService {
     const total = Number(count);
 
     return { data, total, page, lastPage: Math.ceil(total / limit) };
+  }
+
+  /**
+   * Hard-deletes all empty (no messages) conversations for a user.
+   * Useful as a one-time cleanup for users who accumulated duplicates.
+   */
+  async purgeEmptyConversations(userId: string): Promise<number> {
+    return this.knex('conversations')
+      .where({ user_id: userId, total_messages: 0 })
+      .whereNull('deleted_at')
+      .delete();
   }
 
   // ── Get single conversation ─────────────────────────────────────────────────
@@ -515,5 +552,58 @@ export class ConversationService {
       .where('conversation_id', conversationId)
       .orderByRaw('created_at ASC, COALESCE(start_ms, 999999999) ASC')
       .select('*');
+  }
+
+  // ── Conversation documents (in-context file attachments) ───────────────────
+
+  async saveConversationDocument(data: {
+    conversationId: string;
+    userId: string;
+    filename: string;
+    mimeType: string;
+    fileUrl: string | null;
+    contentMarkdown: string;
+  }): Promise<{ id: string; filename: string; charCount: number }> {
+    const charCount = data.contentMarkdown.length;
+    const [doc] = await this.knex('conversation_documents')
+      .insert({
+        conversation_id: data.conversationId,
+        user_id: data.userId,
+        filename: data.filename,
+        mime_type: data.mimeType,
+        file_url: data.fileUrl ?? null,
+        content_markdown: data.contentMarkdown,
+        char_count: charCount,
+      })
+      .returning(['id', 'filename', 'char_count']);
+
+    return { id: doc.id, filename: doc.filename, charCount: doc.char_count };
+  }
+
+  /**
+   * Returns all documents attached to a conversation, formatted as a single
+   * Markdown block ready to inject into the AI system prompt.
+   * Returns null when no documents are attached.
+   */
+  async getConversationDocumentContext(conversationId: string): Promise<string | null> {
+    const docs = await this.knex('conversation_documents')
+      .where('conversation_id', conversationId)
+      .orderBy('created_at', 'asc')
+      .select('filename', 'content_markdown');
+
+    if (!docs.length) return null;
+
+    return docs
+      .map((d: { filename: string; content_markdown: string }) =>
+        `=== ATTACHED DOCUMENT: ${d.filename} ===\n\n${d.content_markdown}\n\n=== END OF DOCUMENT ===`,
+      )
+      .join('\n\n');
+  }
+
+  async listConversationDocuments(conversationId: string): Promise<{ id: string; filename: string; mimeType: string; charCount: number; createdAt: Date }[]> {
+    return this.knex('conversation_documents')
+      .where('conversation_id', conversationId)
+      .orderBy('created_at', 'asc')
+      .select('id', 'filename', 'mime_type as mimeType', 'char_count as charCount', 'created_at as createdAt');
   }
 }
