@@ -15,6 +15,7 @@ import {
   clerkConfig,
   flutterwaveConfig,
   geoConfig,
+  notificationsConfig,
 } from './config';
 
 // Common
@@ -43,6 +44,7 @@ import { ConversationsModule } from './modules/conversations/conversations.modul
 import { ErrorLogModule } from './modules/error-log/error-log.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { DocumentModule } from './modules/documents/document.module';
+import { PushNotificationModule } from './modules/notifications/push-notification.module';
 
 @Module({
   imports: [
@@ -60,6 +62,7 @@ import { DocumentModule } from './modules/documents/document.module';
         clerkConfig,
         flutterwaveConfig,
         geoConfig,
+        notificationsConfig,
       ],
     }),
     LoggerModule,
@@ -81,6 +84,7 @@ import { DocumentModule } from './modules/documents/document.module';
     ErrorLogModule,
     AdminModule,
     DocumentModule,
+    PushNotificationModule,
   ],
   providers: [
     {

@@ -1,6 +1,9 @@
 import {
   Controller,
+  Delete,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   Query,
   UseGuards,
@@ -20,12 +23,14 @@ export class DocumentController {
     @Req() req: Request,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('q') q?: string,
   ) {
     const userId = (req.user as { userId: string }).userId;
     return this.documentService.getUserDocuments(
       userId,
       page ? parseInt(page, 10) : 1,
       limit ? Math.min(parseInt(limit, 10), 50) : 20,
+      q,
     );
   }
 
@@ -33,5 +38,12 @@ export class DocumentController {
   async getDocument(@Req() req: Request, @Param('id') id: string) {
     const userId = (req.user as { userId: string }).userId;
     return this.documentService.getDocumentById(id, userId);
+  }
+
+  @Delete(':id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async deleteDocument(@Req() req: Request, @Param('id') id: string) {
+    const userId = (req.user as { userId: string }).userId;
+    await this.documentService.deleteDocument(id, userId);
   }
 }

@@ -66,8 +66,10 @@ export class UsersService {
   }
 
   async findByEmail(email: string): Promise<User | null> {
+    // Use LOWER() so the lookup is case-insensitive regardless of how the
+    // email was stored (older rows may have mixed-case values in the DB).
     return this.knex("users")
-      .where("email", email.toLowerCase())
+      .whereRaw('LOWER("email") = ?', [email.toLowerCase()])
       .whereNull("deleted_at")
       .first();
   }

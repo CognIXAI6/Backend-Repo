@@ -76,3 +76,9 @@ export const geoConfig = registerAs('geo', () => ({
   // Free at ipinfo.io — 50k req/month. Leave blank to use the unauthenticated endpoint.
   ipinfoToken: process.env.IPINFO_TOKEN,
 }));
+
+export const notificationsConfig = registerAs('notifications', () => ({
+  // JSON string of the Firebase service account credentials for FCM push delivery.
+  // Set via FIREBASE_SERVICE_ACCOUNT env var (base64 or raw JSON).
+  firebaseServiceAccount: process.env.FIREBASE_SERVICE_ACCOUNT,
+}));

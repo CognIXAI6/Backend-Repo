@@ -8,6 +8,8 @@ export interface DocumentRequest {
   topic: string;
   sections: Array<{ heading: string; content: string }>;
   researchContext: string;
+  depth?: 'brief' | 'standard' | 'comprehensive';
+  format?: 'docx' | 'pdf';
 }
 
 export interface ClaudeStreamCallbacks {
@@ -77,6 +79,17 @@ const GENERATE_DOCUMENT_TOOL: Anthropic.Tool = {
           },
           required: ['heading', 'content'],
         },
+      },
+      depth: {
+        type: 'string',
+        enum: ['brief', 'standard', 'comprehensive'],
+        description:
+          'Depth of the document. "brief" = 3-4 short sections, "standard" = 5-7 sections (default), "comprehensive" = 8-12 detailed sections.',
+      },
+      format: {
+        type: 'string',
+        enum: ['docx', 'pdf'],
+        description: 'Output format. "docx" = Word document (default), "pdf" = PDF. Infer from user request.',
       },
     },
     required: ['title', 'topic', 'sections'],
@@ -272,14 +285,14 @@ export class ClaudeService implements OnModuleInit {
         const docResultsMap = new Map<string, string>();
 
         for (const tc of docGenCalls) {
-          let docInput: { title: string; topic: string; sections: Array<{ heading: string; content: string }> } = {
+          let docInput: { title: string; topic: string; sections: Array<{ heading: string; content: string }>; depth?: 'brief' | 'standard' | 'comprehensive'; format?: 'docx' | 'pdf' } = {
             title: 'Document',
             topic: userMessage,
             sections: [],
           };
           try { docInput = JSON.parse(tc.inputJson); } catch {}
 
-          this.logger.log(`  → generating document: "${docInput.title}"`);
+          this.logger.log(`  → generating document: "${docInput.title}" (depth: ${docInput.depth ?? 'standard'}, format: ${docInput.format ?? 'docx'})`);
 
           try {
             const result = await callbacks.onDocumentRequest!({
@@ -287,6 +300,8 @@ export class ClaudeService implements OnModuleInit {
               topic: docInput.topic,
               sections: docInput.sections,
               researchContext,
+              depth: docInput.depth,
+              format: docInput.format,
             });
             docResultsMap.set(
               tc.id,

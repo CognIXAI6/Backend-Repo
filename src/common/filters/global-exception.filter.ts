@@ -19,23 +19,35 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     const request = ctx.getRequest();
 
     let status = HttpStatus.INTERNAL_SERVER_ERROR;
-    let message = 'Internal server error';
-    let errorDetails: any = {};
+    // message: string or string[] (validation errors)
+    let message: string | string[] = 'Internal server error';
 
     if (exception instanceof HttpException) {
       status = exception.getStatus();
       const exceptionResponse = exception.getResponse();
-      message =
-        typeof exceptionResponse === 'string'
-          ? exceptionResponse
-          : (exceptionResponse as any).message || exception.message;
-      errorDetails = exceptionResponse;
+      if (typeof exceptionResponse === 'string') {
+        message = exceptionResponse;
+      } else {
+        const body = exceptionResponse as Record<string, unknown>;
+        // Preserve array of validation messages in full — callers get all failures.
+        message = (body.message as string | string[]) ?? exception.message;
+      }
     } else if (exception instanceof Error) {
-      message = exception.message;
-      errorDetails = {
-        name: exception.name,
-        stack: exception.stack,
-      };
+      // Never expose raw database errors (SQL statements, constraint names, etc.)
+      // to the client — replace them with a safe generic message in all environments.
+      const isDbError =
+        (exception as any).code?.startsWith?.('23') || // Postgres integrity constraints
+        (exception as any).code?.startsWith?.('42') || // Postgres syntax / missing column
+        /^(insert|update|delete|select)\s/i.test(exception.message) ||
+        exception.message.toLowerCase().includes('duplicate key') ||
+        exception.message.toLowerCase().includes('violates') ||
+        exception.message.toLowerCase().includes('relation') ||
+        exception.message.toLowerCase().includes('column') ||
+        exception.message.toLowerCase().includes('syntax error');
+
+      message = isDbError
+        ? 'An unexpected error occurred. Please try again.'
+        : exception.message;
     }
 
     // Forward 5xx errors to Sentry — 4xx are client errors, not bugs.
@@ -45,29 +57,29 @@ export class GlobalExceptionFilter implements ExceptionFilter {
         scope.setContext('request', {
           method: request.method,
           url: request.url,
-          headers: request.headers,
           body: request.body,
         });
         Sentry.captureException(exception);
       });
     }
 
-    // Log the full error details
     this.logger.error(
-      `${request.method} ${request.url} - ${status} - ${message}`,
+      `${request.method} ${request.url} - ${status}`,
       exception instanceof Error ? exception.stack : JSON.stringify(exception),
     );
 
-    // In development, include more details
-    const isDevelopment = process.env.NODE_ENV !== 'production';
+    const isProduction = process.env.NODE_ENV === 'production';
 
     response.status(status).json({
-      status: 'error',
-      message: Array.isArray(message) ? message[0] : message,
       statusCode: status,
-      ...(isDevelopment && {
-        error: exception instanceof Error ? exception.message : String(exception),
-        stack: exception instanceof Error ? exception.stack?.split('\n').slice(0, 5) : undefined,
+      // Always return the full messages array so clients see all validation failures.
+      message: Array.isArray(message) ? message : [message],
+      // Stack traces only in non-production environments.
+      ...(!isProduction && exception instanceof Error && {
+        debug: {
+          name: exception.name,
+          stack: exception.stack?.split('\n').slice(0, 8),
+        },
       }),
     });
   }

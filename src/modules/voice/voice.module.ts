@@ -18,6 +18,7 @@ import { FieldsModule } from '@/modules/fields/fields.module';
 import { EmailModule } from '@/modules/email/email.module';
 import { SpeakersModule } from '@/modules/speakers/speakers.module';
 import { DocumentModule } from '@/modules/documents/document.module';
+import { PushNotificationModule } from '@/modules/notifications/push-notification.module';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { DocumentModule } from '@/modules/documents/document.module';
     EmailModule,
     SpeakersModule,
     DocumentModule,
+    PushNotificationModule,
     JwtModule.registerAsync({
       useFactory: (configService: ConfigService) => ({
         secret: configService.get('jwt.secret'),

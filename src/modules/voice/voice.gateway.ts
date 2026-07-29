@@ -27,6 +27,7 @@ import { EmailService } from '@/modules/email/email.service';
 import { FieldsService } from '@/modules/fields/fields.service';
 import { ErrorLogService } from '@/modules/error-log/error-log.service';
 import { DocumentService } from '@/modules/documents/document.service';
+import { PushNotificationService } from '@/modules/notifications/push-notification.service';
 
 // ─── Mode types ───────────────────────────────────────────────────────────────
 
@@ -284,6 +285,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly configService: ConfigService,
     private readonly speakersService: SpeakersService,
     private readonly documentService: DocumentService,
+    private readonly pushNotificationService: PushNotificationService,
   ) {}
 
   private emitError(
@@ -1772,6 +1774,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // assistant message permanently to the generated document record.
       let generatedDocId: string | null = null;
 
+      // Stable job ID emitted in document:generating so the client can correlate
+      // document:ready / document:failed events back to the originating request.
+      const docJobId = isDocumentRequest ? randomUUID() : '';
+
       let firstToken = true;
 
       await this.claudeService.streamResponse(
@@ -1838,34 +1844,62 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           onDocumentRequest: isDocumentRequest
             ? async (req) => {
                 this.logger.log(`[${client.id}] Document generation requested: "${req.title}"`);
-                client.emit('document:generating', { title: req.title, topic: req.topic });
+                // Include jobId so the client can match this event to future ready/failed events.
+                client.emit('document:generating', { jobId: docJobId, title: req.title, topic: req.topic });
 
-                const result = await this.documentService.generateAndUpload({
-                  userId: session.userId,
-                  conversationId: session.conversationId,
-                  title: req.title,
-                  topic: req.topic,
-                  sections: req.sections,
-                  researchContext: req.researchContext,
-                });
+                try {
+                  const result = await this.documentService.generateAndUpload({
+                    userId: session.userId,
+                    conversationId: session.conversationId,
+                    title: req.title,
+                    topic: req.topic,
+                    sections: req.sections,
+                    researchContext: req.researchContext,
+                    depth: req.depth,
+                    format: req.format,
+                  });
 
-                // Capture docId — onDone picks it up to link the assistant message.
-                generatedDocId = result.docId;
+                  // Capture docId — onDone picks it up to link the assistant message.
+                  generatedDocId = result.docId;
 
-                client.emit('document:ready', {
-                  docId: result.docId,
-                  title: req.title,
-                  topic: req.topic,
-                  downloadUrl: result.downloadUrl,
-                });
+                  client.emit('document:ready', {
+                    jobId: docJobId,
+                    docId: result.docId,
+                    title: req.title,
+                    topic: req.topic,
+                    format: req.format ?? 'docx',
+                    downloadUrl: result.downloadUrl,
+                  });
 
-                this.logger.log(`[${client.id}] Document ready: ${result.downloadUrl}`);
-                return result;
+                  this.logger.log(`[${client.id}] Document ready: ${result.downloadUrl}`);
+
+                  // Fire-and-forget push notification — socket already delivered the event,
+                  // so push is a best-effort duplicate for users who may have closed the tab.
+                  this.pushNotificationService
+                    .sendToUser(session.userId, {
+                      title: 'Your document is ready',
+                      body: req.title,
+                      data: { docId: result.docId, downloadUrl: result.downloadUrl, jobId: docJobId },
+                    })
+                    .catch((err) => this.logger.warn(`Push notification failed for doc ${result.docId}:`, err));
+                  return result;
+                } catch (err) {
+                  this.logger.error(`[${client.id}] Document generation failed for "${req.title}":`, err);
+                  client.emit('document:failed', {
+                    jobId: docJobId,
+                    title: req.title,
+                    reason: 'We couldn\'t generate your document. Please try again.',
+                    canRetry: true,
+                  });
+                  throw err;
+                }
               }
             : undefined,
         },
         {
-          enableWebSearch: inputType === 'text',
+          // Enable web search for text requests AND voice document requests
+          // so documents are always research-enriched regardless of input type.
+          enableWebSearch: inputType === 'text' || isDocumentRequest,
           enableDocumentGeneration: isDocumentRequest,
         },
       );

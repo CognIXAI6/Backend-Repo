@@ -2,6 +2,7 @@ import {
   Injectable,
   Inject,
   BadRequestException,
+  ConflictException,
   UnauthorizedException,
   Logger,
 } from '@nestjs/common';
@@ -236,31 +237,60 @@ export class AuthService {
           avatar_url: user.avatar_url ?? (clerkUser.imageUrl || undefined),
         });
       } else {
-        // 3. Brand-new user via OAuth
-        user = await this.knex.transaction(async (trx) => {
-          const [newUser] = await trx('users')
-            .insert({
-              email: primaryEmail,
-              password: null,
-              name: `${clerkUser.firstName ?? ''} ${clerkUser.lastName ?? ''}`.trim() || null,
-              auth_provider: 'clerk_oauth',
+        // 3. Brand-new user via OAuth — guard against duplicate-key if findByEmail
+        //    missed the row (case mismatch on older records, or a race condition).
+        try {
+          user = await this.knex.transaction(async (trx) => {
+            const [newUser] = await trx('users')
+              .insert({
+                email: primaryEmail,
+                password: null,
+                name: `${clerkUser.firstName ?? ''} ${clerkUser.lastName ?? ''}`.trim() || null,
+                auth_provider: 'clerk_oauth',
+                clerk_user_id: clerkUserId,
+                avatar_url: clerkUser.imageUrl || null,
+                email_verified: true,
+                onboarding_status: dto.niche_id ? 'completed' : 'in_progress',
+              })
+              .returning('*');
+
+            if (dto.niche_id) {
+              await trx('user_fields').insert({
+                user_id: newUser.id,
+                field_id: dto.niche_id,
+                is_primary: true,
+              });
+            }
+
+            return newUser;
+          });
+        } catch (err: any) {
+          if (err?.code === '23505') {
+            // Unique constraint on email — an account already exists under this address
+            // but wasn't found by the earlier lookups (likely a case-mismatch in the DB).
+            // Recover by fetching the existing record with a case-insensitive query and
+            // linking the Clerk identity so future logins skip this fallback path.
+            const existing = await this.knex('users')
+              .whereRaw('LOWER("email") = ?', [primaryEmail])
+              .whereNull('deleted_at')
+              .first();
+
+            if (!existing) {
+              throw new ConflictException(
+                'An account with this email already exists. Please sign in with your email instead.',
+              );
+            }
+
+            user = await this.usersService.update(existing.id, {
               clerk_user_id: clerkUserId,
-              avatar_url: clerkUser.imageUrl || null,
+              auth_provider: 'clerk_oauth',
               email_verified: true,
-              onboarding_status: dto.niche_id ? 'completed' : 'in_progress',
-            })
-            .returning('*');
-
-          if (dto.niche_id) {
-            await trx('user_fields').insert({
-              user_id: newUser.id,
-              field_id: dto.niche_id,
-              is_primary: true,
+              avatar_url: existing.avatar_url ?? (clerkUser.imageUrl || undefined),
             });
+          } else {
+            throw err;
           }
-
-          return newUser;
-        });
+        }
       }
     }
 
