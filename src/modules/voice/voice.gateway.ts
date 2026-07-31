@@ -17,7 +17,7 @@ import { randomUUID } from 'crypto';
 
 import { DeepgramLiveAudioFormat, DeepgramService, TranscriptWord } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
-import { ConversationService, ConversationMode, SaveTranscriptSegmentDto } from './services/conversation.service';
+import { ConversationService, ConversationMode, SaveTranscriptSegmentDto, ConversationParticipant, UpsertParticipantDto } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { VoiceVerificationService, SpeakerIdentificationResult } from './services/voice-verification.service';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
@@ -168,11 +168,26 @@ interface ActiveSession {
   // ── Idle timeout ─────────────────────────────────────────────────────────
   idleTimeoutHandle: ReturnType<typeof setTimeout> | null;
 
-  // ── Audio chunk sequencing (Gap 7) ───────────────────────────────────────
-  lastAudioSequence: number | null;
-  audioGapCount: number;
-  /** Stable UUID for this recording session — used to scope segment corrections. */
+  // ── Stream-aware audio sequencing ────────────────────────────────────────
+  /**
+   * Stable UUID for this recording session — used to scope segment corrections.
+   * Regenerated on every new provider/Deepgram session (i.e. every session:start).
+   */
   recordingSessionId: string;
+  /**
+   * Stable client-provided session ID that survives across provider reconnects.
+   * Set from payload.clientSessionId; absent for older clients.
+   */
+  clientSessionId: string | null;
+  /** Currently active recorder/stream identity (sent by the frontend per recorder instance). */
+  activeStreamId: string | null;
+  /**
+   * Last acknowledged sequence per stream (keyed by recordingId).
+   * A new recordingId resets the scope — sequence 0 is valid and expected.
+   */
+  streamSequences: Map<string, number>;
+  /** Total cross-stream gap count (for metrics only — does not drive recovery). */
+  audioGapCount: number;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
@@ -575,9 +590,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         singleSpeakerSpeechSeconds: 0,
         singleSpeakerProfileTriggered: false,
         idleTimeoutHandle: null,
-        lastAudioSequence: null,
-        audioGapCount: 0,
         recordingSessionId: randomUUID(),
+        clientSessionId: (payload as any).clientSessionId ?? null,
+        activeStreamId: null,
+        streamSequences: new Map(),
+        audioGapCount: 0,
       };
 
       // ── Deepgram transcript handler ───────────────────────────────────────
@@ -909,8 +926,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       emitter.on('error', (err: Error) => {
         if (!this.sessions.has(client.id)) return;
         this.logger.warn(`Deepgram error for session ${client.id}: ${err.message}`);
+        // Provider error — genuine; the provider session cannot continue.
+        // Frontend must reconnect (creates a new provider epoch) but SHOULD
+        // restore participant assignments from restoredParticipants in session:ready.
         client.emit('session:degraded', {
           reason: 'deepgram_error',
+          category: 'provider_error',
+          recoverable: true,
           message: 'Voice connection interrupted. Tap the mic to reconnect.',
         });
         this.cleanupSession(client.id);
@@ -919,8 +941,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       emitter.on('close', () => {
         if (!this.sessions.has(client.id)) return;
         this.logger.warn(`[${client.id}] Deepgram connection closed unexpectedly — degrading session`);
+        // Provider closed — genuine; the socket/session is gone.
+        // Frontend must reconnect and the backend will issue restored participants.
         client.emit('session:degraded', {
           reason: 'deepgram_closed',
+          category: 'provider_closed',
+          recoverable: true,
           message: 'Voice connection dropped. Tap the mic to reconnect.',
         });
         this.cleanupSession(client.id);
@@ -928,19 +954,86 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       this.sessions.set(client.id, session);
 
+      // ── Restore durable participants from previous sessions ───────────────
+      // Load persisted participants for this conversation so the frontend can
+      // restore identity state (names, roles) that survived a reconnect/refresh.
+      let restoredParticipants: ConversationParticipant[] = [];
+      if (!isGuest) {
+        restoredParticipants = await this.conversationService
+          .getConversationParticipants(conversationId)
+          .catch((err) => {
+            this.logger.warn(`[${client.id}] Failed to load conversation participants: ${(err as Error).message}`);
+            return [];
+          });
+
+        // Ensure the owner is always recorded as a participant.
+        this.conversationService.upsertConversationParticipant({
+          conversationId,
+          userId,
+          displayName: cachedOwnerName,
+          role: 'owner',
+          voiceSpeakerId: cachedVoiceSpeakerId ?? undefined,
+        }).catch((err) =>
+          this.logger.warn(`[${client.id}] Failed to upsert owner participant: ${(err as Error).message}`),
+        );
+
+        // Pre-populate resolvedSpeakers from prior voice-ID confirmations so
+        // returning participants are recognised without re-running identification.
+        for (const p of restoredParticipants) {
+          if (p.voice_confirmed && p.voice_speaker_id) {
+            // We can't map to a Deepgram speaker ID yet (provider hasn't assigned
+            // clusters), but we pre-load the roster so identifyMultiSpeaker()
+            // can match quickly.  The actual mapping happens in identifyMultiSpeaker.
+            this.logger.debug(
+              `[${client.id}] Restored participant "${p.display_name}" ` +
+              `(voiceId=${p.voice_speaker_id}) for conv ${conversationId}`,
+            );
+          }
+        }
+      }
+
+      // ── Upsert roster participants ────────────────────────────────────────
+      if (!isGuest && speakerRoster.length > 0) {
+        for (const entry of speakerRoster) {
+          this.conversationService.upsertConversationParticipant({
+            conversationId,
+            userId,
+            displayName: entry.displayName,
+            role: entry.role,
+            speakerId: entry.speakerId,
+            voiceSpeakerId: entry.voiceSpeakerId ?? undefined,
+          }).catch((err) =>
+            this.logger.warn(`[${client.id}] Failed to upsert roster participant: ${(err as Error).message}`),
+          );
+        }
+      }
+
       const rosterCount = speakerRoster.length;
       this.logger.log(
         `Session started — user: ${userId} (${isGuest ? 'guest' : 'auth'}), ` +
         `conv: ${conversationId}, mode: ${mode}, roster: ${rosterCount}, ` +
-        `audioSource: ${session.audioSource}`,
+        `audioSource: ${session.audioSource}, restored: ${restoredParticipants.length}`,
       );
 
       client.emit('session:ready', {
         conversationId,
+        voiceSessionId: session.recordingSessionId,
+        providerSessionEpoch: session.recordingSessionId,
+        clientSessionId: session.clientSessionId,
         isGuest,
         mode,
         isDualSpeaker,
         isMultiSpeaker,
+        // Participants restored from prior sessions — frontend uses these to
+        // reinstate speaker names and skip the "name your speakers" step.
+        restoredParticipants: restoredParticipants.map((p) => ({
+          conversationParticipantId: p.id,
+          displayName: p.display_name,
+          role: p.role,
+          canonicalSpeakerId: p.speaker_id,
+          voiceSpeakerId: p.voice_speaker_id,
+          voiceConfirmed: p.voice_confirmed,
+        })),
         message: isMultiSpeaker
           ? `Multi-speaker mode active. Capturing ${rosterCount > 0 ? rosterCount + ' expected speakers' : 'meeting audio'}.`
           : isDualSpeaker
@@ -955,6 +1048,59 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       this.logger.error('session:start failed', err);
       this.emitError(client, 'SESSION_START_FAILED', (err as Error).message, { clientMessage: 'Failed to start session. Please refresh and try again.' });
     }
+  }
+
+  // ─── stream:start ───────────────────────────────────────────────────────────
+  //
+  // The frontend emits this before the first chunk of every new recorder instance.
+  // It announces the new recordingId and stream epoch so the backend can reset
+  // sequence tracking without mistaking "sequence 0" for a network gap.
+  // It also allows updating audioSource when the recorder switches from
+  // mic-only to mixed mic+tab.
+
+  @SubscribeMessage('stream:start')
+  handleStreamStart(
+    @ConnectedSocket() client: Socket,
+    @MessageBody()
+    payload: {
+      recordingId: string;
+      streamEpoch?: number;
+      audioSource?: 'mic_only' | 'mixed_mic_tab';
+      clientSessionId?: string;
+    },
+  ): void {
+    const session = this.sessions.get(client.id);
+    if (!session) return;
+
+    const streamId = payload.recordingId;
+
+    // Initialize sequence scope for this stream at -1 (no chunks received yet).
+    // When the first chunk arrives its sequence (typically 0) won't be seen as a gap.
+    session.streamSequences.set(streamId, -1);
+    session.activeStreamId = streamId;
+
+    if (payload.audioSource) {
+      session.audioSource = payload.audioSource;
+    }
+    if (payload.clientSessionId && !session.clientSessionId) {
+      session.clientSessionId = payload.clientSessionId;
+    }
+
+    // Reset the container-header capture so the new recorder's header is used
+    // for any per-speaker audio reconstruction.
+    session.audioHeaderChunk = null;
+
+    this.logger.log(
+      `[${client.id}] stream:start — streamId=${streamId} epoch=${payload.streamEpoch ?? 'n/a'} ` +
+      `audioSource=${payload.audioSource ?? session.audioSource}`,
+    );
+
+    client.emit('stream:ready', {
+      recordingId: streamId,
+      streamEpoch: payload.streamEpoch ?? 0,
+      expectedSequence: 0,
+      clientSessionId: session.clientSessionId,
+    });
   }
 
   // ─── audio:chunk ────────────────────────────────────────────────────────────
@@ -978,24 +1124,40 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.audioHeaderChunk = buffer;
     }
 
-    // ── Sequence tracking / gap detection (Gap 7) ─────────────────────────
+    // ── Stream-aware sequence tracking ───────────────────────────────────
+    // Each recorder instance supplies a `recordingId` that resets when it is
+    // recreated (e.g. mic→tab-audio handoff).  Sequence numbers are scoped
+    // per recordingId so that an expected "sequence 0" from a new recorder
+    // is never classified as a network gap in the previous recorder's stream.
     if (payload.sequence != null) {
-      const expected =
-        session.lastAudioSequence != null ? session.lastAudioSequence + 1 : payload.sequence;
+      const streamId = payload.recordingId ?? '__legacy__';
+      const lastSeq = session.streamSequences.get(streamId) ?? null;
 
-      if (payload.sequence !== expected) {
+      if (lastSeq !== null && payload.sequence !== lastSeq + 1) {
+        // Real gap within the same stream — emit a recoverable warning only.
+        // Do NOT destroy the Deepgram session; audio may still be flowing.
         session.audioGapCount += 1;
         this.logger.warn(
-          `[${client.id}] Audio sequence gap: expected=${expected} actual=${payload.sequence} (gaps=${session.audioGapCount})`,
+          `[${client.id}] Audio gap in stream "${streamId}": ` +
+          `expected=${lastSeq + 1} actual=${payload.sequence} (gaps=${session.audioGapCount})`,
         );
-        client.emit('session:degraded', {
-          reason: 'audio_gap',
-          message: 'Network instability detected. Some audio may be missing.',
+        client.emit('audio:continuity_warning', {
+          streamId,
+          expected: lastSeq + 1,
+          actual: payload.sequence,
+          recoverable: true,
+          message: 'Some audio may be missing. Recording continues.',
         });
       }
 
-      session.lastAudioSequence = payload.sequence;
-      client.emit('audio:ack', { sequence: payload.sequence });
+      session.streamSequences.set(streamId, payload.sequence);
+      if (!session.activeStreamId) session.activeStreamId = streamId;
+
+      client.emit('audio:ack', {
+        sequence: payload.sequence,
+        streamId,
+        clientSessionId: session.clientSessionId,
+      });
     }
 
     // ── Per-speaker audio tagging ─────────────────────────────────────────
@@ -1447,6 +1609,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.anonymousSpeakerLabels.set(payload.deepgramSpeakerId, name);
 
     this.logger.log(`[${client.id}] Guest renamed: deepgramId=${payload.deepgramSpeakerId} → "${name}"`);
+
+    // Persist the manual rename as a durable conversation participant so the
+    // name survives a provider reconnect and appears in the next session:ready.
+    if (!session.isGuest) {
+      this.conversationService.upsertConversationParticipant({
+        conversationId: session.conversationId,
+        userId: session.userId,
+        displayName: name,
+        role: 'participant',
+        voiceConfirmed: false,
+      }).catch((err) =>
+        this.logger.warn(`[${client.id}] Failed to persist renamed participant: ${(err as Error).message}`),
+      );
+    }
 
     client.emit('transcript:speaker_corrected', {
       deepgramSpeakerId: payload.deepgramSpeakerId,
@@ -2412,7 +2588,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.multiSpeakerHistory = session.multiSpeakerHistory.map(updateTurn);
       session.pendingMultiSpeakerTurns = session.pendingMultiSpeakerTurns.map(updateTurn);
 
-      // ── Gap 6: retroactively update segment rows saved before identification ──
+      // ── Retroactively update segment rows saved before identification ─────
       this.conversationService.updateTranscriptSpeakerByDeepgramId({
         conversationId: session.conversationId,
         deepgramSpeakerId,
@@ -2422,6 +2598,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         recordingSessionId: session.recordingSessionId,
       }).catch((err) =>
         this.logger.warn(`[${client.id}] retroactive segment update failed (non-fatal): ${(err as Error).message}`),
+      );
+
+      // ── Persist the confirmed identity as a durable conversation participant ──
+      // This survives provider-session reconnects so the next session:ready
+      // can include this speaker in restoredParticipants.
+      this.conversationService.upsertConversationParticipant({
+        conversationId: session.conversationId,
+        userId: session.userId,
+        displayName: resolvedName,
+        speakerId: resolvedSpeakerId ?? undefined,
+        voiceSpeakerId: resolvedVoiceSpeakerId ?? undefined,
+        voiceConfirmed: true,
+      }).catch((err) =>
+        this.logger.warn(`[${client.id}] Failed to persist voice-ID participant: ${(err as Error).message}`),
       );
     }
 
@@ -2440,9 +2630,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   // ─── Helpers ─────────────────────────────────────────────────────────────────
 
   /**
-   * Builds per-speaker transcript turns for multi-speaker mode.
-   * Each Deepgram speaker ID gets its own turn, resolved against the
-   * anonymous label map or a voice-ID match (Gap 3 + Gap 11).
+   * Builds transcript turns for multi-speaker mode preserving strict
+   * chronological word order.
+   *
+   * Words are walked in sequence order.  Each time the speaker ID changes a
+   * new turn is opened.  This preserves interruptions and interleaved speech —
+   * e.g. A-B-A produces three turns: A, B, A.
+   *
+   * The previous grouping-by-speaker approach collapsed all of speaker A's
+   * words into one turn regardless of where speaker B interrupted, corrupting
+   * the conversation timeline.
    */
   private buildMultiSpeakerTurns(
     session: ActiveSession,
@@ -2450,39 +2647,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     confidence: number,
     fallbackTranscript?: string,
   ): MultiSpeakerTurn[] {
-    const grouped = new Map<number, TranscriptWord[]>();
-    for (const word of words) {
-      const spk = word.speaker ?? 0;
-      const group = grouped.get(spk) ?? [];
-      group.push(word);
-      grouped.set(spk, group);
-    }
-
-    const turns: MultiSpeakerTurn[] = [];
-    for (const [deepgramSpeakerId, speakerWords] of grouped.entries()) {
-      const text = speakerWords.map((w) => w.word).join(' ').trim();
-      if (!text) continue;
-
-      const identity = this.resolveSpeakerLabel(session, deepgramSpeakerId);
-
-      turns.push({
-        deepgramSpeakerId,
-        speakerId: identity.speakerId,
-        speakerLabel: identity.speakerLabel,
-        text,
-        confidence,
-        startMs: speakerWords[0]?.start != null ? Math.round(speakerWords[0].start * 1000) : null,
-        endMs: speakerWords.at(-1)?.end != null ? Math.round(speakerWords.at(-1)!.end * 1000) : null,
-        identificationMethod: identity.identificationMethod,
-      });
-    }
-
-    // Gap 7: Deepgram occasionally returns a transcript without word-level data.
-    // When that happens emit a single fallback turn attributed to the dominant speaker.
-    if (turns.length === 0 && fallbackTranscript?.trim()) {
+    // Fallback when Deepgram returns no word-level data.
+    if (!words.length) {
+      if (!fallbackTranscript?.trim()) return [];
       const spkId = session.currentDominantSpeaker ?? 0;
       const identity = this.resolveSpeakerLabel(session, spkId);
-      turns.push({
+      return [{
         deepgramSpeakerId: spkId,
         speakerId: identity.speakerId,
         speakerLabel: identity.speakerLabel,
@@ -2490,6 +2660,38 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         confidence,
         startMs: null,
         endMs: null,
+        identificationMethod: identity.identificationMethod,
+      }];
+    }
+
+    // Build contiguous speaker runs in word order.
+    const runs: { speakerId: number; words: TranscriptWord[] }[] = [];
+    let current: { speakerId: number; words: TranscriptWord[] } | null = null;
+
+    for (const word of words) {
+      const spk = word.speaker ?? 0;
+      if (!current || current.speakerId !== spk) {
+        current = { speakerId: spk, words: [word] };
+        runs.push(current);
+      } else {
+        current.words.push(word);
+      }
+    }
+
+    const turns: MultiSpeakerTurn[] = [];
+    for (const run of runs) {
+      const text = run.words.map((w) => w.word).join(' ').trim();
+      if (!text) continue;
+
+      const identity = this.resolveSpeakerLabel(session, run.speakerId);
+      turns.push({
+        deepgramSpeakerId: run.speakerId,
+        speakerId: identity.speakerId,
+        speakerLabel: identity.speakerLabel,
+        text,
+        confidence,
+        startMs: run.words[0]?.start != null ? Math.round(run.words[0].start * 1000) : null,
+        endMs: run.words.at(-1)?.end != null ? Math.round(run.words.at(-1)!.end * 1000) : null,
         identificationMethod: identity.identificationMethod,
       });
     }

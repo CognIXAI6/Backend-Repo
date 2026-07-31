@@ -6,6 +6,29 @@ import { Knex } from 'knex';
 export type ConversationMode = 'single' | 'double' | 'multi' | 'dual_speaker' | 'multiple_speaker';
 export type MessageRole = 'user' | 'assistant';
 
+export interface ConversationParticipant {
+  id: string;
+  conversation_id: string;
+  user_id: string;
+  speaker_id: string | null;
+  display_name: string;
+  role: 'owner' | 'participant';
+  voice_speaker_id: string | null;
+  voice_confirmed: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface UpsertParticipantDto {
+  conversationId: string;
+  userId: string;
+  displayName: string;
+  role?: 'owner' | 'participant';
+  speakerId?: string | null;
+  voiceSpeakerId?: string | null;
+  voiceConfirmed?: boolean;
+}
+
 export interface SaveTranscriptSegmentDto {
   conversationId: string;
   messageId?: string | null;
@@ -605,5 +628,52 @@ export class ConversationService {
       .where('conversation_id', conversationId)
       .orderBy('created_at', 'asc')
       .select('id', 'filename', 'mime_type as mimeType', 'char_count as charCount', 'created_at as createdAt');
+  }
+
+  // ─── Conversation participants (durable speaker identity) ─────────────────
+
+  /**
+   * Creates or updates a conversation participant by display_name.
+   * Using display_name as the natural key — one record per named speaker per conversation.
+   */
+  async upsertConversationParticipant(dto: UpsertParticipantDto): Promise<ConversationParticipant> {
+    const existing = await this.knex('conversation_participants')
+      .where('conversation_id', dto.conversationId)
+      .whereRaw('LOWER(display_name) = ?', [dto.displayName.toLowerCase()])
+      .first();
+
+    if (existing) {
+      const [updated] = await this.knex('conversation_participants')
+        .where('id', existing.id)
+        .update({
+          speaker_id: dto.speakerId ?? existing.speaker_id,
+          voice_speaker_id: dto.voiceSpeakerId ?? existing.voice_speaker_id,
+          voice_confirmed: dto.voiceConfirmed ?? existing.voice_confirmed,
+          role: dto.role ?? existing.role,
+          updated_at: new Date(),
+        })
+        .returning('*');
+      return updated;
+    }
+
+    const [created] = await this.knex('conversation_participants')
+      .insert({
+        conversation_id: dto.conversationId,
+        user_id: dto.userId,
+        display_name: dto.displayName,
+        role: dto.role ?? 'participant',
+        speaker_id: dto.speakerId ?? null,
+        voice_speaker_id: dto.voiceSpeakerId ?? null,
+        voice_confirmed: dto.voiceConfirmed ?? false,
+      })
+      .returning('*');
+    return created;
+  }
+
+  /** Returns all participants for a conversation, ordered by creation time. */
+  async getConversationParticipants(conversationId: string): Promise<ConversationParticipant[]> {
+    return this.knex('conversation_participants')
+      .where('conversation_id', conversationId)
+      .orderBy('created_at', 'asc');
   }
 }
