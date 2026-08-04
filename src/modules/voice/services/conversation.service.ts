@@ -6,6 +6,28 @@ import { Knex } from 'knex';
 export type ConversationMode = 'single' | 'double' | 'multi' | 'dual_speaker' | 'multiple_speaker';
 export type MessageRole = 'user' | 'assistant';
 
+export interface ConversationImage {
+  id: string;
+  conversation_id: string;
+  user_id: string;
+  filename: string;
+  mime_type: string;
+  file_url: string;
+  image_base64: string;
+  sent_to_ai: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface SaveConversationImageDto {
+  conversationId: string;
+  userId: string;
+  filename: string;
+  mimeType: string;
+  fileUrl: string;
+  imageBase64: string;
+}
+
 export interface ConversationParticipant {
   id: string;
   conversation_id: string;
@@ -675,5 +697,53 @@ export class ConversationService {
     return this.knex('conversation_participants')
       .where('conversation_id', conversationId)
       .orderBy('created_at', 'asc');
+  }
+
+  // ─── Conversation images (Claude Vision — include-once) ───────────────────
+
+  /** Saves an uploaded image for vision injection on the next AI call. */
+  async saveConversationImage(dto: SaveConversationImageDto): Promise<ConversationImage> {
+    const [row] = await this.knex('conversation_images')
+      .insert({
+        conversation_id: dto.conversationId,
+        user_id: dto.userId,
+        filename: dto.filename,
+        mime_type: dto.mimeType,
+        file_url: dto.fileUrl,
+        image_base64: dto.imageBase64,
+        sent_to_ai: false,
+      })
+      .returning('*');
+    return row;
+  }
+
+  /**
+   * Returns all unsent images for a conversation (sent_to_ai = false).
+   * Called before every AI invocation so images are included exactly once.
+   */
+  async getUnsentConversationImages(conversationId: string): Promise<ConversationImage[]> {
+    return this.knex('conversation_images')
+      .where('conversation_id', conversationId)
+      .where('sent_to_ai', false)
+      .orderBy('created_at', 'asc');
+  }
+
+  /**
+   * Marks all unsent images for a conversation as sent.
+   * Called immediately after the AI call that included them.
+   */
+  async markConversationImagesSent(conversationId: string): Promise<void> {
+    await this.knex('conversation_images')
+      .where('conversation_id', conversationId)
+      .where('sent_to_ai', false)
+      .update({ sent_to_ai: true, updated_at: new Date() });
+  }
+
+  /** Lists all images ever attached to a conversation (for display purposes). */
+  async listConversationImages(conversationId: string): Promise<Pick<ConversationImage, 'id' | 'filename' | 'mime_type' | 'file_url' | 'sent_to_ai' | 'created_at'>[]> {
+    return this.knex('conversation_images')
+      .where('conversation_id', conversationId)
+      .orderBy('created_at', 'asc')
+      .select('id', 'filename', 'mime_type', 'file_url', 'sent_to_ai', 'created_at');
   }
 }

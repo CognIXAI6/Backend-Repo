@@ -1,11 +1,12 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import * as mammoth from 'mammoth';
-import * as pdfParseModule from 'pdf-parse';
 
-// pdf-parse ships a CJS module; normalise the callable regardless of interop mode.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const pdfParse: (buf: Buffer) => Promise<{ text: string }> =
-  (pdfParseModule as any).default ?? pdfParseModule;
+// Import the internal implementation directly, NOT the package entry point.
+// The pdf-parse index.js runs test/debug code on first import that reads files
+// from disk — this throws in NestJS compiled environments and breaks every PDF
+// call with a misleading "corrupt or password-protected" message.
+// eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+const pdfParse: (buf: Buffer) => Promise<{ text: string }> = require('pdf-parse/lib/pdf-parse.js');
 
 const SUPPORTED_MIME_TYPES = [
   'application/pdf',

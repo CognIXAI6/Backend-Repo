@@ -16,8 +16,8 @@ import { EventEmitter } from 'events';
 import { randomUUID } from 'crypto';
 
 import { DeepgramLiveAudioFormat, DeepgramService, TranscriptWord } from './services/deepgram.service';
-import { ClaudeService } from './services/claude.service';
-import { ConversationService, ConversationMode, SaveTranscriptSegmentDto, ConversationParticipant, UpsertParticipantDto } from './services/conversation.service';
+import { ClaudeService, ConversationImage as ClaudeConversationImage } from './services/claude.service';
+import { ConversationService, ConversationMode, SaveTranscriptSegmentDto, ConversationParticipant, UpsertParticipantDto, ConversationImage as DbConversationImage } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { VoiceVerificationService, SpeakerIdentificationResult } from './services/voice-verification.service';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
@@ -1959,8 +1959,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       client.emit('ai:start');
       aiStarted = true;
 
-      // Load any documents the user has attached to this conversation so they
-      // are injected into the system prompt and the AI can answer questions about them.
+      // Load any documents attached to this conversation for system prompt injection.
       const documentContext = await this.conversationService
         .getConversationDocumentContext(session.conversationId)
         .catch((err) => {
@@ -1973,6 +1972,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.cachedAiMemory ?? undefined,
         documentContext,
       );
+
+      // Load unsent images (include-once vision strategy).
+      // These are passed directly to the Claude API as image content blocks in
+      // this call only; they are marked sent immediately after.
+      const unsentDbImages = await this.conversationService
+        .getUnsentConversationImages(session.conversationId)
+        .catch(() => [] as DbConversationImage[]);
+
+      const visionImages: ClaudeConversationImage[] = unsentDbImages.map((img) => ({
+        mimeType: img.mime_type as ClaudeConversationImage['mimeType'],
+        imageBase64: img.image_base64,
+        filename: img.filename,
+      }));
 
       // Detect document generation intent so we can enable the tool and raise max_tokens.
       const isDocumentRequest =
@@ -2003,6 +2015,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           },
 
           onDone: async (fullText: string, inputTokens: number, outputTokens: number) => {
+            // Mark images as sent immediately so they are never included again.
+            if (visionImages.length > 0) {
+              this.conversationService.markConversationImagesSent(session.conversationId).catch((err) =>
+                this.logger.warn(`[${client.id}] Failed to mark images as sent: ${(err as Error).message}`),
+              );
+            }
+
             // Safety net: if Claude returned nothing (rare but possible with very garbled
             // or ambiguous input), synthesise a clarification response so the user is
             // never left staring at a blank screen. Emit it as a token first so the
@@ -2129,6 +2148,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           // so documents are always research-enriched regardless of input type.
           enableWebSearch: inputType === 'text' || isDocumentRequest,
           enableDocumentGeneration: isDocumentRequest,
+          // Include any unsent images on this call only (include-once strategy).
+          images: visionImages.length > 0 ? visionImages : undefined,
         },
       );
     } catch (err) {

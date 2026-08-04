@@ -28,6 +28,12 @@ export interface ConversationTurn {
   content: string;
 }
 
+export interface ConversationImage {
+  mimeType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+  imageBase64: string;
+  filename: string;
+}
+
 const WEB_SEARCH_TOOL: Anthropic.Tool = {
   name: 'web_search',
   description:
@@ -140,23 +146,55 @@ export class ClaudeService implements OnModuleInit {
     history: ConversationTurn[],
     systemPrompt: string,
     callbacks: ClaudeStreamCallbacks,
-    options: { enableWebSearch?: boolean; enableDocumentGeneration?: boolean; maxTokens?: number } = {},
+    options: {
+      enableWebSearch?: boolean;
+      enableDocumentGeneration?: boolean;
+      maxTokens?: number;
+      /** Images to include in this call only (include-once vision strategy). */
+      images?: ConversationImage[];
+    } = {},
   ): Promise<void> {
     // Sanitize history: if content is somehow an array (defensive against DB edge cases),
     // flatten to text-only so no tool_use blocks leak into the messages array.
+    const historyMessages: Anthropic.MessageParam[] = history.map((turn) => {
+      const c = turn.content as unknown;
+      if (Array.isArray(c)) {
+        const text = (c as Array<{ type: string; text?: string }>)
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text ?? '')
+          .join('') || '…';
+        return { role: turn.role as 'user' | 'assistant', content: text };
+      }
+      return { role: turn.role as 'user' | 'assistant', content: String(c) };
+    });
+
+    // Build the user message content.  If images are provided, prepend each as
+    // an image block so Claude Vision can analyse them before reading the text.
+    // Images are only attached to this single call (include-once strategy) —
+    // the caller is responsible for marking them as sent afterward.
+    const userContent: Anthropic.ContentBlockParam[] = [];
+    if (options.images?.length) {
+      for (const img of options.images) {
+        userContent.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: img.mimeType,
+            data: img.imageBase64,
+          },
+        } as Anthropic.ImageBlockParam);
+      }
+    }
+    userContent.push({ type: 'text', text: userMessage });
+
     const messages: Anthropic.MessageParam[] = [
-      ...history.map((turn) => {
-        const c = turn.content as unknown;
-        if (Array.isArray(c)) {
-          const text = (c as Array<{ type: string; text?: string }>)
-            .filter((b) => b.type === 'text')
-            .map((b) => b.text ?? '')
-            .join('') || '…';
-          return { role: turn.role as 'user' | 'assistant', content: text };
-        }
-        return { role: turn.role as 'user' | 'assistant', content: String(c) };
-      }),
-      { role: 'user', content: userMessage },
+      ...historyMessages,
+      {
+        role: 'user',
+        content: userContent.length === 1 && userContent[0].type === 'text'
+          ? userMessage  // plain string — avoids wrapping in array when no images
+          : userContent,
+      },
     ];
 
     // Cache the system prompt — saves ~200-400ms on every repeat call within 5 min
