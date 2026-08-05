@@ -93,7 +93,10 @@ export class ConversationsController {
 
   /**
    * POST /conversations/:id/documents
-   * Upload a PDF, DOCX, or TXT — text is extracted and injected into every AI call.
+   * Unified file attachment endpoint — handles both documents and images.
+   * If the uploaded file is an image (JPEG, PNG, GIF, WebP) it is stored for
+   * Claude Vision (include-once). Otherwise text is extracted and injected into
+   * every subsequent AI call.
    */
   @Post(':id/documents')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: CONVERSATION_DOC_SIZE_LIMIT } }))
@@ -106,6 +109,51 @@ export class ConversationsController {
     if (!file) throw new BadRequestException('No file uploaded');
     await this.conversationService.assertOwnership(conversationId, userId);
 
+    // ── Image path ───────────────────────────────────────────────────────────
+    if (SUPPORTED_IMAGE_TYPES.has(file.mimetype)) {
+      const mediaType = CLAUDE_MEDIA_TYPE[file.mimetype];
+
+      if (file.buffer.length > CONVERSATION_IMG_SIZE_LIMIT) {
+        throw new BadRequestException('Image exceeds the 10 MB limit.');
+      }
+
+      const uploaded = await this.uploadService.uploadBuffer(
+        file.buffer,
+        UploadFolder.RESOURCES,
+        `conv-img-${conversationId}-${Date.now()}`,
+        'image',
+      );
+
+      await this.conversationService.saveConversationImage({
+        conversationId,
+        userId,
+        filename: file.originalname,
+        mimeType: mediaType,
+        fileUrl: uploaded.secure_url,
+        imageBase64: file.buffer.toString('base64'),
+      });
+
+      const announcement =
+        `🖼️ **${file.originalname}** was attached to this conversation.` +
+        (instruction ? `\n\n**Your instruction:** ${instruction}` : '') +
+        `\n\nClaude will analyse this image when you send your next message.`;
+
+      await this.conversationService.saveMessage({
+        conversationId,
+        role: 'assistant',
+        content: announcement,
+      });
+
+      return {
+        type: 'image',
+        filename: file.originalname,
+        fileUrl: uploaded.secure_url,
+        mimeType: mediaType,
+        message: `Image attached. Ask anything about "${file.originalname}" and Claude will analyse it.`,
+      };
+    }
+
+    // ── Document path ────────────────────────────────────────────────────────
     const contentMarkdown = await this.extractionService.extract(
       file.buffer,
       file.mimetype,
@@ -133,6 +181,7 @@ export class ConversationsController {
     });
 
     return {
+      type: 'document',
       documentId: doc.id,
       filename: doc.filename,
       charCount: doc.charCount,
