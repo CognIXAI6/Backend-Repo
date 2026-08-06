@@ -17,6 +17,7 @@ import {
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ConversationService } from '@/modules/voice/services/conversation.service';
 import { DocumentExtractionService } from '@/modules/resources/document-extraction.service';
+import { WebCrawlService } from '@/modules/resources/web-crawl.service';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
 import { JwtAuthGuard, CurrentUser } from '@/common';
 
@@ -46,6 +47,7 @@ export class ConversationsController {
   constructor(
     private readonly conversationService: ConversationService,
     private readonly extractionService: DocumentExtractionService,
+    private readonly webCrawlService: WebCrawlService,
     private readonly uploadService: UploadService,
   ) {}
 
@@ -196,6 +198,56 @@ export class ConversationsController {
   ) {
     await this.conversationService.assertOwnership(conversationId, userId);
     return this.conversationService.listConversationDocuments(conversationId);
+  }
+
+  /**
+   * POST /conversations/:id/links
+   * Crawls a public URL and stores its text content as a conversation document.
+   * The extracted text is injected into every subsequent AI call, just like an
+   * uploaded document.  Returns a human-readable error when the page cannot be
+   * accessed (blocked, login-required, empty, invalid URL, etc.).
+   */
+  @Post(':id/links')
+  async attachLink(
+    @CurrentUser('id') userId: string,
+    @Param('id') conversationId: string,
+    @Body('url') url: string,
+  ) {
+    if (!url?.trim()) throw new BadRequestException('Please provide a URL.');
+    await this.conversationService.assertOwnership(conversationId, userId);
+
+    const crawled = await this.webCrawlService.extractUrl(url);
+
+    const filename = `${crawled.title} (${new URL(crawled.url).hostname})`;
+
+    const doc = await this.conversationService.saveConversationDocument({
+      conversationId,
+      userId,
+      filename,
+      mimeType: 'text/html',
+      fileUrl: crawled.url,
+      contentMarkdown: crawled.content,
+    });
+
+    const announcement =
+      `🔗 **[${crawled.title}](${crawled.url})** was attached to this conversation ` +
+      `(${doc.charCount.toLocaleString()} characters extracted).\n\n` +
+      `You can now ask questions about the content of that page.`;
+
+    await this.conversationService.saveMessage({
+      conversationId,
+      role: 'assistant',
+      content: announcement,
+    });
+
+    return {
+      type: 'link',
+      documentId: doc.id,
+      url: crawled.url,
+      title: crawled.title,
+      charCount: doc.charCount,
+      message: `Link attached. Ask anything about "${crawled.title}".`,
+    };
   }
 
   /**
