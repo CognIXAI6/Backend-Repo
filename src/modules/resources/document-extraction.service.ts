@@ -1,12 +1,14 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import * as mammoth from 'mammoth';
 
-// Import the internal implementation directly, NOT the package entry point.
-// The pdf-parse index.js runs test/debug code on first import that reads files
-// from disk — this throws in NestJS compiled environments and breaks every PDF
-// call with a misleading "corrupt or password-protected" message.
+// pdf-parse exports the parser function directly from its main entry point
+// (module.exports = Pdf).  Import via require() so we always get the callable
+// function regardless of TypeScript ESM/CJS interop mode.
+// Do NOT use a subpath (e.g. ./lib/pdf-parse.js) — newer versions of the
+// package restrict subpath access via the "exports" field in package.json,
+// which causes ERR_PACKAGE_PATH_NOT_EXPORTED at runtime on Node 18+.
 // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
-const pdfParse: (buf: Buffer) => Promise<{ text: string }> = require('pdf-parse/lib/pdf-parse.js');
+const pdfParse: (buf: Buffer) => Promise<{ text: string }> = require('pdf-parse');
 
 const SUPPORTED_MIME_TYPES = [
   'application/pdf',
