@@ -1,14 +1,6 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import * as mammoth from 'mammoth';
-
-// pdf-parse exports the parser function directly from its main entry point
-// (module.exports = Pdf).  Import via require() so we always get the callable
-// function regardless of TypeScript ESM/CJS interop mode.
-// Do NOT use a subpath (e.g. ./lib/pdf-parse.js) — newer versions of the
-// package restrict subpath access via the "exports" field in package.json,
-// which causes ERR_PACKAGE_PATH_NOT_EXPORTED at runtime on Node 18+.
-// eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
-const pdfParse: (buf: Buffer) => Promise<{ text: string }> = require('pdf-parse');
+import { PDFParse } from 'pdf-parse';
 
 const SUPPORTED_MIME_TYPES = [
   'application/pdf',
@@ -59,7 +51,8 @@ export class DocumentExtractionService {
   }
 
   private async extractPdf(buffer: Buffer): Promise<string> {
-    const result = await pdfParse(buffer);
+    const parser = new PDFParse({ data: buffer });
+    const result = await parser.getText();
     return result.text ?? '';
   }
 
