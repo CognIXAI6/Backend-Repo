@@ -626,7 +626,7 @@ export class ConversationService {
   }
 
   /**
-   * Returns all documents attached to a conversation, formatted as a single
+   * Returns all documents attached to a specific conversation, formatted as a
    * Markdown block ready to inject into the AI system prompt.
    * Returns null when no documents are attached.
    */
@@ -643,6 +643,55 @@ export class ConversationService {
         `=== ATTACHED DOCUMENT: ${d.filename} ===\n\n${d.content_markdown}\n\n=== END OF DOCUMENT ===`,
       )
       .join('\n\n');
+  }
+
+  /**
+   * Unified document context for AI injection.
+   *
+   * Combines two sources:
+   *   1. Documents attached directly to this conversation (chat attachment upload)
+   *   2. Field-level resources uploaded via the Resources tab that have extracted
+   *      text content — up to the 5 most recently added ones for the conversation's
+   *      professional field.
+   *
+   * This fixes the disconnect where a resource uploaded via the Resources tab was
+   * acknowledged in chat but invisible to the AI because it lived in a separate table.
+   */
+  async getFullDocumentContext(conversationId: string, userId: string): Promise<string | null> {
+    // ── 1. Conversation-specific attachments ─────────────────────────────────
+    const convDocs = await this.knex('conversation_documents')
+      .where('conversation_id', conversationId)
+      .orderBy('created_at', 'asc')
+      .select('filename', 'content_markdown');
+
+    // ── 2. Field resources (Resources-tab uploads) ────────────────────────────
+    // Look up the field that this conversation belongs to so we only pull
+    // resources from the matching professional context.
+    const conv = await this.knex('conversations')
+      .where('id', conversationId)
+      .first('field_id');
+
+    const fieldResources: { title: string; extracted_content: string }[] = conv?.field_id
+      ? await this.knex('resources')
+          .where('user_id', userId)
+          .where('field_id', conv.field_id)
+          .whereNotNull('extracted_content')
+          .whereRaw("extracted_content <> ''")
+          .orderBy('created_at', 'desc')
+          .limit(5)
+          .select('title', 'extracted_content')
+      : [];
+
+    const parts: string[] = [
+      ...convDocs.map((d: { filename: string; content_markdown: string }) =>
+        `=== ATTACHED DOCUMENT: ${d.filename} ===\n\n${d.content_markdown}\n\n=== END OF DOCUMENT ===`,
+      ),
+      ...fieldResources.map((r) =>
+        `=== FIELD RESOURCE: ${r.title} ===\n\n${r.extracted_content}\n\n=== END OF RESOURCE ===`,
+      ),
+    ];
+
+    return parts.length > 0 ? parts.join('\n\n') : null;
   }
 
   async listConversationDocuments(conversationId: string): Promise<{ id: string; filename: string; mimeType: string; charCount: number; createdAt: Date }[]> {

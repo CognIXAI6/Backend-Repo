@@ -1694,7 +1694,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         `Latest exchange:\n${latestExchange}\n\n` +
         `Give the owner a brief, useful insight.${uncertainty}`;
 
-      const msDocContext = await this.conversationService.getConversationDocumentContext(session.conversationId).catch(() => null);
+      const msDocContext = await this.conversationService.getFullDocumentContext(session.conversationId, session.userId).catch(() => null);
       const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
@@ -1806,7 +1806,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         ? `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`
         : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${otherPersonText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
 
-      const dsDocContext = await this.conversationService.getConversationDocumentContext(session.conversationId).catch(() => null);
+      const dsDocContext = await this.conversationService.getFullDocumentContext(session.conversationId, session.userId).catch(() => null);
       const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
@@ -1959,11 +1959,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       client.emit('ai:start');
       aiStarted = true;
 
-      // Load any documents attached to this conversation for system prompt injection.
+      // Load document context: conversation attachments + field resources (Resources tab).
       const documentContext = await this.conversationService
-        .getConversationDocumentContext(session.conversationId)
+        .getFullDocumentContext(session.conversationId, session.userId)
         .catch((err) => {
-          this.logger.warn(`Failed to load conversation documents: ${err.message}`);
+          this.logger.warn(`Failed to load document context: ${err.message}`);
           return null;
         });
 
