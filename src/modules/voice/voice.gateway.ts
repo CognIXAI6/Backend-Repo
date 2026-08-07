@@ -1973,14 +1973,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         documentContext,
       );
 
-      // Load unsent images (include-once vision strategy).
-      // These are passed directly to the Claude API as image content blocks in
-      // this call only; they are marked sent immediately after.
-      const unsentDbImages = await this.conversationService
-        .getUnsentConversationImages(session.conversationId)
+      // Load all images attached to this conversation — passed as image content
+      // blocks on every AI call so the AI can still answer questions about an
+      // image several messages after it was uploaded.
+      const conversationImages = await this.conversationService
+        .getConversationImagesForAI(session.conversationId)
         .catch(() => [] as DbConversationImage[]);
 
-      const visionImages: ClaudeConversationImage[] = unsentDbImages.map((img) => ({
+      const visionImages: ClaudeConversationImage[] = conversationImages.map((img) => ({
         mimeType: img.mime_type as ClaudeConversationImage['mimeType'],
         imageBase64: img.image_base64,
         filename: img.filename,
@@ -2015,13 +2015,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           },
 
           onDone: async (fullText: string, inputTokens: number, outputTokens: number) => {
-            // Mark images as sent immediately so they are never included again.
-            if (visionImages.length > 0) {
-              this.conversationService.markConversationImagesSent(session.conversationId).catch((err) =>
-                this.logger.warn(`[${client.id}] Failed to mark images as sent: ${(err as Error).message}`),
-              );
-            }
-
             // Safety net: if Claude returned nothing (rare but possible with very garbled
             // or ambiguous input), synthesise a clarification response so the user is
             // never left staring at a blank screen. Emit it as a token first so the
@@ -2148,7 +2141,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           // so documents are always research-enriched regardless of input type.
           enableWebSearch: inputType === 'text' || isDocumentRequest,
           enableDocumentGeneration: isDocumentRequest,
-          // Include any unsent images on this call only (include-once strategy).
+          // Include every image attached to this conversation on every call.
           images: visionImages.length > 0 ? visionImages : undefined,
         },
       );

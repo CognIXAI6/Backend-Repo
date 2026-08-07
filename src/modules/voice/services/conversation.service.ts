@@ -748,9 +748,9 @@ export class ConversationService {
       .orderBy('created_at', 'asc');
   }
 
-  // ─── Conversation images (Claude Vision — include-once) ───────────────────
+  // ─── Conversation images (Claude Vision) ───────────────────────────────────
 
-  /** Saves an uploaded image for vision injection on the next AI call. */
+  /** Saves an uploaded image for vision injection on every subsequent AI call. */
   async saveConversationImage(dto: SaveConversationImageDto): Promise<ConversationImage> {
     const [row] = await this.knex('conversation_images')
       .insert({
@@ -767,25 +767,13 @@ export class ConversationService {
   }
 
   /**
-   * Returns all unsent images for a conversation (sent_to_ai = false).
-   * Called before every AI invocation so images are included exactly once.
+   * Returns all images attached to a conversation, so they stay in context for
+   * the lifetime of the conversation — the same treatment as attached documents.
    */
-  async getUnsentConversationImages(conversationId: string): Promise<ConversationImage[]> {
+  async getConversationImagesForAI(conversationId: string): Promise<ConversationImage[]> {
     return this.knex('conversation_images')
       .where('conversation_id', conversationId)
-      .where('sent_to_ai', false)
       .orderBy('created_at', 'asc');
-  }
-
-  /**
-   * Marks all unsent images for a conversation as sent.
-   * Called immediately after the AI call that included them.
-   */
-  async markConversationImagesSent(conversationId: string): Promise<void> {
-    await this.knex('conversation_images')
-      .where('conversation_id', conversationId)
-      .where('sent_to_ai', false)
-      .update({ sent_to_ai: true, updated_at: new Date() });
   }
 
   /** Lists all images ever attached to a conversation (for display purposes). */

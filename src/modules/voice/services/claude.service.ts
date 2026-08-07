@@ -150,7 +150,7 @@ export class ClaudeService implements OnModuleInit {
       enableWebSearch?: boolean;
       enableDocumentGeneration?: boolean;
       maxTokens?: number;
-      /** Images to include in this call only (include-once vision strategy). */
+      /** Images attached to the conversation, included on every call. */
       images?: ConversationImage[];
     } = {},
   ): Promise<void> {
@@ -170,8 +170,6 @@ export class ClaudeService implements OnModuleInit {
 
     // Build the user message content.  If images are provided, prepend each as
     // an image block so Claude Vision can analyse them before reading the text.
-    // Images are only attached to this single call (include-once strategy) —
-    // the caller is responsible for marking them as sent afterward.
     const userContent: Anthropic.ContentBlockParam[] = [];
     if (options.images?.length) {
       for (const img of options.images) {

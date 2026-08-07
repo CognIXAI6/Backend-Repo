@@ -97,8 +97,8 @@ export class ConversationsController {
    * POST /conversations/:id/documents
    * Unified file attachment endpoint — handles both documents and images.
    * If the uploaded file is an image (JPEG, PNG, GIF, WebP) it is stored for
-   * Claude Vision (include-once). Otherwise text is extracted and injected into
-   * every subsequent AI call.
+   * Claude Vision on every subsequent AI call. Otherwise text is extracted and
+   * injected into every subsequent AI call.
    */
   @Post(':id/documents')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: CONVERSATION_DOC_SIZE_LIMIT } }))
@@ -254,10 +254,9 @@ export class ConversationsController {
    * POST /conversations/:id/images
    * Upload a JPEG, PNG, GIF, or WebP image.
    *
-   * The image is stored as base64 and sent to Claude Vision on the FIRST AI
-   * call after upload (include-once strategy).  Subsequent messages in the
-   * same conversation do not re-pay the vision token cost, but Claude's reply
-   * carries the context forward naturally.
+   * The image is stored as base64 and sent to Claude Vision on every AI call
+   * for the remainder of the conversation, so later questions about the image
+   * still have it in context.
    */
   @Post(':id/images')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: CONVERSATION_IMG_SIZE_LIMIT } }))
