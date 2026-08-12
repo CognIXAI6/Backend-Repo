@@ -132,8 +132,8 @@ export class ResourcesService {
         );
       }
 
-      const conversationIds = await trx('resource_conversations').where('resource_id', resource.id).pluck('conversation_id');
-      return this.formatResource(resource, conversationIds);
+      const conversationsByResource = await this.loadConversationsForResources([resource.id], trx);
+      return this.formatResource(resource, conversationsByResource[resource.id] ?? []);
     });
   }
 
@@ -163,10 +163,10 @@ export class ResourcesService {
       .limit(limit)
       .offset(offset);
 
-    const conversationIdsByResource = await this.loadConversationIdsForResources(resources.map((r) => r.id));
+    const conversationsByResource = await this.loadConversationsForResources(resources.map((r) => r.id));
 
     return {
-      data: resources.map((r) => this.formatResource(r, conversationIdsByResource[r.id] ?? [])),
+      data: resources.map((r) => this.formatResource(r, conversationsByResource[r.id] ?? [])),
       pagination: {
         page,
         limit,
@@ -185,8 +185,8 @@ export class ResourcesService {
 
     if (!resource) throw new NotFoundException('Resource not found');
 
-    const conversationIds = await this.knex('resource_conversations').where('resource_id', resourceId).pluck('conversation_id');
-    return this.formatResource(resource, conversationIds);
+    const conversationsByResource = await this.loadConversationsForResources([resourceId]);
+    return this.formatResource(resource, conversationsByResource[resourceId] ?? []);
   }
 
   // ── Update ──────────────────────────────────────────────────────────────────
@@ -223,8 +223,8 @@ export class ResourcesService {
         }
       }
 
-      const conversationIds = await trx('resource_conversations').where('resource_id', resourceId).pluck('conversation_id');
-      return this.formatResource(updated, conversationIds);
+      const conversationsByResource = await this.loadConversationsForResources([resourceId], trx);
+      return this.formatResource(updated, conversationsByResource[resourceId] ?? []);
     });
   }
 
@@ -271,10 +271,10 @@ export class ResourcesService {
       .limit(limit)
       .offset(offset);
 
-    const conversationIdsByResource = await this.loadConversationIdsForResources(resources.map((r) => r.id));
+    const conversationsByResource = await this.loadConversationsForResources(resources.map((r) => r.id));
 
     return {
-      data: resources.map((r) => this.formatResource(r, conversationIdsByResource[r.id] ?? [])),
+      data: resources.map((r) => this.formatResource(r, conversationsByResource[r.id] ?? [])),
       pagination: { page, limit, total: Number(count), totalPages: Math.ceil(Number(count) / limit) },
     };
   }
@@ -290,9 +290,9 @@ export class ResourcesService {
       .orderBy('resource_conversations.created_at', 'asc')
       .select('resources.*');
 
-    const conversationIdsByResource = await this.loadConversationIdsForResources(resources.map((r) => r.id));
+    const conversationsByResource = await this.loadConversationsForResources(resources.map((r) => r.id));
 
-    return resources.map((r) => this.formatResource(r, conversationIdsByResource[r.id] ?? []));
+    return resources.map((r) => this.formatResource(r, conversationsByResource[r.id] ?? []));
   }
 
   // ── Stats ───────────────────────────────────────────────────────────────────
@@ -374,14 +374,21 @@ export class ResourcesService {
     }
   }
 
-  /** Batch-loads tagged conversation IDs for a list of resource IDs, keyed by resource_id. */
-  private async loadConversationIdsForResources(ids: string[]): Promise<Record<string, string[]>> {
+  /** Batch-loads tagged conversations (id + title) for a list of resource IDs, keyed by resource_id. */
+  private async loadConversationsForResources(
+    ids: string[],
+    trx: Knex.Transaction | Knex = this.knex,
+  ): Promise<Record<string, { id: string; title: string | null }[]>> {
     if (!ids.length) return {};
-    const rows = await this.knex('resource_conversations').whereIn('resource_id', ids);
+    const rows = await trx('resource_conversations')
+      .join('conversations', 'resource_conversations.conversation_id', 'conversations.id')
+      .whereIn('resource_conversations.resource_id', ids)
+      .select('resource_conversations.resource_id', 'conversations.id', 'conversations.title');
+
     return rows.reduce((acc, row) => {
-      (acc[row.resource_id] ??= []).push(row.conversation_id);
+      (acc[row.resource_id] ??= []).push({ id: row.id, title: row.title });
       return acc;
-    }, {} as Record<string, string[]>);
+    }, {} as Record<string, { id: string; title: string | null }[]>);
   }
 
   /**
@@ -418,7 +425,7 @@ export class ResourcesService {
     }
   }
 
-  private formatResource(resource: any, conversationIds: string[]) {
+  private formatResource(resource: any, conversations: { id: string; title: string | null }[]) {
     return {
       id: resource.id,
       type: resource.type,
@@ -431,7 +438,7 @@ export class ResourcesService {
       mimeType: resource.mime_type,
       externalUrl: resource.external_url,
       isProcessed: resource.is_processed,
-      conversationIds,
+      conversations,
       createdAt: resource.created_at,
       updatedAt: resource.updated_at,
     };
