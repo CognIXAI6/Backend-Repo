@@ -53,8 +53,8 @@ export class CreateResourceDto {
   })
   @IsOptional()
   @IsArray()
-  @IsString({ each: true })
-  tags?: string[];
+  @IsUUID('4', { each: true })
+  conversationIds?: string[];
 }
 
 export class UpdateResourceDto {
@@ -73,8 +73,8 @@ export class UpdateResourceDto {
 
   @IsOptional()
   @IsArray()
-  @IsString({ each: true })
-  tags?: string[];
+  @IsUUID('4', { each: true })
+  conversationIds?: string[];
 }
 
 export class ResourceQueryDto {
@@ -89,10 +89,6 @@ export class ResourceQueryDto {
   @IsOptional()
   @IsString()
   search?: string;
-
-  @IsOptional()
-  @IsString()
-  tag?: string;
 
   @IsOptional()
   @Type(() => Number)

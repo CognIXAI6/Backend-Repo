@@ -648,11 +648,13 @@ export class ConversationService {
   /**
    * Unified document context for AI injection.
    *
-   * Combines two sources:
+   * Combines three sources:
    *   1. Documents attached directly to this conversation (chat attachment upload)
-   *   2. Field-level resources uploaded via the Resources tab that have extracted
-   *      text content — up to the 5 most recently added ones for the conversation's
-   *      professional field.
+   *   2. Resources explicitly tagged to this conversation from the Resources tab
+   *      ("Create Resource" with conversationIds).
+   *   3. Field-level resources with extracted text content — up to the 5 most
+   *      recently added ones for the conversation's professional field, excluding
+   *      anything already covered by (2) so it isn't duplicated.
    *
    * This fixes the disconnect where a resource uploaded via the Resources tab was
    * acknowledged in chat but invisible to the AI because it lived in a separate table.
@@ -664,7 +666,18 @@ export class ConversationService {
       .orderBy('created_at', 'asc')
       .select('filename', 'content_markdown');
 
-    // ── 2. Field resources (Resources-tab uploads) ────────────────────────────
+    // ── 2. Resources explicitly tagged to this conversation ──────────────────
+    const taggedResources: { id: string; title: string; extracted_content: string }[] = await this.knex('resources')
+      .join('resource_conversations', 'resources.id', 'resource_conversations.resource_id')
+      .where('resource_conversations.conversation_id', conversationId)
+      .whereNotNull('resources.extracted_content')
+      .whereRaw("resources.extracted_content <> ''")
+      .orderBy('resource_conversations.created_at', 'asc')
+      .select('resources.id', 'resources.title', 'resources.extracted_content');
+
+    const taggedResourceIds = taggedResources.map((r) => r.id);
+
+    // ── 3. Field resources (Resources-tab uploads, matched by professional field) ──
     // Look up the field that this conversation belongs to so we only pull
     // resources from the matching professional context.
     const conv = await this.knex('conversations')
@@ -677,6 +690,9 @@ export class ConversationService {
           .where('field_id', conv.field_id)
           .whereNotNull('extracted_content')
           .whereRaw("extracted_content <> ''")
+          .modify((qb) => {
+            if (taggedResourceIds.length) qb.whereNotIn('id', taggedResourceIds);
+          })
           .orderBy('created_at', 'desc')
           .limit(5)
           .select('title', 'extracted_content')
@@ -685,6 +701,9 @@ export class ConversationService {
     const parts: string[] = [
       ...convDocs.map((d: { filename: string; content_markdown: string }) =>
         `=== ATTACHED DOCUMENT: ${d.filename} ===\n\n${d.content_markdown}\n\n=== END OF DOCUMENT ===`,
+      ),
+      ...taggedResources.map((r) =>
+        `=== TAGGED RESOURCE: ${r.title} ===\n\n${r.extracted_content}\n\n=== END OF RESOURCE ===`,
       ),
       ...fieldResources.map((r) =>
         `=== FIELD RESOURCE: ${r.title} ===\n\n${r.extracted_content}\n\n=== END OF RESOURCE ===`,

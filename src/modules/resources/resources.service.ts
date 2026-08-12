@@ -102,6 +102,10 @@ export class ResourcesService {
         mimeType = file.mimetype;
       }
 
+      if (dto.conversationIds?.length) {
+        await this.assertConversationsOwnedByUser(userId, dto.conversationIds, trx);
+      }
+
       const [resource] = await trx('resources')
         .insert({
           user_id: userId,
@@ -118,14 +122,14 @@ export class ResourcesService {
         })
         .returning('*');
 
-      if (dto.tags && dto.tags.length > 0) {
-        await trx('resource_tags').insert(
-          dto.tags.map((tag) => ({ resource_id: resource.id, tag: tag.toLowerCase().trim() })),
+      if (dto.conversationIds?.length) {
+        await trx('resource_conversations').insert(
+          dto.conversationIds.map((conversationId) => ({ resource_id: resource.id, conversation_id: conversationId })),
         );
       }
 
-      const tags = await trx('resource_tags').where('resource_id', resource.id).pluck('tag');
-      return this.formatResource(resource, tags);
+      const conversationIds = await trx('resource_conversations').where('resource_id', resource.id).pluck('conversation_id');
+      return this.formatResource(resource, conversationIds);
     });
   }
 
@@ -146,12 +150,6 @@ export class ResourcesService {
           .orWhereILike('resources.description', `%${query.search}%`);
       });
     }
-    if (query.tag) {
-      baseQuery
-        .join('resource_tags', 'resources.id', 'resource_tags.resource_id')
-        .where('resource_tags.tag', query.tag.toLowerCase());
-    }
-
     const [{ count }] = await baseQuery.clone().clearSelect().clearOrder().countDistinct('resources.id as count');
 
     const resources = await baseQuery
@@ -161,10 +159,10 @@ export class ResourcesService {
       .limit(limit)
       .offset(offset);
 
-    const tagsByResource = await this.loadTagsForResources(resources.map((r) => r.id));
+    const conversationIdsByResource = await this.loadConversationIdsForResources(resources.map((r) => r.id));
 
     return {
-      data: resources.map((r) => this.formatResource(r, tagsByResource[r.id] ?? [])),
+      data: resources.map((r) => this.formatResource(r, conversationIdsByResource[r.id] ?? [])),
       pagination: {
         page,
         limit,
@@ -183,8 +181,8 @@ export class ResourcesService {
 
     if (!resource) throw new NotFoundException('Resource not found');
 
-    const tags = await this.knex('resource_tags').where('resource_id', resourceId).pluck('tag');
-    return this.formatResource(resource, tags);
+    const conversationIds = await this.knex('resource_conversations').where('resource_id', resourceId).pluck('conversation_id');
+    return this.formatResource(resource, conversationIds);
   }
 
   // ── Update ──────────────────────────────────────────────────────────────────
@@ -196,6 +194,10 @@ export class ResourcesService {
 
     if (!resource) throw new NotFoundException('Resource not found');
 
+    if (dto.conversationIds?.length) {
+      await this.assertConversationsOwnedByUser(userId, dto.conversationIds);
+    }
+
     return this.knex.transaction(async (trx) => {
       const updateData: Record<string, unknown> = { updated_at: new Date() };
       if (dto.title !== undefined) updateData.title = dto.title;
@@ -204,17 +206,17 @@ export class ResourcesService {
 
       const [updated] = await trx('resources').where('id', resourceId).update(updateData).returning('*');
 
-      if (dto.tags !== undefined) {
-        await trx('resource_tags').where('resource_id', resourceId).delete();
-        if (dto.tags.length > 0) {
-          await trx('resource_tags').insert(
-            dto.tags.map((tag) => ({ resource_id: resourceId, tag: tag.toLowerCase().trim() })),
+      if (dto.conversationIds !== undefined) {
+        await trx('resource_conversations').where('resource_id', resourceId).delete();
+        if (dto.conversationIds.length > 0) {
+          await trx('resource_conversations').insert(
+            dto.conversationIds.map((conversationId) => ({ resource_id: resourceId, conversation_id: conversationId })),
           );
         }
       }
 
-      const tags = await trx('resource_tags').where('resource_id', resourceId).pluck('tag');
-      return this.formatResource(updated, tags);
+      const conversationIds = await trx('resource_conversations').where('resource_id', resourceId).pluck('conversation_id');
+      return this.formatResource(updated, conversationIds);
     });
   }
 
@@ -261,12 +263,28 @@ export class ResourcesService {
       .limit(limit)
       .offset(offset);
 
-    const tagsByResource = await this.loadTagsForResources(resources.map((r) => r.id));
+    const conversationIdsByResource = await this.loadConversationIdsForResources(resources.map((r) => r.id));
 
     return {
-      data: resources.map((r) => this.formatResource(r, tagsByResource[r.id] ?? [])),
+      data: resources.map((r) => this.formatResource(r, conversationIdsByResource[r.id] ?? [])),
       pagination: { page, limit, total: Number(count), totalPages: Math.ceil(Number(count) / limit) },
     };
+  }
+
+  // ── By conversation ─────────────────────────────────────────────────────────
+
+  /** Returns all resources tagged to a specific conversation. */
+  async getResourcesForConversation(userId: string, conversationId: string) {
+    const resources = await this.knex('resources')
+      .join('resource_conversations', 'resources.id', 'resource_conversations.resource_id')
+      .where('resource_conversations.conversation_id', conversationId)
+      .where('resources.user_id', userId)
+      .orderBy('resource_conversations.created_at', 'asc')
+      .select('resources.*');
+
+    const conversationIdsByResource = await this.loadConversationIdsForResources(resources.map((r) => r.id));
+
+    return resources.map((r) => this.formatResource(r, conversationIdsByResource[r.id] ?? []));
   }
 
   // ── Stats ───────────────────────────────────────────────────────────────────
@@ -284,20 +302,6 @@ export class ResourcesService {
       total: Number(total?.count ?? 0),
       byType: stats.reduce((acc, s) => { acc[s.type] = Number(s.count); return acc; }, {} as Record<string, number>),
     };
-  }
-
-  // ── Tags ────────────────────────────────────────────────────────────────────
-
-  async getAllTags(userId: string) {
-    const tags = await this.knex('resource_tags')
-      .select('resource_tags.tag')
-      .count('resource_tags.id as count')
-      .join('resources', 'resource_tags.resource_id', 'resources.id')
-      .where('resources.user_id', userId)
-      .groupBy('resource_tags.tag')
-      .orderBy('count', 'desc');
-
-    return tags.map((t) => ({ tag: t.tag, count: Number(t.count) }));
   }
 
   // ── RAG ─────────────────────────────────────────────────────────────────────
@@ -362,17 +366,40 @@ export class ResourcesService {
     }
   }
 
-  /** Batch-loads tags for a list of resource IDs, keyed by resource_id. */
-  private async loadTagsForResources(ids: string[]): Promise<Record<string, string[]>> {
+  /** Batch-loads tagged conversation IDs for a list of resource IDs, keyed by resource_id. */
+  private async loadConversationIdsForResources(ids: string[]): Promise<Record<string, string[]>> {
     if (!ids.length) return {};
-    const rows = await this.knex('resource_tags').whereIn('resource_id', ids);
+    const rows = await this.knex('resource_conversations').whereIn('resource_id', ids);
     return rows.reduce((acc, row) => {
-      (acc[row.resource_id] ??= []).push(row.tag);
+      (acc[row.resource_id] ??= []).push(row.conversation_id);
       return acc;
     }, {} as Record<string, string[]>);
   }
 
-  private formatResource(resource: any, tags: string[]) {
+  /**
+   * Verifies every conversationId belongs to the requesting user before it can
+   * be tagged to a resource. Throws BadRequestException listing anything that
+   * doesn't resolve, so a typo'd or foreign conversationId fails loudly.
+   */
+  private async assertConversationsOwnedByUser(
+    userId: string,
+    conversationIds: string[],
+    trx: Knex.Transaction | Knex = this.knex,
+  ): Promise<void> {
+    const uniqueIds = [...new Set(conversationIds)];
+    const owned = await trx('conversations')
+      .whereIn('id', uniqueIds)
+      .where('user_id', userId)
+      .whereNull('deleted_at')
+      .pluck('id');
+
+    const missing = uniqueIds.filter((id) => !owned.includes(id));
+    if (missing.length > 0) {
+      throw new BadRequestException(`Conversation(s) not found or not owned by user: ${missing.join(', ')}`);
+    }
+  }
+
+  private formatResource(resource: any, conversationIds: string[]) {
     return {
       id: resource.id,
       type: resource.type,
@@ -385,7 +412,7 @@ export class ResourcesService {
       mimeType: resource.mime_type,
       externalUrl: resource.external_url,
       isProcessed: resource.is_processed,
-      tags,
+      conversationIds,
       createdAt: resource.created_at,
       updatedAt: resource.updated_at,
     };

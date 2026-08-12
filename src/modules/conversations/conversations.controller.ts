@@ -18,6 +18,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { ConversationService } from '@/modules/voice/services/conversation.service';
 import { DocumentExtractionService } from '@/modules/resources/document-extraction.service';
 import { WebCrawlService } from '@/modules/resources/web-crawl.service';
+import { ResourcesService } from '@/modules/resources/resources.service';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
 import { JwtAuthGuard, CurrentUser } from '@/common';
 
@@ -49,6 +50,7 @@ export class ConversationsController {
     private readonly extractionService: DocumentExtractionService,
     private readonly webCrawlService: WebCrawlService,
     private readonly uploadService: UploadService,
+    private readonly resourcesService: ResourcesService,
   ) {}
 
   /**
@@ -82,6 +84,19 @@ export class ConversationsController {
     @Param('id') conversationId: string,
   ) {
     return this.conversationService.getConversationMessages(conversationId, userId);
+  }
+
+  /**
+   * GET /conversations/:id/resources
+   * Lists resources (documents, textbooks, links, etc.) tagged to this conversation.
+   */
+  @Get(':id/resources')
+  async getResources(
+    @CurrentUser('id') userId: string,
+    @Param('id') conversationId: string,
+  ) {
+    await this.conversationService.assertOwnership(conversationId, userId);
+    return this.resourcesService.getResourcesForConversation(userId, conversationId);
   }
 
   @Patch(':id')

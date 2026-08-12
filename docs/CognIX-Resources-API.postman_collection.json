@@ -29,6 +29,12 @@
       "value": "",
       "type": "string",
       "description": "UUID of the field to scope resources to. Optional on most requests."
+    },
+    {
+      "key": "conversation_id",
+      "value": "",
+      "type": "string",
+      "description": "UUID of a conversation to tag resources to, or to list tagged resources for."
     }
   ],
   "item": [
@@ -87,10 +93,10 @@
               "description": "Optional. UUID of the field to attach this resource to."
             },
             {
-              "key": "tags",
-              "value": "[\"physics\",\"week3\"]",
+              "key": "conversationIds",
+              "value": "[\"{{conversation_id}}\"]",
               "type": "text",
-              "description": "Optional. JSON array string."
+              "description": "Optional. JSON array string of conversation UUIDs to tag this resource to — it will then appear under each of those conversations and feed into the AI's context there."
             },
             {
               "key": "file",
@@ -105,7 +111,7 @@
           "host": ["{{base_url}}"],
           "path": ["api", "v1", "resources"]
         },
-        "description": "Uploads a file and creates a new resource record.\n\nThe `file` field must be included for all types except `link`. File is validated against a MIME-type whitelist before upload.\n\n**Accepted MIME types by resource type:**\n- `document`: application/pdf, application/msword, .docx, .xlsx, .pptx, text/plain, text/csv\n- `textbook`: application/pdf, application/msword, .docx, text/plain\n- `image`: image/jpeg, image/png, image/gif, image/webp, image/svg+xml\n- `audio`: audio/mpeg, audio/wav, audio/ogg, audio/mp4, audio/aac, audio/flac\n- `video`: video/mp4, video/mpeg, video/webm, video/quicktime, video/x-msvideo\n- `link`: no file — use `externalUrl` instead\n\n**Max file size:** 50 MB"
+        "description": "Uploads a file and creates a new resource record.\n\nThe `file` field must be included for all types except `link`. File is validated against a MIME-type whitelist before upload.\n\n**Accepted MIME types by resource type:**\n- `document`: application/pdf, application/msword, .docx, .xlsx, .pptx, text/plain, text/csv\n- `textbook`: application/pdf, application/msword, .docx, text/plain\n- `image`: image/jpeg, image/png, image/gif, image/webp, image/svg+xml\n- `audio`: audio/mpeg, audio/wav, audio/ogg, audio/mp4, audio/aac, audio/flac\n- `video`: video/mp4, video/mpeg, video/webm, video/quicktime, video/x-msvideo\n- `link`: no file — use `externalUrl` instead\n\n**Max file size:** 50 MB\n\n`conversationIds` must belong to the authenticated user — a 400 is returned listing any that don't resolve."
       },
       "response": [
         {
@@ -119,7 +125,7 @@
                 { "key": "type", "value": "document", "type": "text" },
                 { "key": "title", "value": "Lecture Notes Week 3", "type": "text" },
                 { "key": "description", "value": "Covers chapters 5–7", "type": "text" },
-                { "key": "tags", "value": "[\"physics\",\"week3\"]", "type": "text" },
+                { "key": "conversationIds", "value": "[\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"]", "type": "text" },
                 { "key": "file", "type": "file", "src": [] }
               ]
             },
@@ -132,7 +138,7 @@
           "status": "Created",
           "code": 201,
           "header": [{ "key": "Content-Type", "value": "application/json" }],
-          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3\",\n  \"description\": \"Covers chapters 5\\u20137\",\n  \"fieldId\": null,\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"tags\": [\"physics\", \"week3\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n}"
+          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3\",\n  \"description\": \"Covers chapters 5\\u20137\",\n  \"fieldId\": null,\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"conversationIds\": [\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n}"
         },
         {
           "name": "400 Bad Request — File too large",
@@ -193,7 +199,7 @@
             { "key": "title", "value": "Khan Academy — Kinematics", "type": "text" },
             { "key": "externalUrl", "value": "https://www.khanacademy.org/science/physics/one-dimensional-motion", "type": "text", "description": "Required for type=link. Must be a valid URL." },
             { "key": "fieldId", "value": "{{field_id}}", "type": "text", "description": "Optional." },
-            { "key": "tags", "value": "[\"physics\",\"external\"]", "type": "text", "description": "Optional." }
+            { "key": "conversationIds", "value": "[\"{{conversation_id}}\"]", "type": "text", "description": "Optional. JSON array string of conversation UUIDs to tag this resource to." }
           ]
         },
         "url": {
@@ -222,7 +228,7 @@
           "status": "Created",
           "code": 201,
           "header": [{ "key": "Content-Type", "value": "application/json" }],
-          "body": "{\n  \"id\": \"b2c3d4e5-f6a7-8901-bcde-f12345678901\",\n  \"type\": \"link\",\n  \"title\": \"Khan Academy \\u2014 Kinematics\",\n  \"description\": null,\n  \"fieldId\": null,\n  \"fileUrl\": null,\n  \"fileName\": null,\n  \"fileSize\": null,\n  \"mimeType\": null,\n  \"externalUrl\": \"https://www.khanacademy.org/science/physics/one-dimensional-motion\",\n  \"isProcessed\": false,\n  \"tags\": [\"physics\", \"external\"],\n  \"createdAt\": \"2026-05-11T10:05:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:05:00.000Z\"\n}"
+          "body": "{\n  \"id\": \"b2c3d4e5-f6a7-8901-bcde-f12345678901\",\n  \"type\": \"link\",\n  \"title\": \"Khan Academy \\u2014 Kinematics\",\n  \"description\": null,\n  \"fieldId\": null,\n  \"fileUrl\": null,\n  \"fileName\": null,\n  \"fileSize\": null,\n  \"mimeType\": null,\n  \"externalUrl\": \"https://www.khanacademy.org/science/physics/one-dimensional-motion\",\n  \"isProcessed\": false,\n  \"conversationIds\": [],\n  \"createdAt\": \"2026-05-11T10:05:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:05:00.000Z\"\n}"
         },
         {
           "name": "400 Bad Request — externalUrl missing",
@@ -269,8 +275,7 @@
             { "key": "limit", "value": "10", "description": "Items per page. Min: 1, Max: 100. Default: 10." },
             { "key": "type", "value": "document", "description": "Filter by type: document | textbook | image | audio | video | link", "disabled": true },
             { "key": "fieldId", "value": "{{field_id}}", "description": "Filter by field UUID.", "disabled": true },
-            { "key": "search", "value": "lecture", "description": "Case-insensitive search on title and description.", "disabled": true },
-            { "key": "tag", "value": "physics", "description": "Filter by a single tag (exact match, case-insensitive).", "disabled": true }
+            { "key": "search", "value": "lecture", "description": "Case-insensitive search on title and description.", "disabled": true }
           ]
         },
         "description": "Returns a paginated list of the authenticated user's resources.\n\nAll query parameters are optional. `page` and `limit` default to `1` and `10` respectively. `limit` is capped at 100."
@@ -286,7 +291,7 @@
           "status": "OK",
           "code": 200,
           "header": [{ "key": "Content-Type", "value": "application/json" }],
-          "body": "{\n  \"data\": [\n    {\n      \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n      \"type\": \"document\",\n      \"title\": \"Lecture Notes Week 3\",\n      \"description\": \"Covers chapters 5\\u20137\",\n      \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n      \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n      \"fileName\": \"lecture-notes.pdf\",\n      \"fileSize\": 204800,\n      \"mimeType\": \"application/pdf\",\n      \"externalUrl\": null,\n      \"isProcessed\": false,\n      \"tags\": [\"physics\", \"week3\"],\n      \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n      \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 10,\n    \"total\": 47,\n    \"totalPages\": 5\n  }\n}"
+          "body": "{\n  \"data\": [\n    {\n      \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n      \"type\": \"document\",\n      \"title\": \"Lecture Notes Week 3\",\n      \"description\": \"Covers chapters 5\\u20137\",\n      \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n      \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n      \"fileName\": \"lecture-notes.pdf\",\n      \"fileSize\": 204800,\n      \"mimeType\": \"application/pdf\",\n      \"externalUrl\": null,\n      \"isProcessed\": false,\n      \"conversationIds\": [\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"],\n      \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n      \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 10,\n    \"total\": 47,\n    \"totalPages\": 5\n  }\n}"
         }
       ]
     },
@@ -328,7 +333,7 @@
           "status": "OK",
           "code": 200,
           "header": [{ "key": "Content-Type", "value": "application/json" }],
-          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3\",\n  \"description\": \"Covers chapters 5\\u20137\",\n  \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"tags\": [\"physics\", \"week3\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n}"
+          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3\",\n  \"description\": \"Covers chapters 5\\u20137\",\n  \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"conversationIds\": [\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n}"
         },
         {
           "name": "404 Not Found",
@@ -354,7 +359,7 @@
               "pm.test('Status 200', () => pm.expect(pm.response.code).to.equal(200));",
               "const body = pm.response.json();",
               "pm.test('Title updated', () => pm.expect(body.title).to.equal('Lecture Notes Week 3 (Revised)'));",
-              "pm.test('Tags updated', () => pm.expect(body.tags).to.include('revised'));"
+              "pm.test('ConversationIds updated', () => pm.expect(body.conversationIds).to.include(pm.collectionVariables.get('conversation_id')));"
             ],
             "type": "text/javascript"
           }
@@ -368,7 +373,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"description\": \"Updated with exam tips\",\n  \"fieldId\": \"{{field_id}}\",\n  \"tags\": [\"physics\", \"week3\", \"revised\"]\n}",
+          "raw": "{\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"description\": \"Updated with exam tips\",\n  \"fieldId\": \"{{field_id}}\",\n  \"conversationIds\": [\"{{conversation_id}}\"]\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -376,7 +381,7 @@
           "host": ["{{base_url}}"],
           "path": ["api", "v1", "resources", "{{resource_id}}"]
         },
-        "description": "Updates resource metadata. All body fields are optional — only send what you want to change.\n\n**Tags behaviour:** Providing `tags` replaces the entire tag set. Send `\"tags\": []` to remove all tags. Omit `tags` entirely to leave them unchanged.\n\nFile replacement is not supported via this endpoint."
+        "description": "Updates resource metadata. All body fields are optional — only send what you want to change.\n\n**conversationIds behaviour:** Providing `conversationIds` replaces the entire set of tagged conversations. Send `\"conversationIds\": []` to untag all conversations. Omit `conversationIds` entirely to leave them unchanged. Every ID must be a conversation you own — otherwise a 400 lists the ones that didn't resolve.\n\nFile replacement is not supported via this endpoint."
       },
       "response": [
         {
@@ -384,13 +389,13 @@
           "originalRequest": {
             "method": "PATCH",
             "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }, { "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"tags\": [\"physics\", \"week3\", \"revised\"]\n}", "options": { "raw": { "language": "json" } } },
+            "body": { "mode": "raw", "raw": "{\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"conversationIds\": [\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"]\n}", "options": { "raw": { "language": "json" } } },
             "url": { "raw": "{{base_url}}/api/v1/resources/{{resource_id}}", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "{{resource_id}}"] }
           },
           "status": "OK",
           "code": 200,
           "header": [{ "key": "Content-Type", "value": "application/json" }],
-          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"description\": \"Updated with exam tips\",\n  \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"tags\": [\"physics\", \"week3\", \"revised\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T11:00:00.000Z\"\n}"
+          "body": "{\n  \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n  \"type\": \"document\",\n  \"title\": \"Lecture Notes Week 3 (Revised)\",\n  \"description\": \"Updated with exam tips\",\n  \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n  \"fileName\": \"lecture-notes.pdf\",\n  \"fileSize\": 204800,\n  \"mimeType\": \"application/pdf\",\n  \"externalUrl\": null,\n  \"isProcessed\": false,\n  \"conversationIds\": [\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"],\n  \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n  \"updatedAt\": \"2026-05-11T11:00:00.000Z\"\n}"
         },
         {
           "name": "400 Bad Request — Validation error",
@@ -507,7 +512,7 @@
           "status": "OK",
           "code": 200,
           "header": [{ "key": "Content-Type", "value": "application/json" }],
-          "body": "{\n  \"data\": [\n    {\n      \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n      \"type\": \"document\",\n      \"title\": \"Lecture Notes Week 3\",\n      \"description\": \"Covers chapters 5\\u20137\",\n      \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n      \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n      \"fileName\": \"lecture-notes.pdf\",\n      \"fileSize\": 204800,\n      \"mimeType\": \"application/pdf\",\n      \"externalUrl\": null,\n      \"isProcessed\": false,\n      \"tags\": [\"physics\", \"week3\"],\n      \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n      \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 20,\n    \"total\": 12,\n    \"totalPages\": 1\n  }\n}"
+          "body": "{\n  \"data\": [\n    {\n      \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n      \"type\": \"document\",\n      \"title\": \"Lecture Notes Week 3\",\n      \"description\": \"Covers chapters 5\\u20137\",\n      \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n      \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n      \"fileName\": \"lecture-notes.pdf\",\n      \"fileSize\": 204800,\n      \"mimeType\": \"application/pdf\",\n      \"externalUrl\": null,\n      \"isProcessed\": false,\n      \"conversationIds\": [\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"],\n      \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n      \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 20,\n    \"total\": 12,\n    \"totalPages\": 1\n  }\n}"
         }
       ]
     },
@@ -555,7 +560,7 @@
       ]
     },
     {
-      "name": "Get All Tags",
+      "name": "Get Resources for Conversation",
       "event": [
         {
           "listen": "test",
@@ -565,8 +570,8 @@
               "const body = pm.response.json();",
               "pm.test('Returns array', () => pm.expect(body).to.be.an('array'));",
               "if (body.length > 0) {",
-              "  pm.test('Each item has tag and count', () => {",
-              "    pm.expect(body[0]).to.have.all.keys('tag', 'count');",
+              "  pm.test('Each item includes this conversation id', () => {",
+              "    pm.expect(body[0].conversationIds).to.include(pm.collectionVariables.get('conversation_id'));",
               "  });",
               "}"
             ],
@@ -580,11 +585,11 @@
           { "key": "Authorization", "value": "Bearer {{access_token}}" }
         ],
         "url": {
-          "raw": "{{base_url}}/api/v1/resources/tags",
+          "raw": "{{base_url}}/api/v1/conversations/{{conversation_id}}/resources",
           "host": ["{{base_url}}"],
-          "path": ["api", "v1", "resources", "tags"]
+          "path": ["api", "v1", "conversations", "{{conversation_id}}", "resources"]
         },
-        "description": "Returns all unique tags used across the authenticated user's resources, ordered by usage frequency (most used first)."
+        "description": "Lists all resources tagged to a specific conversation (via `conversationIds` on Create/Update Resource). This lives on the Conversations controller, not Resources, but is included here since it's the read side of resource↔conversation tagging.\n\nReturns 404 if the conversation doesn't exist or isn't owned by the authenticated user.\n\nResources tagged this way are also automatically injected into the AI's context for that conversation, alongside directly-attached documents and field-matched resources."
       },
       "response": [
         {
@@ -592,12 +597,24 @@
           "originalRequest": {
             "method": "GET",
             "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
-            "url": { "raw": "{{base_url}}/api/v1/resources/tags", "host": ["{{base_url}}"], "path": ["api", "v1", "resources", "tags"] }
+            "url": { "raw": "{{base_url}}/api/v1/conversations/{{conversation_id}}/resources", "host": ["{{base_url}}"], "path": ["api", "v1", "conversations", "{{conversation_id}}", "resources"] }
           },
           "status": "OK",
           "code": 200,
           "header": [{ "key": "Content-Type", "value": "application/json" }],
-          "body": "[\n  { \"tag\": \"physics\", \"count\": 8 },\n  { \"tag\": \"week3\",   \"count\": 5 },\n  { \"tag\": \"revised\", \"count\": 2 },\n  { \"tag\": \"external\", \"count\": 1 }\n]"
+          "body": "[\n  {\n    \"id\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\n    \"type\": \"document\",\n    \"title\": \"Lecture Notes Week 3\",\n    \"description\": \"Covers chapters 5\\u20137\",\n    \"fieldId\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n    \"fileUrl\": \"https://res.cloudinary.com/cognix/raw/upload/v1714900000/cognix/resources/1714900000-lecture-notes.pdf\",\n    \"fileName\": \"lecture-notes.pdf\",\n    \"fileSize\": 204800,\n    \"mimeType\": \"application/pdf\",\n    \"externalUrl\": null,\n    \"isProcessed\": false,\n    \"conversationIds\": [\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"],\n    \"createdAt\": \"2026-05-11T10:00:00.000Z\",\n    \"updatedAt\": \"2026-05-11T10:00:00.000Z\"\n  }\n]"
+        },
+        {
+          "name": "404 Not Found",
+          "originalRequest": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{base_url}}/api/v1/conversations/non-existent-id/resources", "host": ["{{base_url}}"], "path": ["api", "v1", "conversations", "non-existent-id", "resources"] }
+          },
+          "status": "Not Found",
+          "code": 404,
+          "header": [{ "key": "Content-Type", "value": "application/json" }],
+          "body": "{\n  \"statusCode\": 404,\n  \"message\": \"Conversation not found\",\n  \"error\": \"Not Found\"\n}"
         }
       ]
     },

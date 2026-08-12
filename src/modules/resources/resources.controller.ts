@@ -49,11 +49,6 @@ export class ResourcesController {
     return this.resourcesService.getResourceStats(userId);
   }
 
-  @Get('tags')
-  async getAllTags(@CurrentUser('id') userId: string) {
-    return this.resourcesService.getAllTags(userId);
-  }
-
   @Get('field/:fieldId')
   async getByField(
     @CurrentUser('id') userId: string,
