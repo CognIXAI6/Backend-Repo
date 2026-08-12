@@ -87,6 +87,10 @@ export class ResourcesService {
       this.validateFile(file, dto.type);
     }
 
+    if (dto.fieldId) {
+      await this.assertFieldExists(dto.fieldId);
+    }
+
     return this.knex.transaction(async (trx) => {
       let fileUrl: string | null = null;
       let fileName: string | null = null;
@@ -196,6 +200,10 @@ export class ResourcesService {
 
     if (dto.conversationIds?.length) {
       await this.assertConversationsOwnedByUser(userId, dto.conversationIds);
+    }
+
+    if (dto.fieldId) {
+      await this.assertFieldExists(dto.fieldId);
     }
 
     return this.knex.transaction(async (trx) => {
@@ -396,6 +404,17 @@ export class ResourcesService {
     const missing = uniqueIds.filter((id) => !owned.includes(id));
     if (missing.length > 0) {
       throw new BadRequestException(`Conversation(s) not found or not owned by user: ${missing.join(', ')}`);
+    }
+  }
+
+  /**
+   * Verifies fieldId refers to a real, active field before it hits the DB insert —
+   * catches typos/foreign IDs with a clear 400 instead of a masked FK-violation 500.
+   */
+  private async assertFieldExists(fieldId: string): Promise<void> {
+    const field = await this.knex('fields').where({ id: fieldId, is_active: true }).first('id');
+    if (!field) {
+      throw new BadRequestException(`Field not found: ${fieldId}`);
     }
   }
 
