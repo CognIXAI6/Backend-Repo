@@ -332,9 +332,19 @@ export class ConversationService {
    * Useful as a one-time cleanup for users who accumulated duplicates.
    */
   async purgeEmptyConversations(userId: string): Promise<number> {
+    // A conversation can have zero messages yet still carry tagged resources
+    // (POST /resources with conversationIds never touches total_messages).
+    // resource_conversations.conversation_id cascades on delete, so purging
+    // one of these would silently orphan the tagging and 404 on
+    // GET /conversations/:id/resources — exclude any conversation that has
+    // a resource tagged to it, regardless of message count.
     return this.knex('conversations')
       .where({ user_id: userId, total_messages: 0 })
       .whereNull('deleted_at')
+      .whereNotExists(
+        this.knex('resource_conversations')
+          .whereRaw('resource_conversations.conversation_id = conversations.id'),
+      )
       .delete();
   }
 
