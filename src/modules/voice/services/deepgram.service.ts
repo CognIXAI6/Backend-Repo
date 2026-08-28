@@ -47,9 +47,18 @@ interface V1Socket {
   waitForOpen(): Promise<void>;  // resolves once readyState === OPEN
   sendMedia(data: Buffer): void;
   sendCloseStream(msg?: object): void;
+  sendKeepAlive(msg: { type: string }): void;
   close(): void;
   readyState: number;
 }
+
+// Deepgram closes a live-streaming WS after ~10 s of receiving no audio
+// (NET-0001). During natural pauses in conversation (or before the mic
+// starts streaming) no media frames are sent, so without a periodic
+// KeepAlive the provider silently drops the connection and the frontend
+// sees a spurious "session:degraded" / reconnect prompt. Ping well under
+// the 10 s window to keep the socket alive through normal silence.
+const DEEPGRAM_KEEPALIVE_INTERVAL_MS = 6_000;
 
 @Injectable()
 export class DeepgramService implements OnModuleInit {
@@ -72,6 +81,7 @@ export class DeepgramService implements OnModuleInit {
     close: () => void;
   }> {
     const emitter = new EventEmitter();
+    let keepAliveTimer: NodeJS.Timeout | undefined;
 
     // ── Step 1: build the V1Socket (does NOT open the connection yet) ─────────
     const rawSocket = (await this.deepgram.listen.v1.connect({
@@ -103,6 +113,19 @@ export class DeepgramService implements OnModuleInit {
       // Close the TCP connection if the WS upgrade doesn't complete within 10 s.
       connectionTimeoutInSeconds: 10,
     })) as unknown as V1Socket;
+
+    // The SDK's V1Socket.close() synchronously calls the underlying
+    // ReconnectingWebSocket's close(), which — if the raw ws is still
+    // CONNECTING — triggers `ws`'s abortHandshake path. That emits an
+    // 'error' event on the raw socket via process.nextTick, i.e. *after*
+    // V1Socket.close() has already torn down its own error listener. If
+    // nothing else is listening at that point, Node treats it as an
+    // unhandled EventEmitter error and crashes the whole process. Attach a
+    // permanent, never-removed no-op listener directly on the underlying
+    // ReconnectingWebSocket so that race can never escalate past this
+    // service, regardless of the SDK's own listener bookkeeping.
+    const underlyingSocket = (rawSocket as unknown as { socket?: { addEventListener?: (t: string, l: (...a: unknown[]) => void) => void } }).socket;
+    underlyingSocket?.addEventListener?.('error', () => {});
 
     // ── Step 2: register event handlers BEFORE calling connect()/waitForOpen() ─
     // Must attach handlers first so we don't miss the 'open' event.
@@ -145,6 +168,7 @@ export class DeepgramService implements OnModuleInit {
 
     rawSocket.on('close', () => {
       this.logger.log(`[${sessionId}] Deepgram connection closed`);
+      if (keepAliveTimer) clearInterval(keepAliveTimer);
       emitter.emit('close');
     });
 
@@ -187,7 +211,10 @@ export class DeepgramService implements OnModuleInit {
       const wrappedErr = new Error(`Deepgram connection failed: ${reason}`);
 
       this.logger.error(`[${sessionId}] ${wrappedErr.message}`);
-      // Close immediately so the SDK stops its internal retry loop
+      // Close immediately so the SDK stops its internal retry loop. The
+      // socket is still CONNECTING here, so this is exactly the abort race
+      // the permanent no-op error listener above exists to absorb — this
+      // try/catch only guards the synchronous call, not that async race.
       try { socket.close(); } catch (_) {}
       // Do NOT emit 'error' here — the gateway hasn't registered its emitter
       // listeners yet (it awaits this method first), so emitting would crash Node.js.
@@ -196,6 +223,19 @@ export class DeepgramService implements OnModuleInit {
     }
 
     this.logger.log(`[${sessionId}] Deepgram socket ready (readyState=${socket.readyState})`);
+
+    // Keep the provider socket alive through silence (see comment above the
+    // interval constant) — Deepgram treats KeepAlive frames the same as audio
+    // for the purposes of its inactivity timeout.
+    keepAliveTimer = setInterval(() => {
+      try {
+        if (socket.readyState === 1) {
+          socket.sendKeepAlive({ type: 'KeepAlive' });
+        }
+      } catch (err) {
+        this.logger.warn(`[${sessionId}] sendKeepAlive failed: ${(err as Error).message}`);
+      }
+    }, DEEPGRAM_KEEPALIVE_INTERVAL_MS);
 
     // ── sendAudio ─────────────────────────────────────────────────────────────
     const sendAudio = (chunk: Buffer): void => {
@@ -213,13 +253,17 @@ export class DeepgramService implements OnModuleInit {
     // ── close ─────────────────────────────────────────────────────────────────
     // readyState: 0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED
     // Only send the close-stream signal when the socket is actually open (1).
-    // Calling close() on state 0 or 3 is what triggers the secondary ws crash.
+    // Only call close() while OPEN. Closing a still-CONNECTING (0) socket
+    // triggers the abort-handshake race described above the permanent
+    // no-op error listener — leave a CONNECTING socket for the SDK's own
+    // connectionTimeoutInSeconds to unwind instead of aborting it here.
     const close = (): void => {
+      if (keepAliveTimer) clearInterval(keepAliveTimer);
       try {
         if (socket.readyState === 1) socket.sendCloseStream({} as any);
       } catch (_) {}
       try {
-        if (socket.readyState === 0 || socket.readyState === 1) socket.close();
+        if (socket.readyState === 1) socket.close();
       } catch (_) {}
     };
 

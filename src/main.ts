@@ -8,19 +8,15 @@ import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import * as bodyParser from 'body-parser';
 
-// Prevent the Deepgram SDK's internal ws.WebSocket from crashing the process
-// when it emits an unhandled 'error' event during a connection timeout / close race.
-// NestJS's own exception filters do not cover Node.js-level EventEmitter errors.
+// NestJS's own exception filters do not cover Node.js-level EventEmitter
+// errors. The Deepgram SDK's WS-close race that used to land here is now
+// absorbed at its source in DeepgramService (see the permanent no-op error
+// listener in createLiveSession), so this handler stays a plain fail-fast:
+// log to Sentry, then re-throw so PM2 restarts the process. Per Node's own
+// docs, it is not safe to resume normal operation after uncaughtException.
 import * as Sentry from '@sentry/nestjs';
 
 process.on('uncaughtException', (err: Error) => {
-  if (
-    err.message.includes('WebSocket was closed before the connection was established') ||
-    err.message.includes('WebSocket is not open')
-  ) {
-    console.error('[DeepgramSDK] Suppressed uncaught WS error:', err.message);
-    return;
-  }
   Sentry.captureException(err, { tags: { source: 'uncaughtException' } });
   console.error('[uncaughtException] Re-throwing fatal error:', err);
   throw err;
