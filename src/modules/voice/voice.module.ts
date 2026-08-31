@@ -8,6 +8,7 @@ import { VoiceGateway } from './voice.gateway';
 import { DeepgramService } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService } from './services/conversation.service';
+import { ConversationCleanupService } from './services/conversation-cleanup.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { VoiceVerificationService } from './services/voice-verification.service';
 import { VideoAnalysisService } from './services/video-analysis.service';
@@ -44,6 +45,7 @@ import { PushNotificationModule } from '@/modules/notifications/push-notificatio
     DeepgramService,
     ClaudeService,
     ConversationService,
+    ConversationCleanupService,
     GuestSessionService,
     VoiceVerificationService,
     VideoAnalysisService,

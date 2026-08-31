@@ -8,6 +8,8 @@ import {
 } from '@nestjs/common';
 import { Response } from 'express';
 import * as Sentry from '@sentry/nestjs';
+import { GIT_SHA } from '../utils/deployment-metadata.util';
+import { RequestWithCorrelation } from '../middleware/correlation-id.middleware';
 
 @Catch()
 export class GlobalExceptionFilter implements ExceptionFilter {
@@ -16,7 +18,9 @@ export class GlobalExceptionFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost) {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
-    const request = ctx.getRequest();
+    const request = ctx.getRequest<RequestWithCorrelation>();
+    const correlationId = request.correlationId;
+    const durationMs = request._startedAt != null ? Date.now() - request._startedAt : undefined;
 
     let status = HttpStatus.INTERNAL_SERVER_ERROR;
     // message: string or string[] (validation errors)
@@ -54,17 +58,20 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     if (status >= 500) {
       Sentry.withScope((scope) => {
         scope.setTag('source', 'global_exception_filter');
+        scope.setTag('correlation_id', correlationId ?? 'unknown');
+        scope.setTag('build_sha', GIT_SHA);
         scope.setContext('request', {
           method: request.method,
           url: request.url,
           body: request.body,
+          durationMs,
         });
         Sentry.captureException(exception);
       });
     }
 
     this.logger.error(
-      `${request.method} ${request.url} - ${status}`,
+      `${request.method} ${request.url} - ${status} correlationId=${correlationId ?? 'unknown'} durationMs=${durationMs ?? 'n/a'}`,
       exception instanceof Error ? exception.stack : JSON.stringify(exception),
     );
 
@@ -74,6 +81,7 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       statusCode: status,
       // Always return the full messages array so clients see all validation failures.
       message: Array.isArray(message) ? message : [message],
+      ...(correlationId && { correlationId }),
       // Stack traces only in non-production environments.
       ...(!isProduction && exception instanceof Error && {
         debug: {

@@ -1,4 +1,5 @@
 import { Injectable, Logger, NotFoundException, Inject } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Knex } from 'knex';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -139,10 +140,28 @@ export interface SaveMessageDto {
 export class ConversationService {
   private readonly logger = new Logger(ConversationService.name);
 
+  // Every table with a conversation_id FK that must be empty before a
+  // conversation is eligible for cleanup — see buildCleanupCandidatesQuery.
+  // generated_documents.conversation_id is SET NULL (not CASCADE) on delete,
+  // so it wouldn't destroy the document, but it WOULD silently orphan the
+  // conversation association — excluded for the same reason as the rest.
+  private static readonly CLEANUP_PROTECTED_TABLES = [
+    'conversation_messages',
+    'conversation_transcript_segments',
+    'conversation_participants',
+    'conversation_images',
+    'conversation_documents',
+    'resource_conversations',
+    'generated_documents',
+  ] as const;
+
   // Inject Knex using the token your DatabaseModule provides.
   // Common tokens: 'KNEX_CONNECTION', 'KnexConnection', or Symbol('KNEX')
   // Match whatever your database.module.ts uses.
-  constructor(@Inject('KNEX_CONNECTION') private readonly knex: Knex) {}
+  constructor(
+    @Inject('KNEX_CONNECTION') private readonly knex: Knex,
+    private readonly configService: ConfigService,
+  ) {}
 
   // ── Create ──────────────────────────────────────────────────────────────────
 
@@ -168,31 +187,36 @@ export class ConversationService {
   // ── Save a message ──────────────────────────────────────────────────────────
 
   async saveMessage(dto: SaveMessageDto): Promise<ConversationMessage> {
-    const [message] = await this.knex('conversation_messages')
-      .insert({
-        conversation_id: dto.conversationId,
-        role: dto.role,
-        content: dto.content,
-        transcript: dto.transcript ?? null,
-        audio_url: dto.audioUrl ?? null,
-        audio_duration_ms: dto.audioDurationMs ?? null,
-        speaker_label: dto.speakerLabel ?? null,
-        tokens_used: dto.tokensUsed ?? null,
-        latency_ms: dto.latencyMs ?? null,
-        document_id: dto.documentId ?? null,
-      })
-      .returning('*');
+    // Transactional: the message insert and the total_messages counter bump
+    // must commit together. Split into two round-trips, a failure between
+    // them leaves a real message behind a stale total_messages = 0 — which
+    // cleanup (purgeEmptyConversations) uses as its "safe to delete" signal.
+    return this.knex.transaction(async (trx) => {
+      const [message] = await trx('conversation_messages')
+        .insert({
+          conversation_id: dto.conversationId,
+          role: dto.role,
+          content: dto.content,
+          transcript: dto.transcript ?? null,
+          audio_url: dto.audioUrl ?? null,
+          audio_duration_ms: dto.audioDurationMs ?? null,
+          speaker_label: dto.speakerLabel ?? null,
+          tokens_used: dto.tokensUsed ?? null,
+          latency_ms: dto.latencyMs ?? null,
+          document_id: dto.documentId ?? null,
+        })
+        .returning('*');
 
-    // Single atomic update: increment message count + timestamps in one query
-    await this.knex('conversations')
-      .where('id', dto.conversationId)
-      .update({
-        total_messages: this.knex.raw('total_messages + 1'),
-        last_activity_at: new Date(),
-        updated_at: new Date(),
-      });
+      await trx('conversations')
+        .where('id', dto.conversationId)
+        .update({
+          total_messages: trx.raw('total_messages + 1'),
+          last_activity_at: new Date(),
+          updated_at: new Date(),
+        });
 
-    return message;
+      return message;
+    });
   }
 
   async saveMessageWithTranscriptSegments(
@@ -331,21 +355,42 @@ export class ConversationService {
    * Hard-deletes all empty (no messages) conversations for a user.
    * Useful as a one-time cleanup for users who accumulated duplicates.
    */
-  async purgeEmptyConversations(userId: string): Promise<number> {
-    // A conversation can have zero messages yet still carry tagged resources
-    // (POST /resources with conversationIds never touches total_messages).
-    // resource_conversations.conversation_id cascades on delete, so purging
-    // one of these would silently orphan the tagging and 404 on
-    // GET /conversations/:id/resources — exclude any conversation that has
-    // a resource tagged to it, regardless of message count.
-    return this.knex('conversations')
-      .where({ user_id: userId, total_messages: 0 })
+  /**
+   * The shared "is this conversation actually safe to delete as empty"
+   * predicate, used by both the on-demand DELETE /conversations/empty
+   * endpoint and the scheduled cleanup job. `total_messages = 0` is only a
+   * cheap pre-filter (it's a cached counter, and saveMessage() writing it
+   * non-transactionally used to be able to drift — now fixed, but still not
+   * treated as authoritative here); real eligibility is re-derived from a
+   * NOT EXISTS check against every table that can hold a conversation_id
+   * FK, so a conversation with zero messages but a tagged resource,
+   * participant, image, upload, or generated-document link is never swept.
+   */
+  buildCleanupCandidatesQuery(
+    trx: Knex.Transaction | Knex,
+    opts: { userId?: string; olderThanHours: number },
+  ) {
+    let q = trx('conversations')
+      .where('total_messages', 0)
       .whereNull('deleted_at')
-      .whereNotExists(
-        this.knex('resource_conversations')
-          .whereRaw('resource_conversations.conversation_id = conversations.id'),
-      )
-      .delete();
+      .where('created_at', '<', trx.raw(`now() - interval '${opts.olderThanHours} hours'`));
+
+    if (opts.userId) {
+      q = q.andWhere('user_id', opts.userId);
+    }
+
+    for (const table of ConversationService.CLEANUP_PROTECTED_TABLES) {
+      q = q.whereNotExists(
+        trx(table).whereRaw(`${table}.conversation_id = conversations.id`),
+      );
+    }
+
+    return q;
+  }
+
+  async purgeEmptyConversations(userId: string): Promise<number> {
+    const gracePeriodHours = this.configService.get<number>('cleanup.gracePeriodHours') ?? 24;
+    return this.buildCleanupCandidatesQuery(this.knex, { userId, olderThanHours: gracePeriodHours }).delete();
   }
 
   // ── Get single conversation ─────────────────────────────────────────────────

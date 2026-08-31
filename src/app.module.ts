@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 import { APP_INTERCEPTOR, APP_FILTER } from '@nestjs/core';
 import { SentryModule } from '@sentry/nestjs/setup';
 
@@ -16,6 +17,7 @@ import {
   flutterwaveConfig,
   geoConfig,
   notificationsConfig,
+  cleanupConfig,
 } from './config';
 
 // Common
@@ -63,8 +65,10 @@ import { PushNotificationModule } from './modules/notifications/push-notificatio
         flutterwaveConfig,
         geoConfig,
         notificationsConfig,
+        cleanupConfig,
       ],
     }),
+    ScheduleModule.forRoot(),
     LoggerModule,
     DatabaseModule,
     EmailModule,

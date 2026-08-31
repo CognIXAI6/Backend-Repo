@@ -82,3 +82,13 @@ export const notificationsConfig = registerAs('notifications', () => ({
   // Set via FIREBASE_SERVICE_ACCOUNT env var (base64 or raw JSON).
   firebaseServiceAccount: process.env.FIREBASE_SERVICE_ACCOUNT,
 }));
+
+export const cleanupConfig = registerAs('cleanup', () => ({
+  // Minimum age before an empty conversation is eligible for cleanup.
+  gracePeriodHours: parseInt(process.env.CLEANUP_GRACE_PERIOD_HOURS || '24', 10),
+  // When true (default), the scheduled cleanup job only logs candidates —
+  // it never deletes. Flip to 'false' only after reviewing candidate output.
+  dryRun: process.env.CLEANUP_DRY_RUN !== 'false',
+  // Max rows the scheduled job processes per run.
+  batchSize: parseInt(process.env.CLEANUP_BATCH_SIZE || '200', 10),
+}));

@@ -7,6 +7,7 @@ import { ConfigService } from '@nestjs/config';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import * as bodyParser from 'body-parser';
+import { correlationIdMiddleware } from './common/middleware/correlation-id.middleware';
 
 // NestJS's own exception filters do not cover Node.js-level EventEmitter
 // errors. The Deepgram SDK's WS-close race that used to land here is now
@@ -34,6 +35,10 @@ async function bootstrap() {
 
   // Use Pino logger
   app.useLogger(app.get(Logger));
+
+  // Stamp every request with a correlation ID before anything else runs, so
+  // it's available to every downstream handler and to the exception filter.
+  app.use(correlationIdMiddleware);
 
   // Single JSON body parser: 15 MB limit + rawBody capture for Stripe webhook
   // verification. Must be registered once — multiple body parsers on the same

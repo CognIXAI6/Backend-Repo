@@ -348,7 +348,12 @@ export class ConversationsController {
 
   /**
    * DELETE /conversations/empty
-   * Removes all zero-message conversations for the current user.
+   * Removes the current user's conversations that are genuinely empty: no
+   * messages, transcript segments, participants, images, uploaded documents,
+   * resource tags, or generated-document links, and older than the
+   * configured grace period (see ConversationService.buildCleanupCandidatesQuery).
+   * A backend-owned scheduled job performs the same cleanup system-wide —
+   * this on-demand route stays live for existing clients.
    */
   @Delete('empty')
   @HttpCode(HttpStatus.OK)

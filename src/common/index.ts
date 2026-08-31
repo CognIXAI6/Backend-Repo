@@ -4,4 +4,5 @@ export * from './guards/optional-auth.guard';
 export * from './interceptors/response.interceptor';
 export * from './filters/global-exception.filter';
 export * from './utils/helpers';
+export * from './utils/deployment-metadata.util';
 export * from './logger/logger.module';
