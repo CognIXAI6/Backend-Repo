@@ -9,6 +9,7 @@ function createFakeSession(overrides: Record<string, unknown> = {}) {
     isGuest: false,
     deepgramEmitter: new EventEmitter(),
     sendAudio: jest.fn(),
+    sendFinalize: jest.fn(),
     closeDeepgram: jest.fn(),
     accumulatedTranscript: '',
     pendingInterimTranscript: '',
@@ -54,7 +55,8 @@ function createFakeSession(overrides: Record<string, unknown> = {}) {
     idleTimeoutHandle: null,
     recordingSessionId: 'rec-1',
     clientSessionId: null,
-    activeStreamId: null,
+    activeStreamId: null as string | null,
+    lastHandledStopStreamId: null as string | null,
     streamSequences: new Map(),
     audioGapCount: 0,
     providerState: 'active',
@@ -240,5 +242,78 @@ describe('VoiceGateway provider recovery', () => {
 
     expect(deepgramService.createLiveSession).not.toHaveBeenCalled();
     expect(session.providerState).toBe('active');
+  });
+});
+
+describe('VoiceGateway audio:stop finalize-and-drain', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'debug').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    jest.useRealTimers();
+  });
+
+  it('finalizeAndDrain resolves as soon as the "finalized" signal fires, without waiting out the timeout', async () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession();
+
+    const drainPromise = (gateway as any).finalizeAndDrain(session, 5_000);
+    session.deepgramEmitter.emit('finalized');
+    await drainPromise;
+
+    expect(session.sendFinalize).toHaveBeenCalledTimes(1);
+    expect(session.deepgramEmitter.listenerCount('finalized')).toBe(0);
+  });
+
+  it('finalizeAndDrain resolves via the bounded timeout when no signal ever arrives, and removes its listener', async () => {
+    jest.useFakeTimers();
+    const { gateway } = createGateway();
+    const session = createFakeSession();
+
+    const drainPromise = (gateway as any).finalizeAndDrain(session, 1_500);
+    jest.advanceTimersByTime(1_500);
+    await drainPromise;
+
+    expect(session.deepgramEmitter.listenerCount('finalized')).toBe(0);
+  });
+
+  it('does not mutate accumulatedTranscript when a newer stream started while the drain was in flight', async () => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-stale');
+    const session = createFakeSession({ activeStreamId: 'stream-A', accumulatedTranscript: 'a valid prompt' });
+    gateway.sessions.set(client.id, session);
+
+    // Simulate a new recording starting mid-drain, before finalizeAndDrain resolves.
+    (gateway as any).finalizeAndDrain = jest.fn().mockImplementation(async () => {
+      session.activeStreamId = 'stream-B';
+    });
+
+    await gateway.handleAudioStop(client);
+
+    expect(session.accumulatedTranscript).toBe('a valid prompt'); // untouched
+    expect(client.emit).not.toHaveBeenCalledWith('ai:skipped', expect.anything());
+    expect(client.emit).not.toHaveBeenCalledWith('audio:finalized', expect.anything());
+  });
+
+  it('is idempotent for a duplicate audio:stop on the same recording', async () => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-dup');
+    const session = createFakeSession({ activeStreamId: 'stream-A' }); // empty transcript — short-circuits before processPrompt
+    gateway.sessions.set(client.id, session);
+
+    session.sendFinalize.mockImplementation(() => {
+      queueMicrotask(() => session.deepgramEmitter.emit('finalized'));
+    });
+
+    await gateway.handleAudioStop(client);
+    await gateway.handleAudioStop(client);
+
+    expect(session.sendFinalize).toHaveBeenCalledTimes(1);
+    expect(client.emit).toHaveBeenCalledWith('ai:skipped', { reason: 'empty_transcript' });
   });
 });

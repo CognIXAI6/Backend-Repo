@@ -18,6 +18,7 @@ import {
   geoConfig,
   notificationsConfig,
   cleanupConfig,
+  chatConfig,
 } from './config';
 
 // Common
@@ -43,6 +44,7 @@ import { HealthModule } from './modules/health/health.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { ResourcesModule } from './modules/resources/resources.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
+import { ChatModule } from './modules/chat/chat.module';
 import { ErrorLogModule } from './modules/error-log/error-log.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { DocumentModule } from './modules/documents/document.module';
@@ -66,6 +68,7 @@ import { PushNotificationModule } from './modules/notifications/push-notificatio
         geoConfig,
         notificationsConfig,
         cleanupConfig,
+        chatConfig,
       ],
     }),
     ScheduleModule.forRoot(),
@@ -85,6 +88,7 @@ import { PushNotificationModule } from './modules/notifications/push-notificatio
     SettingsModule,
     ResourcesModule,
     ConversationsModule,
+    ChatModule,
     ErrorLogModule,
     AdminModule,
     DocumentModule,

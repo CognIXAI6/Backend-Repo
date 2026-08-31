@@ -79,12 +79,14 @@ describe('ConversationService.saveMessage', () => {
     const trx: any = jest.fn((table: string) => {
       const chain: any = {
         insert: jest.fn(() => chain),
-        returning: jest.fn().mockResolvedValue([{ id: 'msg-1', conversation_id: 'conv-1' }]),
         where: jest.fn(() => chain),
-        update:
-          table === 'conversations' && opts.conversationsUpdateError
-            ? jest.fn().mockRejectedValue(opts.conversationsUpdateError)
-            : jest.fn().mockResolvedValue(1),
+        update: jest.fn(() => chain),
+        returning:
+          table === 'conversations'
+            ? opts.conversationsUpdateError
+              ? jest.fn().mockRejectedValue(opts.conversationsUpdateError)
+              : jest.fn().mockResolvedValue([{ next_message_sequence: 7 }])
+            : jest.fn().mockResolvedValue([{ id: 'msg-1', conversation_id: 'conv-1' }]),
       };
       chainsByTable[table] = chain;
       return chain;
@@ -93,7 +95,7 @@ describe('ConversationService.saveMessage', () => {
     return { trx, chainsByTable };
   }
 
-  it('inserts the message and bumps total_messages inside a single transaction', async () => {
+  it('inserts the message and bumps total_messages/sequence inside a single transaction', async () => {
     const { trx, chainsByTable } = createFakeTransaction();
     const knexLike: any = {
       transaction: jest.fn(async (cb: (trx: any) => Promise<any>) => cb(trx)),
@@ -107,7 +109,9 @@ describe('ConversationService.saveMessage', () => {
     });
 
     expect(knexLike.transaction).toHaveBeenCalledTimes(1);
-    expect(chainsByTable['conversation_messages'].insert).toHaveBeenCalled();
+    expect(chainsByTable['conversation_messages'].insert).toHaveBeenCalledWith(
+      expect.objectContaining({ conversation_sequence: 7 }),
+    );
     expect(chainsByTable['conversations'].update).toHaveBeenCalled();
     expect(message).toEqual({ id: 'msg-1', conversation_id: 'conv-1' });
   });

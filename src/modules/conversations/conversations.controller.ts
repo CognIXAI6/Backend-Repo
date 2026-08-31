@@ -82,7 +82,11 @@ export class ConversationsController {
   async getMessages(
     @CurrentUser('id') userId: string,
     @Param('id') conversationId: string,
+    @Query('afterSequence') afterSequence?: string,
   ) {
+    if (afterSequence !== undefined) {
+      return this.conversationService.getMessagesAfterSequence(conversationId, userId, Number(afterSequence));
+    }
     return this.conversationService.getConversationMessages(conversationId, userId);
   }
 

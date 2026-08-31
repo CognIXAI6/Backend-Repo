@@ -83,6 +83,18 @@ export const notificationsConfig = registerAs('notifications', () => ({
   firebaseServiceAccount: process.env.FIREBASE_SERVICE_ACCOUNT,
 }));
 
+export const chatConfig = registerAs('chat', () => ({
+  // How often the job worker polls ai_response_jobs for work.
+  pollIntervalMs: parseInt(process.env.CHAT_WORKER_POLL_INTERVAL_MS || '2000', 10),
+  // Max jobs claimed per poll tick.
+  batchSize: parseInt(process.env.CHAT_WORKER_BATCH_SIZE || '5', 10),
+  // Attempts before a job is marked permanently 'failed'.
+  maxAttempts: parseInt(process.env.CHAT_WORKER_MAX_ATTEMPTS || '3', 10),
+  // How long a claimed job holds its lease before another poll tick may
+  // reclaim it (crash recovery).
+  leaseDurationMs: parseInt(process.env.CHAT_WORKER_LEASE_MS || '30000', 10),
+}));
+
 export const cleanupConfig = registerAs('cleanup', () => ({
   // Minimum age before an empty conversation is eligible for cleanup.
   gracePeriodHours: parseInt(process.env.CLEANUP_GRACE_PERIOD_HOURS || '24', 10),

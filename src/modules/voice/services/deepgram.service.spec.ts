@@ -19,6 +19,7 @@ function createFakeSocket() {
     sendMedia: jest.Mock;
     sendCloseStream: jest.Mock;
     sendKeepAlive: jest.Mock;
+    sendFinalize: jest.Mock;
     close: jest.Mock;
     readyState: number;
     socket: { addEventListener: jest.Mock };
@@ -31,6 +32,7 @@ function createFakeSocket() {
     sendMedia: jest.fn(),
     sendCloseStream: jest.fn(),
     sendKeepAlive: jest.fn(),
+    sendFinalize: jest.fn(),
     close: jest.fn(),
     readyState: 1,
     socket: { addEventListener: jest.fn() },
@@ -145,5 +147,62 @@ describe('DeepgramService', () => {
 
     expect(socket.sendKeepAlive).toHaveBeenCalledTimes(3); // fires at 6s, 12s, 18s
     expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it('sendFinalize() calls the SDK Finalize control message when the socket is open', async () => {
+    const { socket } = createFakeSocket();
+    mockConnect.mockResolvedValue(socket);
+
+    const { close, sendFinalize } = await service.createLiveSession('sess-6');
+    cleanups.push(close);
+
+    sendFinalize();
+
+    expect(socket.sendFinalize).toHaveBeenCalledWith({ type: 'Finalize' });
+  });
+
+  it('sendFinalize() is a no-op when the socket is not open', async () => {
+    const { socket } = createFakeSocket();
+    socket.readyState = 0;
+    mockConnect.mockResolvedValue(socket);
+
+    const { close, sendFinalize } = await service.createLiveSession('sess-7');
+    cleanups.push(close);
+
+    expect(() => sendFinalize()).not.toThrow();
+    expect(socket.sendFinalize).not.toHaveBeenCalled();
+  });
+
+  it('emits "finalized" for a Results message with from_finalize:true, even with no transcript text', async () => {
+    const { socket, handlers } = createFakeSocket();
+    mockConnect.mockResolvedValue(socket);
+
+    const { emitter, close } = await service.createLiveSession('sess-8');
+    cleanups.push(close);
+
+    const finalizedListener = jest.fn();
+    const transcriptListener = jest.fn();
+    emitter.on('finalized', finalizedListener);
+    emitter.on('transcript', transcriptListener);
+
+    handlers['message']({ type: 'Results', is_final: true, from_finalize: true, channel: { alternatives: [{ transcript: '' }] } });
+
+    expect(finalizedListener).toHaveBeenCalledTimes(1);
+    expect(transcriptListener).not.toHaveBeenCalled();
+  });
+
+  it('does not emit "finalized" for a normal Results message without from_finalize', async () => {
+    const { socket, handlers } = createFakeSocket();
+    mockConnect.mockResolvedValue(socket);
+
+    const { emitter, close } = await service.createLiveSession('sess-9');
+    cleanups.push(close);
+
+    const finalizedListener = jest.fn();
+    emitter.on('finalized', finalizedListener);
+
+    handlers['message']({ type: 'Results', is_final: true, channel: { alternatives: [{ transcript: 'hello' }] } });
+
+    expect(finalizedListener).not.toHaveBeenCalled();
   });
 });

@@ -118,8 +118,13 @@ export interface ConversationMessage {
   latency_ms: number | null;
   document_id: string | null;
   document: DocumentMeta | null;
+  client_message_id: string | null;
+  conversation_sequence: number | null;
+  delivery_source: MessageDeliverySource;
   created_at: Date;
 }
+
+export type MessageDeliverySource = 'text' | 'voice' | 'attachment' | 'regenerate';
 
 export interface SaveMessageDto {
   conversationId: string;
@@ -132,6 +137,10 @@ export interface SaveMessageDto {
   tokensUsed?: number;
   latencyMs?: number;
   documentId?: string;
+  /** Set only by the durable chat command path — undefined for voice-originated messages. */
+  clientMessageId?: string;
+  /** Defaults to 'voice' to match every existing caller's behavior unchanged. */
+  deliverySource?: MessageDeliverySource;
 }
 
 // ─── Service ──────────────────────────────────────────────────────────────────
@@ -186,37 +195,55 @@ export class ConversationService {
 
   // ── Save a message ──────────────────────────────────────────────────────────
 
-  async saveMessage(dto: SaveMessageDto): Promise<ConversationMessage> {
-    // Transactional: the message insert and the total_messages counter bump
-    // must commit together. Split into two round-trips, a failure between
-    // them leaves a real message behind a stale total_messages = 0 — which
-    // cleanup (purgeEmptyConversations) uses as its "safe to delete" signal.
-    return this.knex.transaction(async (trx) => {
-      const [message] = await trx('conversation_messages')
-        .insert({
-          conversation_id: dto.conversationId,
-          role: dto.role,
-          content: dto.content,
-          transcript: dto.transcript ?? null,
-          audio_url: dto.audioUrl ?? null,
-          audio_duration_ms: dto.audioDurationMs ?? null,
-          speaker_label: dto.speakerLabel ?? null,
-          tokens_used: dto.tokensUsed ?? null,
-          latency_ms: dto.latencyMs ?? null,
-          document_id: dto.documentId ?? null,
-        })
-        .returning('*');
+  /**
+   * @param trx Run inside an already-open transaction (e.g. so a caller can
+   * atomically save the message and insert a related row, like
+   * ChatMessageService does with ai_response_jobs). Omit to have this method
+   * open and commit its own transaction, as every existing caller does.
+   */
+  async saveMessage(dto: SaveMessageDto, trx?: Knex.Transaction): Promise<ConversationMessage> {
+    if (trx) return this.saveMessageInTransaction(dto, trx);
+    // Transactional: the message insert and the conversation counter bumps
+    // must commit together. Split into separate round-trips, a failure
+    // between them leaves a real message behind a stale total_messages = 0
+    // — which cleanup (purgeEmptyConversations) uses as its "safe to
+    // delete" signal.
+    return this.knex.transaction((innerTrx) => this.saveMessageInTransaction(dto, innerTrx));
+  }
 
-      await trx('conversations')
-        .where('id', dto.conversationId)
-        .update({
-          total_messages: trx.raw('total_messages + 1'),
-          last_activity_at: new Date(),
-          updated_at: new Date(),
-        });
+  private async saveMessageInTransaction(dto: SaveMessageDto, trx: Knex.Transaction): Promise<ConversationMessage> {
+    // Claim the next sequence atomically — the UPDATE's row lock means a
+    // concurrent saveMessage() for the same conversation blocks until this
+    // commits, so two messages can never be assigned the same sequence.
+    const [{ next_message_sequence: conversationSequence }] = await trx('conversations')
+      .where('id', dto.conversationId)
+      .update({
+        total_messages: trx.raw('total_messages + 1'),
+        next_message_sequence: trx.raw('next_message_sequence + 1'),
+        last_activity_at: new Date(),
+        updated_at: new Date(),
+      })
+      .returning('next_message_sequence');
 
-      return message;
-    });
+    const [message] = await trx('conversation_messages')
+      .insert({
+        conversation_id: dto.conversationId,
+        role: dto.role,
+        content: dto.content,
+        transcript: dto.transcript ?? null,
+        audio_url: dto.audioUrl ?? null,
+        audio_duration_ms: dto.audioDurationMs ?? null,
+        speaker_label: dto.speakerLabel ?? null,
+        tokens_used: dto.tokensUsed ?? null,
+        latency_ms: dto.latencyMs ?? null,
+        document_id: dto.documentId ?? null,
+        client_message_id: dto.clientMessageId ?? null,
+        conversation_sequence: conversationSequence,
+        delivery_source: dto.deliverySource ?? 'voice',
+      })
+      .returning('*');
+
+    return message;
   }
 
   async saveMessageWithTranscriptSegments(
@@ -422,6 +449,24 @@ export class ConversationService {
   async getConversationMessages(conversationId: string, userId: string): Promise<ConversationMessage[]> {
     await this.assertOwnership(conversationId, userId);
     return this.fetchMessagesWithDocuments(conversationId);
+  }
+
+  /**
+   * Reconciliation read for the durable chat command path — messages saved
+   * after a given conversation_sequence. Rows saved before sequencing was
+   * added (or via saveMessageWithTranscriptSegments, which doesn't assign
+   * one) have a NULL conversation_sequence and are never returned here.
+   */
+  async getMessagesAfterSequence(
+    conversationId: string,
+    userId: string,
+    afterSequence: number,
+  ): Promise<ConversationMessage[]> {
+    await this.assertOwnership(conversationId, userId);
+    return this.knex('conversation_messages')
+      .where('conversation_id', conversationId)
+      .andWhere('conversation_sequence', '>', afterSequence)
+      .orderBy('conversation_sequence', 'asc');
   }
 
   // ── Shared messages query with document join ─────────────────────────────────

@@ -86,6 +86,7 @@ interface ActiveSession {
   guestSessionId?: string;
   deepgramEmitter: EventEmitter;
   sendAudio: (chunk: Buffer) => void;
+  sendFinalize: () => void;
   closeDeepgram: () => void;
   accumulatedTranscript: string;
   /**
@@ -184,6 +185,8 @@ interface ActiveSession {
   clientSessionId: string | null;
   /** Currently active recorder/stream identity (sent by the frontend per recorder instance). */
   activeStreamId: string | null;
+  /** streamId of the last audio:stop this session actually finalized/processed — makes a duplicate audio:stop for the same recording a no-op. */
+  lastHandledStopStreamId: string | null;
   /**
    * Last acknowledged sequence per stream (keyed by recordingId).
    * A new recordingId resets the scope — sequence 0 is valid and expected.
@@ -253,6 +256,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    */
   private readonly PROVIDER_RECOVERY_BUFFER_MAX_BYTES = 320_000;
   private readonly PROVIDER_RECOVERY_BUFFER_MAX_MS = 10_000;
+
+  /**
+   * Bounded wait for Deepgram to flush its final diarized result after
+   * audio:stop, via the Finalize control message. Deepgram doesn't
+   * guarantee an acknowledgement when nothing is buffered, so this timeout
+   * is the fallback, not the common case.
+   */
+  private readonly AUDIO_FINALIZE_TIMEOUT_MS = 1_500;
 
   private readonly FILLER_WORDS = new Set([
     'um', 'uh', 'hmm', 'hm', 'ah', 'er', 'erm', 'mhm',
@@ -568,7 +579,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         meetingMode: shouldDiarize,
         audioFormat,
       };
-      const { emitter, sendAudio, close } = await this.deepgramService.createLiveSession(
+      const { emitter, sendAudio, sendFinalize, close } = await this.deepgramService.createLiveSession(
         client.id,
         providerConnectOptions,
       );
@@ -581,6 +592,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         guestSessionId,
         deepgramEmitter: emitter,
         sendAudio,
+        sendFinalize,
         closeDeepgram: close,
         accumulatedTranscript: '',
         pendingInterimTranscript: '',
@@ -627,6 +639,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         recordingSessionId: randomUUID(),
         clientSessionId: (payload as any).clientSessionId ?? null,
         activeStreamId: null,
+        lastHandledStopStreamId: null,
         streamSequences: new Map(),
         audioGapCount: 0,
         providerState: 'active',
@@ -895,13 +908,70 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── audio:stop ─────────────────────────────────────────────────────────────
 
+  /**
+   * Bounded "flush and drain" boundary for audio:stop. audio:stop only
+   * proves the client stopped sending audio, not that Deepgram has finished
+   * processing what was already sent — diarized (dual/multi-speaker)
+   * sessions in particular can still be mid-flight on a final result.
+   * Sends Finalize and waits for the resulting 'finalized' signal (or a
+   * bounded timeout, since Deepgram doesn't guarantee an acknowledgement
+   * when nothing was buffered) before the caller reads any transcript
+   * buffer. The existing 'transcript' listener keeps running throughout
+   * this wait and updates those buffers exactly as it always does.
+   */
+  private finalizeAndDrain(session: ActiveSession, timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        session.deepgramEmitter.off('finalized', onFinalized);
+        resolve();
+      };
+      const onFinalized = () => cleanup();
+      const timer = setTimeout(cleanup, timeoutMs);
+      session.deepgramEmitter.on('finalized', onFinalized);
+      try {
+        session.sendFinalize();
+      } catch (err) {
+        this.logger.warn(`sendFinalize threw: ${(err as Error).message}`);
+        cleanup();
+      }
+    });
+  }
+
   @SubscribeMessage('audio:stop')
   async handleAudioStop(@ConnectedSocket() client: Socket): Promise<void> {
     const session = this.sessions.get(client.id);
     if (!session) return;
 
+    const streamId = session.activeStreamId;
+
+    // Duplicate/concurrent audio:stop for the same recording — already
+    // handled or already being handled. Set synchronously, before the
+    // await below, so two audio:stop events arriving back-to-back (both
+    // dispatched before either handler yields) can't both pass this check.
+    if (streamId !== null && streamId === session.lastHandledStopStreamId) return;
+    session.lastHandledStopStreamId = streamId;
+
+    const drainStartedAt = Date.now();
+    await this.finalizeAndDrain(session, this.AUDIO_FINALIZE_TIMEOUT_MS);
+    const drainMs = Date.now() - drainStartedAt;
+
+    // A newer recording started while this stop was draining — the buffers
+    // this stop would read may now belong to that newer stream. Bail
+    // without touching anything; this is what stops a late result from
+    // recording A leaking into recording B.
+    if (session.activeStreamId !== streamId) {
+      this.logger.warn(`[${client.id}] audio:stop for stale streamId=${streamId} (now ${session.activeStreamId}) — dropped, drainMs=${drainMs}`);
+      return;
+    }
+
     // Multi-speaker: flush pending turns (minWords=1 so stop never silently discards).
     if (session.isMultiSpeaker) {
+      this.logger.log(`[${client.id}] audio:stop streamId=${streamId} drainMs=${drainMs} turnsPending=${session.pendingMultiSpeakerTurns.length}`);
+      client.emit('audio:finalized', { recordingId: streamId, transcriptDetected: session.pendingMultiSpeakerTurns.length > 0 });
       await this.flushMultiSpeakerTurns(client, session, { reason: 'audio_stop', minWords: 1 });
       return;
     }
@@ -915,6 +985,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.accumulatedTranscript = '';
     session.pendingInterimTranscript = '';
     session.transcriptConfidences = [];
+
+    this.logger.log(`[${client.id}] audio:stop streamId=${streamId} drainMs=${drainMs} transcriptEmpty=${!transcript}`);
+    client.emit('audio:finalized', { recordingId: streamId, transcriptDetected: Boolean(transcript) });
 
     if (!transcript) {
       client.emit('ai:skipped', { reason: 'empty_transcript' });
@@ -2986,7 +3059,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }
 
       try {
-        const { emitter, sendAudio, close } = await this.deepgramService.createLiveSession(
+        const { emitter, sendAudio, sendFinalize, close } = await this.deepgramService.createLiveSession(
           `${client.id}:e${session.providerEpoch + 1}`,
           { ...session.providerConnectOptions, connectionTimeoutMs: 5_000 },
         );
@@ -3001,6 +3074,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         session.deepgramEmitter = emitter;
         session.sendAudio = sendAudio;
+        session.sendFinalize = sendFinalize;
         session.closeDeepgram = close;
         session.providerEpoch += 1;
         this.attachDeepgramListeners(client, session, emitter);

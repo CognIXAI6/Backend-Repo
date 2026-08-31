@@ -29,6 +29,8 @@ interface DeepgramMessagePayload {
   type?: string;
   is_final?: boolean;
   speech_final?: boolean;
+  /** Set on the Results message that flushes buffered audio in response to a Finalize control message. */
+  from_finalize?: boolean;
   channel?: {
     alternatives?: Array<{
       transcript?: string;
@@ -55,6 +57,7 @@ interface V1Socket {
   sendMedia(data: Buffer): void;
   sendCloseStream(msg?: object): void;
   sendKeepAlive(msg: { type: string }): void;
+  sendFinalize(msg: { type: string }): void;
   close(): void;
   readyState: number;
 }
@@ -85,6 +88,7 @@ export class DeepgramService implements OnModuleInit {
   async createLiveSession(sessionId: string, options?: { diarize?: boolean; utteranceEndMs?: number; meetingMode?: boolean; audioFormat?: DeepgramLiveAudioFormat; connectionTimeoutMs?: number }): Promise<{
     emitter: EventEmitter;
     sendAudio: (chunk: Buffer) => void;
+    sendFinalize: () => void;
     close: () => void;
   }> {
     const emitter = new EventEmitter();
@@ -153,15 +157,23 @@ export class DeepgramService implements OnModuleInit {
 
       if (data?.type === 'Results') {
         const alt = data?.channel?.alternatives?.[0];
-        this.logger.debug(`[${sessionId}] transcript="${alt?.transcript ?? ''}" isFinal=${data.is_final}`);
-        if (!alt?.transcript) return;
+        this.logger.debug(`[${sessionId}] transcript="${alt?.transcript ?? ''}" isFinal=${data.is_final} fromFinalize=${data.from_finalize ?? false}`);
 
-        emitter.emit('transcript', {
-          transcript: alt.transcript,
-          isFinal:    data.is_final === true,
-          confidence: alt.confidence ?? 0,
-          words:      alt.words ?? [],
-        } satisfies TranscriptResult);
+        if (alt?.transcript) {
+          emitter.emit('transcript', {
+            transcript: alt.transcript,
+            isFinal:    data.is_final === true,
+            confidence: alt.confidence ?? 0,
+            words:      alt.words ?? [],
+          } satisfies TranscriptResult);
+        }
+
+        // A content-free flush is still a meaningful signal — "nothing was
+        // buffered, I'm done" — so this check must not live behind the
+        // `alt?.transcript` guard above.
+        if (data?.from_finalize === true) {
+          emitter.emit('finalized');
+        }
       }
 
       if (data?.type === 'UtteranceEnd') {
@@ -288,6 +300,25 @@ export class DeepgramService implements OnModuleInit {
       }
     };
 
+    // ── sendFinalize ─────────────────────────────────────────────────────────
+    // Flushes buffered audio without closing the WebSocket — used by the
+    // gateway's audio:stop handler to force Deepgram to emit its final
+    // diarized result before the gateway decides the transcript is empty.
+    // Never throws; a Results message with from_finalize:true isn't
+    // guaranteed if nothing was buffered, so the caller must still apply its
+    // own bounded timeout rather than waiting on this indefinitely.
+    const sendFinalize = (): void => {
+      try {
+        if (socket.readyState === 1) {
+          socket.sendFinalize({ type: 'Finalize' });
+        } else {
+          this.logger.warn(`[${sessionId}] sendFinalize skipped — readyState=${socket.readyState}`);
+        }
+      } catch (err) {
+        this.logger.warn(`[${sessionId}] sendFinalize failed: ${(err as Error).message}`);
+      }
+    };
+
     // ── close ─────────────────────────────────────────────────────────────────
     // readyState: 0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED
     // Only send the close-stream signal when the socket is actually open (1).
@@ -305,6 +336,6 @@ export class DeepgramService implements OnModuleInit {
       } catch (_) {}
     };
 
-    return { emitter, sendAudio, close };
+    return { emitter, sendAudio, sendFinalize, close };
   }
 }
