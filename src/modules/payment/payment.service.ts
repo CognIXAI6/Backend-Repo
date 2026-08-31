@@ -198,47 +198,53 @@ export class PaymentService {
     email: string,
     name?: string | null,
   ): Promise<string> {
-    return this.knex.transaction(async (trx) => {
-      const user = await trx('users').where('id', userId).forUpdate().first();
-      const existingId = user?.stripe_customer_id as string | null;
+    // No DB transaction/lock held across the Stripe calls below — holding a
+    // pooled connection (and previously a `FOR UPDATE` row lock) open for
+    // the duration of a network round-trip to Stripe starves the connection
+    // pool for every other query in the app. Safe without the lock because
+    // the idempotency keys below are deterministic per userId, not random —
+    // Stripe itself already deduplicates a concurrent duplicate call and
+    // returns the same customer for both, so two racing requests still
+    // converge on the same stripe_customer_id.
+    const user = await this.knex('users').where('id', userId).first();
+    const existingId = user?.stripe_customer_id as string | null;
 
-      if (existingId) {
-        // Verify the stored ID still exists in the current Stripe mode.
-        // Fails when IDs were created in test mode but live key is now active (or vice versa),
-        // or when a customer was manually deleted in the Stripe dashboard.
-        let valid = false;
-        try {
-          const existing = await this.stripe.customers.retrieve(existingId);
-          valid = !(existing as Stripe.DeletedCustomer).deleted;
-        } catch (err) {
-          if ((err as any).code !== 'resource_missing') throw err;
-          // resource_missing = stale ID (test/live mismatch or deleted) — fall through
-        }
-
-        if (valid) return existingId;
-
-        this.logger.warn(
-          `Stale Stripe customer ${existingId} for user ${userId} (test/live mismatch or deleted) — creating a new one`,
-        );
+    if (existingId) {
+      // Verify the stored ID still exists in the current Stripe mode.
+      // Fails when IDs were created in test mode but live key is now active (or vice versa),
+      // or when a customer was manually deleted in the Stripe dashboard.
+      let valid = false;
+      try {
+        const existing = await this.stripe.customers.retrieve(existingId);
+        valid = !(existing as Stripe.DeletedCustomer).deleted;
+      } catch (err) {
+        if ((err as any).code !== 'resource_missing') throw err;
+        // resource_missing = stale ID (test/live mismatch or deleted) — fall through
       }
 
-      // Use a different idempotency key for recreation vs first creation so Stripe
-      // doesn't return the cached (now-invalid) customer from the original key.
-      const idempotencyKey = existingId
-        ? `customer-recreate-${userId}`
-        : `customer-create-${userId}`;
+      if (valid) return existingId;
 
-      const customer = await this.stripe.customers.create(
-        { email, name: name ?? undefined },
-        { idempotencyKey },
+      this.logger.warn(
+        `Stale Stripe customer ${existingId} for user ${userId} (test/live mismatch or deleted) — creating a new one`,
       );
+    }
 
-      await trx('users')
-        .where('id', userId)
-        .update({ stripe_customer_id: customer.id, updated_at: new Date() });
+    // Use a different idempotency key for recreation vs first creation so Stripe
+    // doesn't return the cached (now-invalid) customer from the original key.
+    const idempotencyKey = existingId
+      ? `customer-recreate-${userId}`
+      : `customer-create-${userId}`;
 
-      return customer.id;
-    });
+    const customer = await this.stripe.customers.create(
+      { email, name: name ?? undefined },
+      { idempotencyKey },
+    );
+
+    await this.knex('users')
+      .where('id', userId)
+      .update({ stripe_customer_id: customer.id, updated_at: new Date() });
+
+    return customer.id;
   }
 
   // ── Checkout session (geo-routed) ────────────────────────────────────────────

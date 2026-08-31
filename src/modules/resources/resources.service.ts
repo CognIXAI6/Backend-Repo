@@ -91,25 +91,30 @@ export class ResourcesService {
       await this.assertFieldExists(dto.fieldId);
     }
 
+    if (dto.conversationIds?.length) {
+      await this.assertConversationsOwnedByUser(userId, dto.conversationIds);
+    }
+
+    // Upload BEFORE opening the transaction — Cloudinary is a slow external
+    // network call, and holding a pooled DB connection open for its duration
+    // starves the pool for every other query in the app (max 10-20
+    // connections). A ROLLBACK here was never able to undo an already-
+    // uploaded file anyway, so this doesn't change atomicity, only pool usage.
+    let fileUrl: string | null = null;
+    let fileName: string | null = null;
+    let fileSize: number | null = null;
+    let mimeType: string | null = null;
+
+    if (file) {
+      const cloudinaryType = this.toCloudinaryResourceType(file.mimetype);
+      const uploadResult = await this.uploadService.uploadFile(file, UploadFolder.RESOURCES, cloudinaryType);
+      fileUrl = uploadResult.secure_url;
+      fileName = file.originalname;
+      fileSize = file.size;
+      mimeType = file.mimetype;
+    }
+
     return this.knex.transaction(async (trx) => {
-      let fileUrl: string | null = null;
-      let fileName: string | null = null;
-      let fileSize: number | null = null;
-      let mimeType: string | null = null;
-
-      if (file) {
-        const cloudinaryType = this.toCloudinaryResourceType(file.mimetype);
-        const uploadResult = await this.uploadService.uploadFile(file, UploadFolder.RESOURCES, cloudinaryType);
-        fileUrl = uploadResult.secure_url;
-        fileName = file.originalname;
-        fileSize = file.size;
-        mimeType = file.mimetype;
-      }
-
-      if (dto.conversationIds?.length) {
-        await this.assertConversationsOwnedByUser(userId, dto.conversationIds, trx);
-      }
-
       const [resource] = await trx('resources')
         .insert({
           user_id: userId,
