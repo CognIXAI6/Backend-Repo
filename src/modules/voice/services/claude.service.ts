@@ -303,9 +303,16 @@ export class ClaudeService implements OnModuleInit {
             let content = 'Search failed — please answer based on your training knowledge.';
             try {
               const r = await this.tavilyClient!.search(query, { searchDepth: 'basic', maxResults: 5 });
-              content = r.results
-                .map((res, i) => `[${i + 1}] ${res.title}\n${res.content}\nSource: ${res.url}`)
-                .join('\n\n');
+              // An empty array joins to '' — an ambiguous, uninformative
+              // tool_result that leaves the model nothing to work with.
+              // Observed to trigger the model narrating its own tool-call/
+              // tool-response transcript in the visible reply instead of
+              // just answering, so always give it an explicit signal.
+              content = r.results.length > 0
+                ? r.results
+                    .map((res, i) => `[${i + 1}] ${res.title}\n${res.content}\nSource: ${res.url}`)
+                    .join('\n\n')
+                : 'No web search results were found for this query. Answer using your training knowledge and note that live results were unavailable.';
             } catch (err) {
               this.logger.error(`Tavily search error for "${query}":`, err);
             }
@@ -393,7 +400,12 @@ export class ClaudeService implements OnModuleInit {
         }
       }
 
-      await callbacks.onDone(fullText, inputTokens, outputTokens);
+      // Defensive net: if the model still narrates a tool-call/tool-response
+      // transcript despite the system prompt forbidding it, strip it before
+      // persisting. This matters beyond cosmetics — a contaminated turn left
+      // in conversation history teaches the model (via its own prior turn)
+      // to keep repeating the pattern on subsequent messages.
+      await callbacks.onDone(this.stripToolCallArtifacts(fullText), inputTokens, outputTokens);
     } catch (error) {
       this.logger.error('Claude stream error:', error);
       callbacks.onError(error instanceof Error ? error : new Error(String(error)));
@@ -403,6 +415,20 @@ export class ClaudeService implements OnModuleInit {
   /**
    * Builds a system prompt based on user's professional field.
    */
+  /**
+   * Removes a leaked <tool_call>/<tool_response> narration from a response,
+   * should the model produce one despite the system prompt forbidding it —
+   * these are never part of Anthropic's actual tool-use protocol, so any
+   * occurrence in visible text is the model narrating instead of answering.
+   */
+  private stripToolCallArtifacts(text: string): string {
+    return text
+      .replace(/<tool_call>[\s\S]*?<\/tool_response>/gi, '')
+      .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+      .replace(/<tool_response>[\s\S]*?<\/tool_response>/gi, '')
+      .trim();
+  }
+
   buildSystemPrompt(fieldName?: string, aiMemory?: string, documentContext?: string | null): string {
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', {
@@ -465,6 +491,12 @@ NEVER return silence. A short clarification is always better than no response.
 
 You have access to a web_search tool. Use it for current events, live data, or anything after your training cutoff.
 When search results are used, include the source as a bullet with a markdown link — no full article content.
+If a search returns no results, say so in one short bullet and answer from your training knowledge — do not speculate about why it failed.
+
+## NEVER NARRATE TOOL USE — MANDATORY
+- NEVER include <tool_call>, <tool_response>, or any similar tags, JSON, or pseudo-code in your response.
+- NEVER describe, summarise, or transcribe the fact that you called a tool, what you searched for, or what the raw tool result was.
+- The tool call and its result are invisible to the user — respond ONLY with your final answer in the bullet format above.
 
 You also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. After the document is generated, respond with a brief confirmation and the download link.`;
 
