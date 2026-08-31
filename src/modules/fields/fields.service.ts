@@ -2,6 +2,7 @@ import { Injectable, Inject, NotFoundException, BadRequestException } from '@nes
 import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { slugify } from '@/common';
+import { CreateFieldDto, UpdateFieldDto } from './dto/fields.dto';
 
 export interface Field {
   id: string;
@@ -236,5 +237,78 @@ export class FieldsService {
     async getAppSetting(key: string) {
     const setting = await this.knex('app_settings').where('key', key).first();
     return setting?.value;
+  }
+
+  // ── Admin management ────────────────────────────────────────────────────────
+
+  /** All fields regardless of is_active — the public findAll() only returns active ones. */
+  async findAllAdmin(): Promise<Field[]> {
+    return this.knex('fields').orderBy('name');
+  }
+
+  async createField(dto: CreateFieldDto): Promise<Field> {
+    const slug = slugify(dto.slug ?? dto.name);
+
+    try {
+      const [field] = await this.knex('fields')
+        .insert({
+          name: dto.name,
+          slug,
+          description: dto.description ?? null,
+          icon: dto.icon ?? null,
+          requires_verification: dto.requiresVerification ?? false,
+          is_system: dto.isSystem ?? true,
+          is_free: dto.isFree ?? false,
+          is_active: dto.isActive ?? true,
+        })
+        .returning('*');
+      return field;
+    } catch (err: any) {
+      if (err?.code === '23505') throw new BadRequestException('A field with this name or slug already exists');
+      throw err;
+    }
+  }
+
+  async updateField(id: string, dto: UpdateFieldDto): Promise<Field> {
+    const existing = await this.findById(id);
+    if (!existing) throw new NotFoundException('Field not found');
+
+    const updatePayload: Record<string, unknown> = {};
+    if (dto.name !== undefined) updatePayload.name = dto.name;
+    // Slug is only rewritten when explicitly provided — a name-only update
+    // must not silently break existing slug-based lookups/links elsewhere.
+    if (dto.slug !== undefined) updatePayload.slug = slugify(dto.slug);
+    if (dto.description !== undefined) updatePayload.description = dto.description;
+    if (dto.icon !== undefined) updatePayload.icon = dto.icon;
+    if (dto.requiresVerification !== undefined) updatePayload.requires_verification = dto.requiresVerification;
+    if (dto.isSystem !== undefined) updatePayload.is_system = dto.isSystem;
+    if (dto.isFree !== undefined) updatePayload.is_free = dto.isFree;
+    if (dto.isActive !== undefined) updatePayload.is_active = dto.isActive;
+
+    if (Object.keys(updatePayload).length === 0) {
+      throw new BadRequestException('No fields provided to update');
+    }
+
+    try {
+      const [field] = await this.knex('fields').where('id', id).update(updatePayload).returning('*');
+      return field;
+    } catch (err: any) {
+      if (err?.code === '23505') throw new BadRequestException('A field with this name or slug already exists');
+      throw err;
+    }
+  }
+
+  /**
+   * Soft delete only. `fields.id` cascades into user_fields and
+   * professional_verification_fields, so a hard delete would silently wipe
+   * users' field assignments and verification records — deactivating is the
+   * only supported removal path through this endpoint.
+   */
+  async deactivateField(id: string): Promise<Field> {
+    const existing = await this.findById(id);
+    if (!existing) throw new NotFoundException('Field not found');
+
+    const [field] = await this.knex('fields').where('id', id).update({ is_active: false }).returning('*');
+    return field;
   }
 }

@@ -47,6 +47,16 @@ export async function seed(knex: Knex): Promise<void> {
       is_active: true,
     },
     {
+      name: 'Politics',
+      slug: 'politics',
+      description: 'Political transcription',
+      icon: 'landmark',
+      requires_verification: false,
+      is_system: true,
+      is_free: false,
+      is_active: true,
+    },
+    {
       name: 'Religion',
       slug: 'religion',
       description: 'Faith transcription',

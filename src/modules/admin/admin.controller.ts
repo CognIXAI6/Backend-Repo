@@ -1,11 +1,13 @@
 import {
   Controller, Get, Post, Patch, Delete,
   Body, Param, Query, Req,
-  UseGuards, HttpCode, HttpStatus,
+  UseGuards, HttpCode, HttpStatus, NotFoundException,
 } from '@nestjs/common';
 import { Request } from 'express';
 import { AdminService, Period, AdminRole } from './admin.service';
 import { AdminGuard } from './admin.guard';
+import { FieldsService } from '../fields/fields.service';
+import { CreateFieldDto, UpdateFieldDto } from '../fields/dto/fields.dto';
 
 function adminFromReq(req: Request): any {
   return (req as any).admin;
@@ -13,7 +15,10 @@ function adminFromReq(req: Request): any {
 
 @Controller('admin')
 export class AdminController {
-  constructor(private adminService: AdminService) {}
+  constructor(
+    private adminService: AdminService,
+    private fieldsService: FieldsService,
+  ) {}
 
   // ── Auth ───────────────────────────────────────────────────────────────────
 
@@ -185,5 +190,43 @@ export class AdminController {
     return this.adminService.getErrorLogs({
       page: Number(page), limit: Number(limit), source, severity,
     });
+  }
+
+  // ── Fields management ─────────────────────────────────────────────────────
+
+  @Get('fields')
+  @UseGuards(AdminGuard)
+  listFields() {
+    return this.fieldsService.findAllAdmin();
+  }
+
+  @Get('fields/:id')
+  @UseGuards(AdminGuard)
+  async getField(@Param('id') id: string) {
+    const field = await this.fieldsService.findById(id);
+    if (!field) throw new NotFoundException('Field not found');
+    return field;
+  }
+
+  @Post('fields')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.CREATED)
+  createField(@Body() dto: CreateFieldDto) {
+    return this.fieldsService.createField(dto);
+  }
+
+  @Patch('fields/:id')
+  @UseGuards(AdminGuard)
+  updateField(@Param('id') id: string, @Body() dto: UpdateFieldDto) {
+    return this.fieldsService.updateField(id, dto);
+  }
+
+  // Soft delete only — deactivates the field rather than removing the row.
+  // See FieldsService.deactivateField for why a hard delete isn't offered.
+  @Delete('fields/:id')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.OK)
+  deactivateField(@Param('id') id: string) {
+    return this.fieldsService.deactivateField(id);
   }
 }

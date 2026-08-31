@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DeepgramClient } from '@deepgram/sdk';
 import { EventEmitter } from 'events';
+import { ProviderCloseInfo } from '../interfaces/provider-session.types';
 
 export interface TranscriptWord {
   word: string;
@@ -37,11 +38,17 @@ interface DeepgramMessagePayload {
   };
 }
 
+interface DeepgramCloseEvent {
+  code?: number;
+  reason?: string;
+  wasClean?: boolean;
+}
+
 // Full V1Socket interface including waitForOpen()
 interface V1Socket {
   on(event: 'open',    cb: () => void): void;
   on(event: 'message', cb: (data: DeepgramMessagePayload) => void): void;
-  on(event: 'close',   cb: (event: unknown) => void): void;
+  on(event: 'close',   cb: (event: DeepgramCloseEvent) => void): void;
   on(event: 'error',   cb: (err: Error) => void): void;
   connect(): V1Socket;           // starts the WS handshake, returns this
   waitForOpen(): Promise<void>;  // resolves once readyState === OPEN
@@ -75,13 +82,20 @@ export class DeepgramService implements OnModuleInit {
     this.logger.log('Deepgram client initialized (SDK v5)');
   }
 
-  async createLiveSession(sessionId: string, options?: { diarize?: boolean; utteranceEndMs?: number; meetingMode?: boolean; audioFormat?: DeepgramLiveAudioFormat }): Promise<{
+  async createLiveSession(sessionId: string, options?: { diarize?: boolean; utteranceEndMs?: number; meetingMode?: boolean; audioFormat?: DeepgramLiveAudioFormat; connectionTimeoutMs?: number }): Promise<{
     emitter: EventEmitter;
     sendAudio: (chunk: Buffer) => void;
     close: () => void;
   }> {
     const emitter = new EventEmitter();
     let keepAliveTimer: NodeJS.Timeout | undefined;
+    const connectionTimeoutMs = options?.connectionTimeoutMs ?? 10_000;
+    // Diagnostics captured for the eventual 'close' event — lets recovery
+    // orchestration in the gateway distinguish a genuinely dead connection
+    // from one that was simply idle, and correlate error+close pairs.
+    let lastAudioAt: number | null = null;
+    let lastKeepAliveAt: number | null = null;
+    let sawError = false;
 
     // ── Step 1: build the V1Socket (does NOT open the connection yet) ─────────
     const rawSocket = (await this.deepgram.listen.v1.connect({
@@ -110,8 +124,8 @@ export class DeepgramService implements OnModuleInit {
       // The gateway catch block will surface a clear error to the client instead
       // of leaving 30 zombie reconnect attempts running in the background.
       reconnectAttempts:       0,
-      // Close the TCP connection if the WS upgrade doesn't complete within 10 s.
-      connectionTimeoutInSeconds: 10,
+      // Close the TCP connection if the WS upgrade doesn't complete in time.
+      connectionTimeoutInSeconds: Math.ceil(connectionTimeoutMs / 1000),
     })) as unknown as V1Socket;
 
     // The SDK's V1Socket.close() synchronously calls the underlying
@@ -160,20 +174,32 @@ export class DeepgramService implements OnModuleInit {
       if (data?.type === 'Error') {
         const msg = (data as any)?.description ?? (data as any)?.message ?? 'Deepgram stream error';
         this.logger.warn(`[${sessionId}] Deepgram stream error message: ${msg}`);
+        sawError = true;
         if (emitter.listenerCount('error') > 0) {
           emitter.emit('error', new Error(msg));
         }
       }
     });
 
-    rawSocket.on('close', () => {
-      this.logger.log(`[${sessionId}] Deepgram connection closed`);
+    rawSocket.on('close', (event) => {
+      this.logger.log(`[${sessionId}] Deepgram connection closed code=${event?.code ?? 'n/a'} reason=${event?.reason ?? ''}`);
       if (keepAliveTimer) clearInterval(keepAliveTimer);
-      emitter.emit('close');
+      const closeInfo: ProviderCloseInfo = {
+        code: event?.code ?? null,
+        reason: event?.reason ?? null,
+        wasClean: event?.wasClean ?? null,
+        readyStateAtClose: socket.readyState,
+        errorPreceded: sawError,
+        lastAudioAt,
+        lastKeepAliveAt,
+        closedAt: Date.now(),
+      };
+      emitter.emit('close', closeInfo);
     });
 
     rawSocket.on('error', (err: Error) => {
       this.logger.error(`[${sessionId}] Deepgram error: ${err.message}`);
+      sawError = true;
       // Guard: if listeners were removed (session cleanup), emitting 'error' on a
       // bare EventEmitter crashes Node.js with "Unhandled 'error' event".
       if (emitter.listenerCount('error') > 0) {
@@ -189,16 +215,21 @@ export class DeepgramService implements OnModuleInit {
     // failure, etc.).  Wrap it so the gateway always gets a proper Error with a
     // human-readable message, and close the socket immediately on failure so the
     // underlying ReconnectingWebSocket stops its retry loop.
+    let openTimeoutHandle: NodeJS.Timeout | undefined;
     try {
-      // Race waitForOpen() against a 10-second timeout so a hanging TCP connection
+      // Race waitForOpen() against a timeout so a hanging TCP connection
       // (Deepgram accepts TCP but never upgrades to WS) doesn't block forever.
+      // The timer is cleared as soon as the race settles either way, so it
+      // never lingers as an open handle past this call.
       await Promise.race([
         socket.waitForOpen(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Deepgram connection timed out after 10 s')), 10_000),
-        ),
+        new Promise<never>((_, reject) => {
+          openTimeoutHandle = setTimeout(() => reject(new Error(`Deepgram connection timed out after ${connectionTimeoutMs} ms`)), connectionTimeoutMs);
+        }),
       ]);
+      clearTimeout(openTimeoutHandle);
     } catch (err) {
+      clearTimeout(openTimeoutHandle);
       // Convert non-Error rejections (e.g. ErrorEvent from the WS layer) to
       // proper Error instances so callers always have a .message to log/display.
       const reason =
@@ -231,9 +262,14 @@ export class DeepgramService implements OnModuleInit {
       try {
         if (socket.readyState === 1) {
           socket.sendKeepAlive({ type: 'KeepAlive' });
+          lastKeepAliveAt = Date.now();
         }
       } catch (err) {
         this.logger.warn(`[${sessionId}] sendKeepAlive failed: ${(err as Error).message}`);
+        // A failed KeepAlive means the connection is unhealthy even though no
+        // 'close'/'error' event has fired yet — surface it so the gateway can
+        // start recovery instead of silently continuing to ping a dead socket.
+        emitter.emit('transportFailure', { source: 'sendKeepAlive', error: err as Error });
       }
     }, DEEPGRAM_KEEPALIVE_INTERVAL_MS);
 
@@ -242,11 +278,13 @@ export class DeepgramService implements OnModuleInit {
       try {
         if (socket.readyState === 1) {
           socket.sendMedia(chunk);
+          lastAudioAt = Date.now();
         } else {
           this.logger.warn(`[${sessionId}] sendAudio skipped — readyState=${socket.readyState}`);
         }
       } catch (err) {
         this.logger.warn(`[${sessionId}] sendMedia failed: ${(err as Error).message}`);
+        emitter.emit('transportFailure', { source: 'sendMedia', error: err as Error });
       }
     };
 

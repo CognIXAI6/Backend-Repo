@@ -28,6 +28,9 @@ import { FieldsService } from '@/modules/fields/fields.service';
 import { ErrorLogService } from '@/modules/error-log/error-log.service';
 import { DocumentService } from '@/modules/documents/document.service';
 import { PushNotificationService } from '@/modules/notifications/push-notification.service';
+import { ProviderSessionState, ProviderCloseInfo } from './interfaces/provider-session.types';
+import { ProviderDisruptionReason } from './interfaces/voice-events.types';
+import { computeBackoffDelayMs, sleep, PROVIDER_RECOVERY_MAX_ATTEMPTS } from './utils/backoff.util';
 
 // ─── Mode types ───────────────────────────────────────────────────────────────
 
@@ -188,6 +191,27 @@ interface ActiveSession {
   streamSequences: Map<string, number>;
   /** Total cross-stream gap count (for metrics only — does not drive recovery). */
   audioGapCount: number;
+
+  // ── Provider connection lifecycle (recovery) ──────────────────────────────
+  providerState: ProviderSessionState;
+  /** Incremented each time the underlying Deepgram connection is replaced by recovery. Starts at 0. */
+  providerEpoch: number;
+  /** Non-null only while providerState === 'recovering'. */
+  currentRecoveryId: string | null;
+  /** 1-based attempt counter for the in-flight recovery sequence. */
+  recoveryAttempt: number;
+  /** Exact connect options used for the live Deepgram session — captured once at session:start so recovery can recreate it identically. */
+  providerConnectOptions: {
+    diarize: boolean;
+    utteranceEndMs: number;
+    meetingMode: boolean;
+    audioFormat?: DeepgramLiveAudioFormat;
+  };
+  /** Bounded audio replay buffer used only while providerState === 'recovering'. Separate from the speaker-ID audioBuffer above. */
+  recoveryAudioBuffer: Array<{ chunk: Buffer; enqueuedAt: number }>;
+  recoveryAudioBufferBytes: number;
+  /** Wall-clock timestamp when overflow-driven dropping started this recovery cycle; null when not currently dropping. */
+  recoveryBufferOverflowStartedAt: number | null;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
@@ -220,6 +244,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly RETRY_IDENTIFICATION_EXTRA_S = 6;
   /** Milliseconds of inactivity before a session is auto-closed (30 min). */
   private readonly SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+  /**
+   * Bounds for the audio replay buffer accumulated while providerState ===
+   * 'recovering'. Sized for ~10 s of 16 kHz/16-bit mono PCM; for lower-bitrate
+   * client formats (e.g. Opus/WebM) the byte cap is looser than 10 s in
+   * practice, with the time cap doing the real work.
+   */
+  private readonly PROVIDER_RECOVERY_BUFFER_MAX_BYTES = 320_000;
+  private readonly PROVIDER_RECOVERY_BUFFER_MAX_MS = 10_000;
 
   private readonly FILLER_WORDS = new Set([
     'um', 'uh', 'hmm', 'hm', 'ah', 'er', 'erm', 'mhm',
@@ -529,14 +562,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
 
       // ── Open Deepgram live session ────────────────────────────────────────
+      const providerConnectOptions = {
+        diarize: shouldDiarize,
+        utteranceEndMs: shouldDiarize ? 2000 : 1500,
+        meetingMode: shouldDiarize,
+        audioFormat,
+      };
       const { emitter, sendAudio, close } = await this.deepgramService.createLiveSession(
         client.id,
-        {
-          diarize: shouldDiarize,
-          utteranceEndMs: shouldDiarize ? 2000 : 1500,
-          meetingMode: shouldDiarize,
-          audioFormat,
-        },
+        providerConnectOptions,
       );
 
       const session: ActiveSession = {
@@ -595,362 +629,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         activeStreamId: null,
         streamSequences: new Map(),
         audioGapCount: 0,
+        providerState: 'active',
+        providerEpoch: 0,
+        currentRecoveryId: null,
+        recoveryAttempt: 0,
+        providerConnectOptions,
+        recoveryAudioBuffer: [],
+        recoveryAudioBufferBytes: 0,
+        recoveryBufferOverflowStartedAt: null,
       };
 
-      // ── Deepgram transcript handler ───────────────────────────────────────
-      emitter.on('transcript', (result) => {
-        if (!result.isFinal) {
-          if (!shouldDiarize) {
-            session.pendingInterimTranscript = result.transcript;
-          }
-          client.emit('transcript:update', {
-            transcript: (session.accumulatedTranscript + ' ' + result.transcript).trim(),
-            isFinal: false,
-            confidence: result.confidence,
-          });
-          return;
-        }
-
-        session.pendingInterimTranscript = '';
-
-        if (typeof result.confidence === 'number') {
-          session.transcriptConfidences.push(result.confidence);
-        }
-
-        // ── Multi-speaker path ────────────────────────────────────────────
-        if (session.isMultiSpeaker) {
-          const words: TranscriptWord[] = result.words ?? [];
-          const turns = this.buildMultiSpeakerTurns(session, words, result.confidence, result.transcript);
-
-          // Track per-speaker accumulated speech duration
-          for (const w of words) {
-            const spk = w.speaker ?? 0;
-            const dur = (w.end ?? 0) - (w.start ?? 0);
-            session.speakerWordSeconds.set(spk, (session.speakerWordSeconds.get(spk) ?? 0) + dur);
-          }
-
-          // Update dominant speaker for audio tagging
-          const dominantInResult = words.reduce((acc, w) => {
-            const spk = w.speaker ?? 0;
-            acc.set(spk, (acc.get(spk) ?? 0) + 1);
-            return acc;
-          }, new Map<number, number>());
-          if (dominantInResult.size > 0) {
-            session.currentDominantSpeaker = [...dominantInResult.entries()].sort((a, b) => b[1] - a[1])[0][0];
-          }
-
-          session.multiSpeakerHistory.push(...turns);
-          session.pendingMultiSpeakerTurns.push(...turns);
-          session.accumulatedTranscript = turns.map((t) => t.text).join(' ');
-
-          // Trigger per-speaker identification (first attempt + retry on prior failure)
-          if (!session.isGuest && this.voiceVerificationService.isEnabled) {
-            for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
-              const alreadyTriggered = session.speakerIdentificationTriggered.has(spkId);
-              const prevFailed = session.speakerIdentificationFailed.has(spkId);
-              const attemptedAtSeconds = session.speakerIdentificationAtSeconds.get(spkId) ?? 0;
-
-              const isFirstAttempt = !alreadyTriggered && seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S;
-              // Retry after a failed attempt once they've spoken RETRY_IDENTIFICATION_EXTRA_S
-              // more seconds since the last attempt — avoids thrashing on poor-audio windows.
-              const isRetry = alreadyTriggered && prevFailed &&
-                seconds >= attemptedAtSeconds + this.RETRY_IDENTIFICATION_EXTRA_S;
-
-              if (isFirstAttempt || isRetry) {
-                session.speakerIdentificationTriggered.add(spkId);
-                session.speakerIdentificationFailed.delete(spkId);
-                session.speakerIdentificationAtSeconds.set(spkId, seconds);
-                this.identifyMultiSpeaker(client, session, spkId).catch((err) =>
-                  this.logger.error(`[${client.id}] identifyMultiSpeaker error (speaker ${spkId}):`, err),
-                );
-              }
-            }
-          }
-
-          // Trigger backend calibration
-          if (!session.voiceCalibrationTriggered && !session.isGuest) {
-            const totalSpeech = [...session.speakerWordSeconds.values()].reduce((a, b) => a + b, 0);
-            if (totalSpeech >= this.CALIBRATION_SPEECH_THRESHOLD_S && session.audioBuffer.length > 0) {
-              session.voiceCalibrationTriggered = true;
-              this.autoVoiceCalibration(client, session).catch((err) =>
-                this.logger.error(`[${client.id}] Auto voice calibration error:`, err),
-              );
-            }
-          }
-
-          client.emit('transcript:update', {
-            mode: 'multiple_speaker',
-            isFinal: true,
-            confidence: result.confidence,
-            transcript: session.accumulatedTranscript,
-            segments: turns,
-          });
-          return;
-        }
-
-        // ── Dual-speaker path ─────────────────────────────────────────────
-        if (session.isDualSpeaker) {
-          const words: TranscriptWord[] = result.words ?? [];
-          const speakerTexts = new Map<number, string>();
-          for (const w of words) {
-            const spk = w.speaker ?? 0;
-            speakerTexts.set(spk, ((speakerTexts.get(spk) ?? '') + ' ' + w.word).trim());
-          }
-
-          const dominantInResult = [...speakerTexts.entries()]
-            .sort((a, b) => b[1].length - a[1].length)[0]?.[0];
-          if (dominantInResult !== undefined) {
-            session.currentDominantSpeaker = dominantInResult;
-          }
-
-          for (const w of words) {
-            const spk = w.speaker ?? 0;
-            const dur = (w.end ?? 0) - (w.start ?? 0);
-            session.speakerWordSeconds.set(spk, (session.speakerWordSeconds.get(spk) ?? 0) + dur);
-          }
-
-          if (!session.calibrationPhase && !session.isGuest && this.voiceVerificationService.isEnabled) {
-            for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
-              const alreadyTriggered = session.speakerIdentificationTriggered.has(spkId);
-              const prevFailed = session.speakerIdentificationFailed.has(spkId);
-              const attemptedAtSeconds = session.speakerIdentificationAtSeconds.get(spkId) ?? 0;
-
-              const isFirstAttempt = !alreadyTriggered && seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S;
-              const isRetry = alreadyTriggered && prevFailed &&
-                seconds >= attemptedAtSeconds + this.RETRY_IDENTIFICATION_EXTRA_S;
-
-              if (isFirstAttempt || isRetry) {
-                session.speakerIdentificationTriggered.add(spkId);
-                session.speakerIdentificationFailed.delete(spkId);
-                session.speakerIdentificationAtSeconds.set(spkId, seconds);
-                this.identifyDualSpeaker(client, session, spkId).catch((err) =>
-                  this.logger.error(`[${client.id}] identifyDualSpeaker error (speaker ${spkId}):`, err),
-                );
-              }
-            }
-          }
-
-          if (session.calibrationPhase && words.length >= 3) {
-            const wordCounts = new Map<number, number>();
-            for (const w of words) {
-              const spk = w.speaker ?? 0;
-              wordCounts.set(spk, (wordCounts.get(spk) ?? 0) + 1);
-            }
-            const sorted = [...wordCounts.entries()].sort((a, b) => b[1] - a[1]);
-            const dominantSpeaker = sorted[0][0];
-            const totalWords = [...wordCounts.values()].reduce((a, b) => a + b, 0);
-            const calibrationConfidence = totalWords > 0 ? sorted[0][1] / totalWords : 1;
-
-            session.ownerSpeakerId = dominantSpeaker;
-            session.calibrationPhase = false;
-            this.logger.log(
-              `[${client.id}] Word-count calibration: owner=speaker ${dominantSpeaker}, confidence=${calibrationConfidence.toFixed(2)}`,
-            );
-            client.emit('calibration:complete', {
-              ownerSpeakerId: dominantSpeaker,
-              method: 'word_count',
-              confidence: calibrationConfidence,
-              speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
-              message: calibrationConfidence >= 0.7
-                ? 'Voice identified. Biometric verification in progress…'
-                : 'Initial speaker assignment made, but confidence is low. Biometric verification in progress…',
-            });
-          }
-
-          if (!session.voiceCalibrationTriggered && !session.isGuest) {
-            const totalSpeech = [...session.speakerWordSeconds.values()].reduce((a, b) => a + b, 0);
-            if (totalSpeech >= this.CALIBRATION_SPEECH_THRESHOLD_S && session.audioBuffer.length > 0) {
-              session.voiceCalibrationTriggered = true;
-              this.autoVoiceCalibration(client, session).catch((err) =>
-                this.logger.error(`[${client.id}] Auto voice calibration error:`, err),
-              );
-            }
-          }
-
-          const ownerSpk = session.ownerSpeakerId ?? 0;
-
-          for (const [spkId, text] of speakerTexts.entries()) {
-            if (!text) continue;
-            const label: 'owner' | 'other' = spkId === ownerSpk ? 'owner' : 'other';
-            session.dualSpeakerHistory.push({ speaker: label, text });
-            if (label === 'other') {
-              session.pendingOtherText = (session.pendingOtherText + ' ' + text).trim();
-            } else {
-              session.pendingOwnerText = (session.pendingOwnerText + ' ' + text).trim();
-            }
-          }
-
-          session.accumulatedTranscript =
-            (session.accumulatedTranscript + ' ' + result.transcript).trim();
-
-          client.emit('transcript:update', {
-            transcript: session.accumulatedTranscript,
-            isFinal: true,
-            confidence: result.confidence,
-            speakers: Object.fromEntries(
-              Array.from(speakerTexts.entries()).map(([id, text]) => [
-                id === ownerSpk ? 'owner' : 'other',
-                text,
-              ]),
-            ),
-            speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
-          });
-          return;
-        }
-
-        // ── Single-speaker path ───────────────────────────────────────────
-        session.accumulatedTranscript =
-          (session.accumulatedTranscript + ' ' + result.transcript).trim();
-
-        client.emit('transcript:update', {
-          transcript: session.accumulatedTranscript,
-          isFinal: true,
-          confidence: result.confidence,
-        });
-
-        if (
-          !session.isGuest &&
-          !session.singleSpeakerProfileTriggered &&
-          this.voiceVerificationService.isEnabled
-        ) {
-          const words: TranscriptWord[] = result.words ?? [];
-          if (words.length > 0) {
-            for (const w of words) {
-              session.singleSpeakerSpeechSeconds += (w.end ?? 0) - (w.start ?? 0);
-            }
-          } else {
-            session.singleSpeakerSpeechSeconds +=
-              (result.transcript?.split(/\s+/).filter(Boolean).length ?? 0) / 2.5;
-          }
-
-          if (
-            session.singleSpeakerSpeechSeconds >= this.SINGLE_SPEAKER_PROFILE_THRESHOLD_S &&
-            session.audioBuffer.length > 0
-          ) {
-            session.singleSpeakerProfileTriggered = true;
-            this.buildSingleSpeakerVoiceProfile(client, session).catch((err) =>
-              this.logger.error(`[${client.id}] Single-speaker voice profile build failed:`, err),
-            );
-          }
-        }
-      });
-
-      // ── Debounced Claude trigger ──────────────────────────────────────────
-      emitter.on('utteranceEnd', () => {
-        if (session.isProcessingAI) return;
-
-        if (session.utteranceDebounceTimer) {
-          clearTimeout(session.utteranceDebounceTimer);
-          session.utteranceDebounceTimer = null;
-        }
-
-        session.utteranceDebounceTimer = setTimeout(async () => {
-          session.utteranceDebounceTimer = null;
-          if (session.isProcessingAI) return;
-
-          // ── Multi-speaker path ──────────────────────────────────────────
-          if (session.isMultiSpeaker) {
-            await this.flushMultiSpeakerTurns(client, session, {
-              reason: 'utterance_end',
-              minWords: 8,
-            });
-            return;
-          }
-
-          // ── Dual-speaker path ───────────────────────────────────────────
-          if (session.isDualSpeaker) {
-            if (session.calibrationPhase) return;
-
-            const otherText = session.pendingOtherText.trim();
-            const ownerText = session.pendingOwnerText.trim();
-
-            const combinedWords = `${ownerText} ${otherText}`
-              .trim()
-              .split(/\s+/)
-              .filter(Boolean).length;
-
-            if (combinedWords < 8) return;
-
-            session.pendingOtherText = '';
-            session.pendingOwnerText = '';
-            session.accumulatedTranscript = '';
-            client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
-
-            const primaryText = otherText || ownerText;
-            const contextText = otherText ? ownerText : '';
-            const speakerDetected = Boolean(otherText);
-
-            await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected);
-            return;
-          }
-
-          // ── Single-speaker path ─────────────────────────────────────────
-          const transcript = session.accumulatedTranscript.trim();
-          if (!transcript) return;
-
-          const wordCount = transcript.split(/\s+/).filter(Boolean).length;
-          if (wordCount < 6) return;
-
-          const confidences = [...session.transcriptConfidences];
-          session.accumulatedTranscript = '';
-          session.transcriptConfidences = [];
-
-          const avgConfidence =
-            confidences.length > 0
-              ? confidences.reduce((a, b) => a + b, 0) / confidences.length
-              : 1.0;
-
-          const quality = this.isTranscriptMeaningful(transcript, avgConfidence);
-          if (!quality.pass) {
-            this.logger.log(`UtteranceEnd filtered [${quality.reason}]: "${transcript}" (conf=${avgConfidence.toFixed(2)})`);
-            client.emit('ai:skipped', { reason: quality.reason, transcript });
-            return;
-          }
-
-          if (session.isGuest && session.guestSessionId) {
-            const gs = await this.guestSessionService.getStatus(session.guestSessionId);
-            if (!gs.canSend) {
-              client.emit('guest:limit_reached', {
-                message: 'You have used all 5 free prompts. Sign up to continue.',
-                used: gs.used,
-                limit: gs.limit,
-              });
-              return;
-            }
-          }
-
-          await this.processPrompt(client, session, transcript, 'voice');
-        }, session.utteranceDebounceMs);
-      });
-
-      emitter.on('error', (err: Error) => {
-        if (!this.sessions.has(client.id)) return;
-        this.logger.warn(`Deepgram error for session ${client.id}: ${err.message}`);
-        // Provider error — genuine; the provider session cannot continue.
-        // Frontend must reconnect (creates a new provider epoch) but SHOULD
-        // restore participant assignments from restoredParticipants in session:ready.
-        client.emit('session:degraded', {
-          reason: 'deepgram_error',
-          category: 'provider_error',
-          recoverable: true,
-          message: 'Voice connection interrupted. Tap the mic to reconnect.',
-        });
-        this.cleanupSession(client.id);
-      });
-
-      emitter.on('close', () => {
-        if (!this.sessions.has(client.id)) return;
-        this.logger.warn(`[${client.id}] Deepgram connection closed unexpectedly — degrading session`);
-        // Provider closed — genuine; the socket/session is gone.
-        // Frontend must reconnect and the backend will issue restored participants.
-        client.emit('session:degraded', {
-          reason: 'deepgram_closed',
-          category: 'provider_closed',
-          recoverable: true,
-          message: 'Voice connection dropped. Tap the mic to reconnect.',
-        });
-        this.cleanupSession(client.id);
-      });
+      this.attachDeepgramListeners(client, session, emitter);
 
       this.sessions.set(client.id, session);
 
@@ -1019,6 +708,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         conversationId,
         voiceSessionId: session.recordingSessionId,
         providerSessionEpoch: session.recordingSessionId,
+        // Real incrementing counter (0 at initial ready) — correlates with
+        // session:recovered.providerEpoch across a provider reconnect.
+        // providerSessionEpoch above is left as-is for backward compatibility.
+        providerEpoch: session.providerEpoch,
         clientSessionId: session.clientSessionId,
         isGuest,
         mode,
@@ -1117,7 +810,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       ? payload.chunk
       : Buffer.from(payload.chunk);
 
-    session.sendAudio(buffer);
+    // While the provider connection is being replaced, hold audio in the
+    // bounded recovery buffer instead of dropping it on the floor — it gets
+    // replayed in order once the new connection is up (see flushRecoveryBuffer).
+    if (session.providerState === 'recovering') {
+      this.bufferAudioForRecovery(session, buffer);
+    } else {
+      session.sendAudio(buffer);
+    }
 
     // Capture the container header for per-speaker audio reconstruction
     if (!session.audioHeaderChunk) {
@@ -2864,9 +2564,564 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     return true;
   }
 
+  // ─── Provider connection lifecycle (bounded recovery) ────────────────────────
+
+  /**
+   * Registers the Deepgram event handlers for the session's *current*
+   * provider connection. Called once at session:start and again after each
+   * successful recovery reconnect (against the new emitter). `epoch` is
+   * snapshotted at registration time so a stale event from an
+   * already-replaced connection can be detected and ignored.
+   */
+  private attachDeepgramListeners(client: Socket, session: ActiveSession, emitter: EventEmitter): void {
+    const epoch = session.providerEpoch;
+    const shouldDiarize = session.isDualSpeaker || session.isMultiSpeaker;
+
+    // ── Deepgram transcript handler ───────────────────────────────────────
+    emitter.on('transcript', (result) => {
+      if (!result.isFinal) {
+        if (!shouldDiarize) {
+          session.pendingInterimTranscript = result.transcript;
+        }
+        client.emit('transcript:update', {
+          transcript: (session.accumulatedTranscript + ' ' + result.transcript).trim(),
+          isFinal: false,
+          confidence: result.confidence,
+        });
+        return;
+      }
+
+      session.pendingInterimTranscript = '';
+
+      if (typeof result.confidence === 'number') {
+        session.transcriptConfidences.push(result.confidence);
+      }
+
+      // ── Multi-speaker path ────────────────────────────────────────────
+      if (session.isMultiSpeaker) {
+        const words: TranscriptWord[] = result.words ?? [];
+        const turns = this.buildMultiSpeakerTurns(session, words, result.confidence, result.transcript);
+
+        // Track per-speaker accumulated speech duration
+        for (const w of words) {
+          const spk = w.speaker ?? 0;
+          const dur = (w.end ?? 0) - (w.start ?? 0);
+          session.speakerWordSeconds.set(spk, (session.speakerWordSeconds.get(spk) ?? 0) + dur);
+        }
+
+        // Update dominant speaker for audio tagging
+        const dominantInResult = words.reduce((acc, w) => {
+          const spk = w.speaker ?? 0;
+          acc.set(spk, (acc.get(spk) ?? 0) + 1);
+          return acc;
+        }, new Map<number, number>());
+        if (dominantInResult.size > 0) {
+          session.currentDominantSpeaker = [...dominantInResult.entries()].sort((a, b) => b[1] - a[1])[0][0];
+        }
+
+        session.multiSpeakerHistory.push(...turns);
+        session.pendingMultiSpeakerTurns.push(...turns);
+        session.accumulatedTranscript = turns.map((t) => t.text).join(' ');
+
+        // Trigger per-speaker identification (first attempt + retry on prior failure)
+        if (!session.isGuest && this.voiceVerificationService.isEnabled) {
+          for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
+            const alreadyTriggered = session.speakerIdentificationTriggered.has(spkId);
+            const prevFailed = session.speakerIdentificationFailed.has(spkId);
+            const attemptedAtSeconds = session.speakerIdentificationAtSeconds.get(spkId) ?? 0;
+
+            const isFirstAttempt = !alreadyTriggered && seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S;
+            // Retry after a failed attempt once they've spoken RETRY_IDENTIFICATION_EXTRA_S
+            // more seconds since the last attempt — avoids thrashing on poor-audio windows.
+            const isRetry = alreadyTriggered && prevFailed &&
+              seconds >= attemptedAtSeconds + this.RETRY_IDENTIFICATION_EXTRA_S;
+
+            if (isFirstAttempt || isRetry) {
+              session.speakerIdentificationTriggered.add(spkId);
+              session.speakerIdentificationFailed.delete(spkId);
+              session.speakerIdentificationAtSeconds.set(spkId, seconds);
+              this.identifyMultiSpeaker(client, session, spkId).catch((err) =>
+                this.logger.error(`[${client.id}] identifyMultiSpeaker error (speaker ${spkId}):`, err),
+              );
+            }
+          }
+        }
+
+        // Trigger backend calibration
+        if (!session.voiceCalibrationTriggered && !session.isGuest) {
+          const totalSpeech = [...session.speakerWordSeconds.values()].reduce((a, b) => a + b, 0);
+          if (totalSpeech >= this.CALIBRATION_SPEECH_THRESHOLD_S && session.audioBuffer.length > 0) {
+            session.voiceCalibrationTriggered = true;
+            this.autoVoiceCalibration(client, session).catch((err) =>
+              this.logger.error(`[${client.id}] Auto voice calibration error:`, err),
+            );
+          }
+        }
+
+        client.emit('transcript:update', {
+          mode: 'multiple_speaker',
+          isFinal: true,
+          confidence: result.confidence,
+          transcript: session.accumulatedTranscript,
+          segments: turns,
+        });
+        return;
+      }
+
+      // ── Dual-speaker path ─────────────────────────────────────────────
+      if (session.isDualSpeaker) {
+        const words: TranscriptWord[] = result.words ?? [];
+        const speakerTexts = new Map<number, string>();
+        for (const w of words) {
+          const spk = w.speaker ?? 0;
+          speakerTexts.set(spk, ((speakerTexts.get(spk) ?? '') + ' ' + w.word).trim());
+        }
+
+        const dominantInResult = [...speakerTexts.entries()]
+          .sort((a, b) => b[1].length - a[1].length)[0]?.[0];
+        if (dominantInResult !== undefined) {
+          session.currentDominantSpeaker = dominantInResult;
+        }
+
+        for (const w of words) {
+          const spk = w.speaker ?? 0;
+          const dur = (w.end ?? 0) - (w.start ?? 0);
+          session.speakerWordSeconds.set(spk, (session.speakerWordSeconds.get(spk) ?? 0) + dur);
+        }
+
+        if (!session.calibrationPhase && !session.isGuest && this.voiceVerificationService.isEnabled) {
+          for (const [spkId, seconds] of session.speakerWordSeconds.entries()) {
+            const alreadyTriggered = session.speakerIdentificationTriggered.has(spkId);
+            const prevFailed = session.speakerIdentificationFailed.has(spkId);
+            const attemptedAtSeconds = session.speakerIdentificationAtSeconds.get(spkId) ?? 0;
+
+            const isFirstAttempt = !alreadyTriggered && seconds >= this.SPEAKER_IDENTIFICATION_THRESHOLD_S;
+            const isRetry = alreadyTriggered && prevFailed &&
+              seconds >= attemptedAtSeconds + this.RETRY_IDENTIFICATION_EXTRA_S;
+
+            if (isFirstAttempt || isRetry) {
+              session.speakerIdentificationTriggered.add(spkId);
+              session.speakerIdentificationFailed.delete(spkId);
+              session.speakerIdentificationAtSeconds.set(spkId, seconds);
+              this.identifyDualSpeaker(client, session, spkId).catch((err) =>
+                this.logger.error(`[${client.id}] identifyDualSpeaker error (speaker ${spkId}):`, err),
+              );
+            }
+          }
+        }
+
+        if (session.calibrationPhase && words.length >= 3) {
+          const wordCounts = new Map<number, number>();
+          for (const w of words) {
+            const spk = w.speaker ?? 0;
+            wordCounts.set(spk, (wordCounts.get(spk) ?? 0) + 1);
+          }
+          const sorted = [...wordCounts.entries()].sort((a, b) => b[1] - a[1]);
+          const dominantSpeaker = sorted[0][0];
+          const totalWords = [...wordCounts.values()].reduce((a, b) => a + b, 0);
+          const calibrationConfidence = totalWords > 0 ? sorted[0][1] / totalWords : 1;
+
+          session.ownerSpeakerId = dominantSpeaker;
+          session.calibrationPhase = false;
+          this.logger.log(
+            `[${client.id}] Word-count calibration: owner=speaker ${dominantSpeaker}, confidence=${calibrationConfidence.toFixed(2)}`,
+          );
+          client.emit('calibration:complete', {
+            ownerSpeakerId: dominantSpeaker,
+            method: 'word_count',
+            confidence: calibrationConfidence,
+            speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
+            message: calibrationConfidence >= 0.7
+              ? 'Voice identified. Biometric verification in progress…'
+              : 'Initial speaker assignment made, but confidence is low. Biometric verification in progress…',
+          });
+        }
+
+        if (!session.voiceCalibrationTriggered && !session.isGuest) {
+          const totalSpeech = [...session.speakerWordSeconds.values()].reduce((a, b) => a + b, 0);
+          if (totalSpeech >= this.CALIBRATION_SPEECH_THRESHOLD_S && session.audioBuffer.length > 0) {
+            session.voiceCalibrationTriggered = true;
+            this.autoVoiceCalibration(client, session).catch((err) =>
+              this.logger.error(`[${client.id}] Auto voice calibration error:`, err),
+            );
+          }
+        }
+
+        const ownerSpk = session.ownerSpeakerId ?? 0;
+
+        for (const [spkId, text] of speakerTexts.entries()) {
+          if (!text) continue;
+          const label: 'owner' | 'other' = spkId === ownerSpk ? 'owner' : 'other';
+          session.dualSpeakerHistory.push({ speaker: label, text });
+          if (label === 'other') {
+            session.pendingOtherText = (session.pendingOtherText + ' ' + text).trim();
+          } else {
+            session.pendingOwnerText = (session.pendingOwnerText + ' ' + text).trim();
+          }
+        }
+
+        session.accumulatedTranscript =
+          (session.accumulatedTranscript + ' ' + result.transcript).trim();
+
+        client.emit('transcript:update', {
+          transcript: session.accumulatedTranscript,
+          isFinal: true,
+          confidence: result.confidence,
+          speakers: Object.fromEntries(
+            Array.from(speakerTexts.entries()).map(([id, text]) => [
+              id === ownerSpk ? 'owner' : 'other',
+              text,
+            ]),
+          ),
+          speakerNames: { owner: 'You', other: session.otherSpeakerName ?? 'Other' },
+        });
+        return;
+      }
+
+      // ── Single-speaker path ───────────────────────────────────────────
+      session.accumulatedTranscript =
+        (session.accumulatedTranscript + ' ' + result.transcript).trim();
+
+      client.emit('transcript:update', {
+        transcript: session.accumulatedTranscript,
+        isFinal: true,
+        confidence: result.confidence,
+      });
+
+      if (
+        !session.isGuest &&
+        !session.singleSpeakerProfileTriggered &&
+        this.voiceVerificationService.isEnabled
+      ) {
+        const words: TranscriptWord[] = result.words ?? [];
+        if (words.length > 0) {
+          for (const w of words) {
+            session.singleSpeakerSpeechSeconds += (w.end ?? 0) - (w.start ?? 0);
+          }
+        } else {
+          session.singleSpeakerSpeechSeconds +=
+            (result.transcript?.split(/\s+/).filter(Boolean).length ?? 0) / 2.5;
+        }
+
+        if (
+          session.singleSpeakerSpeechSeconds >= this.SINGLE_SPEAKER_PROFILE_THRESHOLD_S &&
+          session.audioBuffer.length > 0
+        ) {
+          session.singleSpeakerProfileTriggered = true;
+          this.buildSingleSpeakerVoiceProfile(client, session).catch((err) =>
+            this.logger.error(`[${client.id}] Single-speaker voice profile build failed:`, err),
+          );
+        }
+      }
+    });
+
+    // ── Debounced Claude trigger ──────────────────────────────────────────
+    emitter.on('utteranceEnd', () => {
+      if (session.isProcessingAI) return;
+
+      if (session.utteranceDebounceTimer) {
+        clearTimeout(session.utteranceDebounceTimer);
+        session.utteranceDebounceTimer = null;
+      }
+
+      session.utteranceDebounceTimer = setTimeout(async () => {
+        session.utteranceDebounceTimer = null;
+        if (session.isProcessingAI) return;
+
+        // ── Multi-speaker path ──────────────────────────────────────────
+        if (session.isMultiSpeaker) {
+          await this.flushMultiSpeakerTurns(client, session, {
+            reason: 'utterance_end',
+            minWords: 8,
+          });
+          return;
+        }
+
+        // ── Dual-speaker path ───────────────────────────────────────────
+        if (session.isDualSpeaker) {
+          if (session.calibrationPhase) return;
+
+          const otherText = session.pendingOtherText.trim();
+          const ownerText = session.pendingOwnerText.trim();
+
+          const combinedWords = `${ownerText} ${otherText}`
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean).length;
+
+          if (combinedWords < 8) return;
+
+          session.pendingOtherText = '';
+          session.pendingOwnerText = '';
+          session.accumulatedTranscript = '';
+          client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
+
+          const primaryText = otherText || ownerText;
+          const contextText = otherText ? ownerText : '';
+          const speakerDetected = Boolean(otherText);
+
+          await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected);
+          return;
+        }
+
+        // ── Single-speaker path ─────────────────────────────────────────
+        const transcript = session.accumulatedTranscript.trim();
+        if (!transcript) return;
+
+        const wordCount = transcript.split(/\s+/).filter(Boolean).length;
+        if (wordCount < 6) return;
+
+        const confidences = [...session.transcriptConfidences];
+        session.accumulatedTranscript = '';
+        session.transcriptConfidences = [];
+
+        const avgConfidence =
+          confidences.length > 0
+            ? confidences.reduce((a, b) => a + b, 0) / confidences.length
+            : 1.0;
+
+        const quality = this.isTranscriptMeaningful(transcript, avgConfidence);
+        if (!quality.pass) {
+          this.logger.log(`UtteranceEnd filtered [${quality.reason}]: "${transcript}" (conf=${avgConfidence.toFixed(2)})`);
+          client.emit('ai:skipped', { reason: quality.reason, transcript });
+          return;
+        }
+
+        if (session.isGuest && session.guestSessionId) {
+          const gs = await this.guestSessionService.getStatus(session.guestSessionId);
+          if (!gs.canSend) {
+            client.emit('guest:limit_reached', {
+              message: 'You have used all 5 free prompts. Sign up to continue.',
+              used: gs.used,
+              limit: gs.limit,
+            });
+            return;
+          }
+        }
+
+        await this.processPrompt(client, session, transcript, 'voice');
+      }, session.utteranceDebounceMs);
+    });
+
+    // ── Provider disruption routing ───────────────────────────────────────
+    // All three funnel into the same bounded-recovery orchestration. `epoch`
+    // is the epoch this connection was registered under, so a late event
+    // from a connection that recovery has already replaced is ignored.
+    emitter.on('error', () => {
+      this.handleProviderDisruption(client, session, epoch, 'deepgram_error');
+    });
+    emitter.on('close', (closeInfo: ProviderCloseInfo) => {
+      this.handleProviderDisruption(client, session, epoch, 'deepgram_closed', closeInfo);
+    });
+    emitter.on('transportFailure', ({ source, error }: { source: string; error: Error }) => {
+      this.logger.warn(`[${client.id}] provider transport failure (${source}) epoch=${epoch}: ${error.message}`);
+      this.handleProviderDisruption(client, session, epoch, 'transport_failure');
+    });
+  }
+
+  /** Entry guard shared by the three provider-disruption events. */
+  private handleProviderDisruption(
+    client: Socket,
+    session: ActiveSession,
+    epoch: number,
+    reason: ProviderDisruptionReason,
+    closeInfo: ProviderCloseInfo | null = null,
+  ): void {
+    if (!this.sessions.has(client.id)) return;
+    void this.recoverProviderSession(client, session, epoch, reason, closeInfo);
+  }
+
+  /**
+   * Bounded, provider-only reconnect. Preserves the outer application/
+   * conversation session — only the Deepgram connection is replaced.
+   * Detect → Quiesce → Notify → Reconnect → Resume → Escalate.
+   */
+  private async recoverProviderSession(
+    client: Socket,
+    session: ActiveSession,
+    epoch: number,
+    reason: ProviderDisruptionReason,
+    closeInfo: ProviderCloseInfo | null,
+  ): Promise<void> {
+    // Detect/dedupe — synchronous, before any await. A stale epoch means this
+    // event came from a connection recovery already replaced; a non-'active'
+    // state means a recovery sequence is already running (or finished) for
+    // this epoch, e.g. an 'error' immediately followed by a 'close' for the
+    // same disruption — collapse both into a single recovery sequence.
+    if (session.providerEpoch !== epoch) return;
+    if (session.providerState !== 'active') return;
+    session.providerState = 'recovering';
+
+    // Quiesce — tear down the dead connection defensively. closeDeepgram()
+    // only acts while the socket is OPEN, so this is a safe no-op if the
+    // connection is already gone.
+    session.deepgramEmitter.removeAllListeners();
+    try { session.closeDeepgram(); } catch (_) {}
+
+    const recoveryId = randomUUID();
+    session.currentRecoveryId = recoveryId;
+    session.recoveryAttempt = 0;
+
+    this.logger.warn(
+      `[${client.id}] provider disruption (${reason}) — starting recovery ${recoveryId} ` +
+      `closeCode=${closeInfo?.code ?? 'n/a'} closeReason=${closeInfo?.reason ?? 'n/a'} errorPreceded=${closeInfo?.errorPreceded ?? 'n/a'}`,
+    );
+
+    // Notify — emitted exactly once per recovery sequence, not per attempt.
+    client.emit('session:recovering', {
+      recoveryId,
+      reason,
+      attempt: 1,
+      maxAttempts: PROVIDER_RECOVERY_MAX_ATTEMPTS,
+      recoverable: true,
+    });
+
+    for (let attempt = 1; attempt <= PROVIDER_RECOVERY_MAX_ATTEMPTS; attempt++) {
+      if (!this.sessions.has(client.id) || session.providerState !== 'recovering') return;
+      session.recoveryAttempt = attempt;
+
+      if (attempt > 1) {
+        await sleep(computeBackoffDelayMs(attempt - 1));
+        if (!this.sessions.has(client.id) || session.providerState !== 'recovering') return;
+      }
+
+      try {
+        const { emitter, sendAudio, close } = await this.deepgramService.createLiveSession(
+          `${client.id}:e${session.providerEpoch + 1}`,
+          { ...session.providerConnectOptions, connectionTimeoutMs: 5_000 },
+        );
+
+        // The session may have been torn down (disconnect/session:end) while
+        // this connect attempt was in flight — discard the fresh connection
+        // cleanly rather than attaching it to a dead session.
+        if (!this.sessions.has(client.id) || session.providerState !== 'recovering') {
+          try { close(); } catch (_) {}
+          return;
+        }
+
+        session.deepgramEmitter = emitter;
+        session.sendAudio = sendAudio;
+        session.closeDeepgram = close;
+        session.providerEpoch += 1;
+        this.attachDeepgramListeners(client, session, emitter);
+
+        const { droppedDurationMs } = this.flushRecoveryBuffer(session);
+
+        session.providerState = 'recovered';
+        session.currentRecoveryId = null;
+
+        this.logger.log(
+          `[${client.id}] provider recovery ${recoveryId} succeeded on attempt ${attempt} ` +
+          `(epoch=${session.providerEpoch}, droppedDurationMs=${droppedDurationMs})`,
+        );
+
+        client.emit('session:recovered', {
+          recoveryId,
+          providerEpoch: session.providerEpoch,
+          audioGapDetected: droppedDurationMs > 0,
+          droppedDurationMs,
+        });
+        return;
+      } catch (err) {
+        this.logger.warn(
+          `[${client.id}] provider recovery ${recoveryId} attempt ${attempt}/${PROVIDER_RECOVERY_MAX_ATTEMPTS} failed: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    // Escalate — retry budget exhausted.
+    if (!this.sessions.has(client.id)) return;
+
+    const incidentId = randomUUID();
+    session.providerState = 'failed';
+
+    this.errorLogService.log({
+      source: 'voice_gateway',
+      code: 'PROVIDER_RECOVERY_EXHAUSTED',
+      message: `Provider recovery exhausted after ${PROVIDER_RECOVERY_MAX_ATTEMPTS} attempts`,
+      severity: 'error',
+      context: {
+        socketId: client.id,
+        recoveryId,
+        incidentId,
+        providerEpoch: session.providerEpoch,
+        reason,
+        closeCode: closeInfo?.code ?? null,
+      },
+    });
+
+    client.emit('session:degraded', {
+      recoveryId,
+      reason: 'provider_recovery_exhausted',
+      category: 'provider_recovery_failed',
+      recoverable: false,
+      incidentId,
+      message: 'We could not restore your voice connection after several attempts. Please start a new recording.',
+    });
+
+    this.cleanupSession(client.id);
+  }
+
+  /** Buffers one audio chunk while providerState === 'recovering', bounded by both byte count and age. */
+  private bufferAudioForRecovery(session: ActiveSession, buffer: Buffer): void {
+    const now = Date.now();
+
+    while (
+      session.recoveryAudioBuffer.length > 0 &&
+      now - session.recoveryAudioBuffer[0].enqueuedAt > this.PROVIDER_RECOVERY_BUFFER_MAX_MS
+    ) {
+      const dropped = session.recoveryAudioBuffer.shift()!;
+      session.recoveryAudioBufferBytes -= dropped.chunk.length;
+    }
+
+    if (session.recoveryAudioBufferBytes + buffer.length > this.PROVIDER_RECOVERY_BUFFER_MAX_BYTES) {
+      // Byte cap reached — drop this (newest) chunk so the buffer keeps
+      // replaying audio closest to the moment the outage started.
+      if (session.recoveryBufferOverflowStartedAt === null) {
+        session.recoveryBufferOverflowStartedAt = now;
+      }
+      return;
+    }
+
+    session.recoveryAudioBuffer.push({ chunk: buffer, enqueuedAt: now });
+    session.recoveryAudioBufferBytes += buffer.length;
+  }
+
+  /** Replays the bounded recovery buffer to the newly-reconnected provider and clears it. */
+  private flushRecoveryBuffer(session: ActiveSession): { flushedBytes: number; droppedDurationMs: number } {
+    let flushedBytes = 0;
+    for (const { chunk } of session.recoveryAudioBuffer) {
+      session.sendAudio(chunk);
+      flushedBytes += chunk.length;
+    }
+
+    const droppedDurationMs = session.recoveryBufferOverflowStartedAt !== null
+      ? Date.now() - session.recoveryBufferOverflowStartedAt
+      : 0;
+
+    session.recoveryAudioBuffer = [];
+    session.recoveryAudioBufferBytes = 0;
+    session.recoveryBufferOverflowStartedAt = null;
+
+    return { flushedBytes, droppedDurationMs };
+  }
+
   private cleanupSession(socketId: string): void {
     const session = this.sessions.get(socketId);
     if (!session) return;
+
+    // Marked first, before anything else: any provider 'error'/'close'/
+    // 'transportFailure' already in flight for this session will see this on
+    // its next synchronous check and no-op instead of starting recovery or
+    // reporting an unexpected drop — this is what makes an intentional
+    // teardown (session:end, idle timeout, disconnect) distinguishable from
+    // a genuine provider failure. Exception: recoverProviderSession's own
+    // escalate step sets 'failed' and then calls cleanupSession itself as
+    // its final teardown — don't overwrite that with 'intentionally_closed',
+    // the disruption was real, not an intentional stop.
+    if (session.providerState !== 'failed') {
+      session.providerState = 'intentionally_closed';
+    }
 
     this.sessions.delete(socketId);
     session.deepgramEmitter.removeAllListeners();
@@ -2886,6 +3141,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.speakerAudioBytes.clear();
     session.resolvedSpeakers.clear();
     session.anonymousSpeakerLabels.clear();
+    session.recoveryAudioBuffer = [];
+    session.recoveryAudioBufferBytes = 0;
 
     session.closeDeepgram();
     this.logger.log(`Session cleaned up: ${socketId}`);
