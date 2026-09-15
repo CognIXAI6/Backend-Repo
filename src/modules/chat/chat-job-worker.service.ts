@@ -112,10 +112,17 @@ export class ChatJobWorkerService {
         filename: img.filename,
       }));
 
+      // This path never registers generate_document with the Anthropic API
+      // (see enableDocumentGeneration: false below — no socket exists here to
+      // deliver document:ready/failed events to), so the prompt must not
+      // claim the tool exists either. Otherwise Claude tries to "call" it,
+      // finds nothing to invoke, and narrates a fake tool_call as text —
+      // which then gets stripped down to an empty response.
       const systemPrompt = this.claudeService.buildSystemPrompt(
         field?.name,
         user?.ai_memory ?? undefined,
         documentContext,
+        false,
       );
 
       const startedAt = Date.now();

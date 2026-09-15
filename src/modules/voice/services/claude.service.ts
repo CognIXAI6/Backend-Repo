@@ -429,7 +429,12 @@ export class ClaudeService implements OnModuleInit {
       .trim();
   }
 
-  buildSystemPrompt(fieldName?: string, aiMemory?: string, documentContext?: string | null): string {
+  buildSystemPrompt(
+    fieldName?: string,
+    aiMemory?: string,
+    documentContext?: string | null,
+    enableDocumentGeneration = false,
+  ): string {
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
@@ -437,6 +442,13 @@ export class ClaudeService implements OnModuleInit {
     const currentTime = now.toLocaleTimeString('en-US', {
       hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
     });
+
+    // Only tell the model it has this tool when it's actually being registered
+    // with the Anthropic API for this call — otherwise, with nothing to invoke,
+    // it narrates a fake tool_call as visible text instead of just answering.
+    const documentToolBlock = enableDocumentGeneration
+      ? '\n\nYou also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. After the document is generated, respond with a brief confirmation and the download link.'
+      : '';
 
     const basePrompt = `You are CognIX AI, a real-time insight assistant for professionals.
 
@@ -496,9 +508,7 @@ If a search returns no results, say so in one short bullet and answer from your 
 ## NEVER NARRATE TOOL USE — MANDATORY
 - NEVER include <tool_call>, <tool_response>, or any similar tags, JSON, or pseudo-code in your response.
 - NEVER describe, summarise, or transcribe the fact that you called a tool, what you searched for, or what the raw tool result was.
-- The tool call and its result are invisible to the user — respond ONLY with your final answer in the bullet format above.
-
-You also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. After the document is generated, respond with a brief confirmation and the download link.`;
+- The tool call and its result are invisible to the user — respond ONLY with your final answer in the bullet format above.${documentToolBlock}`;
 
     const memoryBlock = aiMemory
       ? `\n\n## What you remember about this user from past sessions\n${aiMemory}\n\nUse this context naturally — address the user by name if known, and build on what you already know about them.`

@@ -31,6 +31,7 @@ import { PushNotificationService } from '@/modules/notifications/push-notificati
 import { ProviderSessionState, ProviderCloseInfo } from './interfaces/provider-session.types';
 import { ProviderDisruptionReason } from './interfaces/voice-events.types';
 import { computeBackoffDelayMs, sleep, PROVIDER_RECOVERY_MAX_ATTEMPTS } from './utils/backoff.util';
+import { ToolCallStreamFilter } from './utils/tool-call-stream-filter.util';
 
 // ─── Mode types ───────────────────────────────────────────────────────────────
 
@@ -1501,6 +1502,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       aiStarted = true;
 
       let firstToken = true;
+      const toolCallFilter = new ToolCallStreamFilter();
 
       await this.claudeService.streamResponse(claudePrompt, [], systemPrompt, {
         onToken: (token) => {
@@ -1508,7 +1510,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             client.emit('ai:latency', { latencyMs: Date.now() - aiStartTime });
             firstToken = false;
           }
-          client.emit('ai:token', { token });
+          const safeToken = toolCallFilter.push(token);
+          if (safeToken) client.emit('ai:token', { token: safeToken });
         },
 
         onDone: async (fullText, inputTokens, outputTokens) => {
@@ -1597,6 +1600,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       aiStarted = true;
 
       let firstToken = true;
+      const toolCallFilter = new ToolCallStreamFilter();
 
       await this.claudeService.streamResponse(userMessage, [], systemPrompt, {
         onToken: (token) => {
@@ -1604,7 +1608,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             client.emit('ai:latency', { latencyMs: Date.now() - aiStartTime });
             firstToken = false;
           }
-          client.emit('ai:token', { token });
+          const safeToken = toolCallFilter.push(token);
+          if (safeToken) client.emit('ai:token', { token: safeToken });
         },
 
         onDone: async (fullText, inputTokens, outputTokens) => {
@@ -1732,6 +1737,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       client.emit('ai:start');
       aiStarted = true;
 
+      // Detect document generation intent so we can enable the tool, raise
+      // max_tokens, and tell the system prompt whether to advertise the tool
+      // at all — must be computed before buildSystemPrompt below, since the
+      // prompt's mention of generate_document has to match whether it's
+      // actually being registered with the Anthropic API for this call.
+      const isDocumentRequest =
+        !session.isGuest &&
+        /\b(?:prepar(?:e|es|ing)|creat(?:e|es|ing)|generat(?:e|es|ing)|writ(?:e|es|ing)|mak(?:e|es|ing)|draft(?:s|ing)?|put together)\b.{0,30}\b(document|report|file|proposal|paper|essay|article|doc|write-up)\b/i.test(userMessage);
+
       // Load document context: conversation attachments + field resources (Resources tab).
       const documentContext = await this.conversationService
         .getFullDocumentContext(session.conversationId, session.userId)
@@ -1744,6 +1758,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.fieldName,
         session.cachedAiMemory ?? undefined,
         documentContext,
+        isDocumentRequest,
       );
 
       // Load all images attached to this conversation — passed as image content
@@ -1759,11 +1774,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         filename: img.filename,
       }));
 
-      // Detect document generation intent so we can enable the tool and raise max_tokens.
-      const isDocumentRequest =
-        !session.isGuest &&
-        /\b(prepare|create|generate|write|make|draft|put together)\b.{0,30}\b(document|report|file|proposal|paper|essay|article|doc|write-up)\b/i.test(userMessage);
-
       // Captured inside onDocumentRequest, read inside onDone to link the
       // assistant message permanently to the generated document record.
       let generatedDocId: string | null = null;
@@ -1773,6 +1783,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const docJobId = isDocumentRequest ? randomUUID() : '';
 
       let firstToken = true;
+      const toolCallFilter = new ToolCallStreamFilter();
 
       await this.claudeService.streamResponse(
         userMessage,
@@ -1784,7 +1795,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               client.emit('ai:latency', { latencyMs: Date.now() - aiStartTime });
               firstToken = false;
             }
-            client.emit('ai:token', { token });
+            const safeToken = toolCallFilter.push(token);
+            if (safeToken) client.emit('ai:token', { token: safeToken });
           },
 
           onDone: async (fullText: string, inputTokens: number, outputTokens: number) => {
