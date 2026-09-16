@@ -1737,13 +1737,22 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       client.emit('ai:start');
       aiStarted = true;
 
-      // Detect document generation intent so we can enable the tool, raise
-      // max_tokens, and tell the system prompt whether to advertise the tool
-      // at all — must be computed before buildSystemPrompt below, since the
-      // prompt's mention of generate_document has to match whether it's
-      // actually being registered with the Anthropic API for this call.
-      const isDocumentRequest =
-        !session.isGuest &&
+      // Document generation is registered as a real tool for every
+      // authenticated turn — NOT gated behind a single-message keyword
+      // regex. A real request routinely builds up over several turns
+      // ("I want a strategy for X" -> clarifying questions -> "yes, with
+      // sample numbers" -> "in document format"), and no one message in
+      // that sequence need contain a trigger verb+noun pair. Trying to
+      // pre-guess intent with a regex just reproduces that bug under a new
+      // phrasing every time; Claude's own tool-use judgment (guided by the
+      // system prompt) is what tool-calling exists to handle instead.
+      const documentGenerationEnabled = !session.isGuest;
+
+      // Soft hint used ONLY to decide whether this voice turn is worth the
+      // latency of also registering web_search (voice search is off by
+      // default for response speed) — never a gate on whether
+      // generate_document itself is available.
+      const documentIntentHint =
         /\b(?:prepar(?:e|es|ing)|creat(?:e|es|ing)|generat(?:e|es|ing)|writ(?:e|es|ing)|mak(?:e|es|ing)|draft(?:s|ing)?|put together)\b.{0,30}\b(document|report|file|proposal|paper|essay|article|doc|write-up)\b/i.test(userMessage);
 
       // Load document context: conversation attachments + field resources (Resources tab).
@@ -1758,7 +1767,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.fieldName,
         session.cachedAiMemory ?? undefined,
         documentContext,
-        isDocumentRequest,
+        documentGenerationEnabled,
       );
 
       // Load all images attached to this conversation — passed as image content
@@ -1780,7 +1789,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       // Stable job ID emitted in document:generating so the client can correlate
       // document:ready / document:failed events back to the originating request.
-      const docJobId = isDocumentRequest ? randomUUID() : '';
+      const docJobId = documentGenerationEnabled ? randomUUID() : '';
 
       let firstToken = true;
       const toolCallFilter = new ToolCallStreamFilter();
@@ -1866,7 +1875,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             session.isProcessingAI = false;
           },
 
-          onDocumentRequest: isDocumentRequest
+          onDocumentRequest: documentGenerationEnabled
             ? async (req) => {
                 this.logger.log(`[${client.id}] Document generation requested: "${req.title}"`);
                 // Include jobId so the client can match this event to future ready/failed events.
@@ -1922,10 +1931,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             : undefined,
         },
         {
-          // Enable web search for text requests AND voice document requests
-          // so documents are always research-enriched regardless of input type.
-          enableWebSearch: inputType === 'text' || isDocumentRequest,
-          enableDocumentGeneration: isDocumentRequest,
+          // Enable web search for text requests, and for voice turns that
+          // look document-adjacent (so a voice-triggered document still
+          // gets research-enriched) — voice search stays off by default
+          // for response latency otherwise.
+          enableWebSearch: inputType === 'text' || documentIntentHint,
+          enableDocumentGeneration: documentGenerationEnabled,
           // Include every image attached to this conversation on every call.
           images: visionImages.length > 0 ? visionImages : undefined,
         },
