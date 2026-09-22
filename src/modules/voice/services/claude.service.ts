@@ -215,7 +215,13 @@ export class ClaudeService implements OnModuleInit {
       activeTools.push(GENERATE_DOCUMENT_TOOL);
     }
     const tools = activeTools.length > 0 ? activeTools : undefined;
-    const maxTokens = options.maxTokens ?? (options.enableDocumentGeneration ? 4000 : 300);
+    // generate_document requires the model to write the ENTIRE document body as
+    // tool-call JSON arguments (every section's full text). A "2-4 page" document
+    // routinely runs well past 4000 output tokens once combined with a web_search
+    // call in the same turn — that truncates the tool call mid-JSON, which the
+    // caller must be able to detect (see stop_reason handling below), so the
+    // budget here just needs to make truncation the exception, not the norm.
+    const maxTokens = options.maxTokens ?? (options.enableDocumentGeneration ? 8192 : 300);
 
     try {
       // ── Single streaming call — stream from the very start ─────────────────
@@ -285,9 +291,24 @@ export class ClaudeService implements OnModuleInit {
         (tc) => tc.name === 'generate_document' && callbacks.onDocumentRequest,
       );
 
-      if (finalMessage.stop_reason === 'tool_use' && (webSearchCalls.length > 0 || docGenCalls.length > 0)) {
+      // generate_document must carry the entire document body as tool-call JSON
+      // arguments, so a long document can legitimately run out of output tokens
+      // mid tool-call. When that happens the stream ends with stop_reason
+      // 'max_tokens' instead of 'tool_use' — still gating on 'tool_use' alone
+      // silently dropped the whole tool-use branch (no search, no document, no
+      // tool_result), leaving fullText empty and surfacing the generic "didn't
+      // quite catch that" fallback for a perfectly clear request. Truncated
+      // calls still need to go through this branch so they can be reported as
+      // a real (and explicable) failure instead of vanishing.
+      const truncatedByTokenLimit = finalMessage.stop_reason === 'max_tokens';
+
+      if (
+        (finalMessage.stop_reason === 'tool_use' || truncatedByTokenLimit) &&
+        (webSearchCalls.length > 0 || docGenCalls.length > 0)
+      ) {
         this.logger.log(
-          `Tool use triggered — web_search: ${webSearchCalls.length}, generate_document: ${docGenCalls.length}`,
+          `Tool use triggered — web_search: ${webSearchCalls.length}, generate_document: ${docGenCalls.length}` +
+            (truncatedByTokenLimit ? ' (truncated by max_tokens)' : ''),
         );
 
         // ── Step 1: Run all web searches in parallel ──────────────────────
@@ -328,12 +349,28 @@ export class ClaudeService implements OnModuleInit {
         const docResultsMap = new Map<string, string>();
 
         for (const tc of docGenCalls) {
-          let docInput: { title: string; topic: string; sections: Array<{ heading: string; content: string }>; depth?: 'brief' | 'standard' | 'comprehensive'; format?: 'docx' | 'pdf' } = {
-            title: 'Document',
-            topic: userMessage,
-            sections: [],
-          };
+          let docInput: { title: string; topic: string; sections: Array<{ heading: string; content: string }>; depth?: 'brief' | 'standard' | 'comprehensive'; format?: 'docx' | 'pdf' } | null = null;
           try { docInput = JSON.parse(tc.inputJson); } catch {}
+
+          // A parse failure (or an empty sections array) means the tool call's JSON
+          // was cut off before it finished — almost always the max_tokens truncation
+          // above. Calling onDocumentRequest anyway would silently produce a near-blank
+          // document titled "Document"; report it as a failure instead so Claude's
+          // follow-up reply can tell the user what actually happened.
+          if (!docInput || !docInput.title || !Array.isArray(docInput.sections) || docInput.sections.length === 0) {
+            this.logger.warn(
+              `generate_document call ${tc.id} had unparsable/incomplete input` +
+                (truncatedByTokenLimit ? ' (truncated by max_tokens)' : '') +
+                ` — skipping generation`,
+            );
+            docResultsMap.set(
+              tc.id,
+              'Document generation failed: the request was too large and the response got cut off ' +
+                'before the document was fully specified. Ask for a shorter document (fewer pages or ' +
+                'sections) and try again.',
+            );
+            continue;
+          }
 
           this.logger.log(`  → generating document: "${docInput.title}" (depth: ${docInput.depth ?? 'standard'}, format: ${docInput.format ?? 'docx'})`);
 

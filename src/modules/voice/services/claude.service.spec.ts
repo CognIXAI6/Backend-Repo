@@ -84,3 +84,69 @@ describe('ClaudeService.streamResponse — empty web search results', () => {
     expect(toolResultBlock.content).toContain('No web search results were found');
   });
 });
+
+describe('ClaudeService.streamResponse — generate_document truncated by max_tokens', () => {
+  it('reports a clear failure instead of silently dropping the whole turn', async () => {
+    const service = createService() as any;
+
+    // A large document body cut off mid tool-call — the stream ends with
+    // stop_reason 'max_tokens', not 'tool_use', and the JSON is incomplete.
+    const truncatedInputJson = '{"title":"Role of INEC in Nigeria","topic":"INEC","sections":[{"heading":"Intro","content":"tex';
+
+    const firstStreamEvents = [
+      { type: 'message_start', message: { usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', content_block: { type: 'tool_use', id: 'tool-1', name: 'generate_document' } },
+      { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: truncatedInputJson } },
+      { type: 'message_delta', usage: { output_tokens: 4000 } },
+    ];
+    const firstFinalMessage = {
+      stop_reason: 'max_tokens',
+      content: [{ type: 'tool_use', id: 'tool-1', name: 'generate_document', input: {} }],
+    };
+
+    const followUpEvents = [
+      {
+        type: 'content_block_delta',
+        delta: { type: 'text_delta', text: '- That document was too long — try asking for fewer pages.' },
+      },
+      { type: 'message_delta', usage: { output_tokens: 8 } },
+    ];
+
+    const streamMock = jest
+      .fn()
+      .mockReturnValueOnce(createFakeStream(firstStreamEvents, firstFinalMessage))
+      .mockReturnValueOnce(createFakeStream(followUpEvents, {}));
+
+    service.client = { messages: { stream: streamMock } };
+    service.tavilyClient = null;
+    service.model = 'test-model';
+
+    const onDocumentRequest = jest.fn();
+    const callbacks = { onToken: jest.fn(), onDone: jest.fn(), onError: jest.fn(), onDocumentRequest };
+
+    await service.streamResponse(
+      'Discuss the role of INEC in Nigeria in a 4 page doc',
+      [],
+      'system prompt',
+      callbacks,
+      { enableDocumentGeneration: true },
+    );
+
+    expect(callbacks.onError).not.toHaveBeenCalled();
+    // The old bug: gating on stop_reason === 'tool_use' meant this whole branch
+    // was skipped, onDone got called with empty text, and the caller fell back to
+    // the generic "didn't quite catch that" message despite a perfectly clear request.
+    expect(onDocumentRequest).not.toHaveBeenCalled();
+    expect(callbacks.onDone).toHaveBeenCalledWith(
+      expect.stringContaining('too long'),
+      expect.any(Number),
+      expect.any(Number),
+    );
+
+    const followUpCallArgs = streamMock.mock.calls[1][0];
+    const toolResultMessage = followUpCallArgs.messages.find(
+      (m: any) => m.role === 'user' && Array.isArray(m.content),
+    );
+    expect(toolResultMessage.content[0].content).toContain('cut off');
+  });
+});

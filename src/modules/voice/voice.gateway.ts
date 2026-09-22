@@ -1784,8 +1784,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }));
 
       // Captured inside onDocumentRequest, read inside onDone to link the
-      // assistant message permanently to the generated document record.
+      // assistant message permanently to the generated document record, and
+      // to build a real confirmation if Claude's own follow-up text comes
+      // back empty — a successful generation must never be masked by the
+      // generic "didn't quite catch that" fallback below.
       let generatedDocId: string | null = null;
+      let generatedDocTitle: string | null = null;
+      let generatedDocUrl: string | null = null;
 
       // Stable job ID emitted in document:generating so the client can correlate
       // document:ready / document:failed events back to the originating request.
@@ -1813,16 +1818,30 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             // or ambiguous input), synthesise a clarification response so the user is
             // never left staring at a blank screen. Emit it as a token first so the
             // frontend renders it identically to a streamed response.
+            //
+            // A document that actually finished generating this turn is never covered
+            // by this fallback — Claude's own confirmation text coming back empty is
+            // not evidence the request was unclear; document:ready already told the
+            // client generation succeeded, so the chat bubble must say so too instead
+            // of contradicting it with "I didn't quite catch that."
             const UNCLEAR_FALLBACK =
               `- I didn't quite catch that — could you rephrase?\n` +
               `- Try asking something specific, like: "Explain [topic] step by step"\n` +
               `- Or: "What are the key trends in ${session.fieldName ?? 'my industry'}?"`;
 
-            const responseText = fullText.trim() ? fullText : UNCLEAR_FALLBACK;
+            const DOCUMENT_READY_FALLBACK = generatedDocUrl
+              ? `- Your document "${generatedDocTitle ?? 'Untitled'}" is ready.\n` +
+                `- [Download it here](${generatedDocUrl})`
+              : UNCLEAR_FALLBACK;
+
+            const fallback = generatedDocId ? DOCUMENT_READY_FALLBACK : UNCLEAR_FALLBACK;
+            const responseText = fullText.trim() ? fullText : fallback;
 
             if (!fullText.trim()) {
-              this.logger.warn(`[${client.id}] Empty AI response — sending clarification fallback`);
-              client.emit('ai:token', { token: UNCLEAR_FALLBACK });
+              this.logger.warn(
+                `[${client.id}] Empty AI response — sending ${generatedDocId ? 'document-ready' : 'clarification'} fallback`,
+              );
+              client.emit('ai:token', { token: fallback });
             }
 
             await this.conversationService.saveMessage({
@@ -1893,8 +1912,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                     format: req.format,
                   });
 
-                  // Capture docId — onDone picks it up to link the assistant message.
+                  // Capture doc info — onDone picks it up to link the assistant
+                  // message and to build a fallback confirmation if needed.
                   generatedDocId = result.docId;
+                  generatedDocTitle = req.title;
+                  generatedDocUrl = result.downloadUrl;
 
                   client.emit('document:ready', {
                     jobId: docJobId,
