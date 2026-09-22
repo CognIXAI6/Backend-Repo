@@ -224,90 +224,111 @@ export class ClaudeService implements OnModuleInit {
     const maxTokens = options.maxTokens ?? (options.enableDocumentGeneration ? 8192 : 300);
 
     try {
-      // ── Single streaming call — stream from the very start ─────────────────
       let fullText = '';
       let inputTokens = 0;
       let outputTokens = 0;
+      let currentMessages: Anthropic.MessageParam[] = messages;
+      // Cumulative across rounds: generate_document commonly gets called in a
+      // LATER round than the web_search(es) that fed it (see MAX_ROUNDS below),
+      // so a round that only calls generate_document must still have access to
+      // research gathered in an earlier round.
+      const researchContextParts: string[] = [];
 
-      // Collect ALL tool-use blocks Claude may emit in a single response.
-      // A single response can contain multiple tool_use blocks; only capturing
-      // the last one (as the old code did) leaves earlier ones without a
-      // matching tool_result, which causes a 400 from the Anthropic API.
       interface PendingToolCall { id: string; name: string; inputJson: string }
-      const collectedToolCalls: PendingToolCall[] = [];
-      let activeToolCall: PendingToolCall | null = null;
 
-      const stream = this.client.messages.stream({
-        model: this.model,
-        max_tokens: maxTokens,
-        system: systemWithCache,
-        tools,
-        messages,
-      });
+      // The system prompt tells Claude to "use web_search first, then call
+      // generate_document" — a genuinely sequential instruction. Tools must
+      // therefore stay available across more than one round-trip: a design that
+      // only offers tools on the very first call (and forces a tool-less
+      // follow-up right after) makes generate_document unreachable whenever
+      // Claude follows that instruction literally. Observed live: Claude calls
+      // web_search alone in round 1, then — with no tools available and still
+      // "owing" a generate_document call per the system prompt — the follow-up
+      // call comes back completely empty (zero content blocks) instead of
+      // writing prose. That surfaced as the generic "didn't quite catch that"
+      // fallback for a perfectly well-formed request.
+      //
+      // Loop instead: keep offering the same tools across rounds until Claude
+      // stops asking for one. Capped so a confused model can't loop forever —
+      // the final round always drops tools, which forces the API to return a
+      // plain-text answer instead of attempting (and failing) another tool call.
+      const MAX_ROUNDS = 4;
 
-      for await (const event of stream) {
-        if (event.type === 'message_start' && event.message.usage) {
-          inputTokens = event.message.usage.input_tokens ?? 0;
-        }
+      for (let round = 1; round <= MAX_ROUNDS; round++) {
+        const roundTools = round < MAX_ROUNDS ? tools : undefined;
 
-        if (event.type === 'content_block_start') {
-          if (event.content_block.type === 'tool_use') {
-            // Flush any previous tool call that was open (shouldn't happen, but safe)
-            if (activeToolCall) collectedToolCalls.push(activeToolCall);
-            activeToolCall = { id: event.content_block.id, name: event.content_block.name, inputJson: '' };
-          } else {
-            if (activeToolCall) { collectedToolCalls.push(activeToolCall); activeToolCall = null; }
+        fullText = '';
+        const collectedToolCalls: PendingToolCall[] = [];
+        let activeToolCall: PendingToolCall | null = null;
+
+        const stream = this.client.messages.stream({
+          model: this.model,
+          max_tokens: maxTokens,
+          system: systemWithCache,
+          tools: roundTools,
+          messages: currentMessages,
+        });
+
+        for await (const event of stream) {
+          if (event.type === 'message_start' && event.message.usage) {
+            inputTokens += event.message.usage.input_tokens ?? 0;
+          }
+
+          if (event.type === 'content_block_start') {
+            if (event.content_block.type === 'tool_use') {
+              // Flush any previous tool call that was open (shouldn't happen, but safe)
+              if (activeToolCall) collectedToolCalls.push(activeToolCall);
+              activeToolCall = { id: event.content_block.id, name: event.content_block.name, inputJson: '' };
+            } else {
+              if (activeToolCall) { collectedToolCalls.push(activeToolCall); activeToolCall = null; }
+            }
+          }
+
+          if (event.type === 'content_block_delta') {
+            if (event.delta.type === 'text_delta' && !activeToolCall) {
+              const token = event.delta.text;
+              fullText += token;
+              callbacks.onToken(token);
+            } else if (event.delta.type === 'input_json_delta' && activeToolCall) {
+              activeToolCall.inputJson += event.delta.partial_json;
+            }
+          }
+
+          if (event.type === 'message_delta' && event.usage) {
+            outputTokens += event.usage.output_tokens ?? 0;
           }
         }
 
-        if (event.type === 'content_block_delta') {
-          if (event.delta.type === 'text_delta' && !activeToolCall) {
-            const token = event.delta.text;
-            fullText += token;
-            callbacks.onToken(token);
-          } else if (event.delta.type === 'input_json_delta' && activeToolCall) {
-            activeToolCall.inputJson += event.delta.partial_json;
-          }
+        // Flush any still-open tool call after the stream ends
+        if (activeToolCall) { collectedToolCalls.push(activeToolCall); activeToolCall = null; }
+
+        const finalMessage = await stream.finalMessage();
+
+        // Claude can emit multiple tool_use blocks in one response. We collect them
+        // all above and must provide a tool_result for EACH one; missing any causes
+        // a 400 "tool_use without tool_result" error from the Anthropic API.
+        const webSearchCalls = collectedToolCalls.filter(
+          (tc) => tc.name === 'web_search' && this.tavilyClient,
+        );
+        const docGenCalls = collectedToolCalls.filter(
+          (tc) => tc.name === 'generate_document' && callbacks.onDocumentRequest,
+        );
+
+        if (webSearchCalls.length === 0 && docGenCalls.length === 0) {
+          // No tool use this round — fullText is the real answer. Done.
+          break;
         }
 
-        if (event.type === 'message_delta' && event.usage) {
-          outputTokens = event.usage.output_tokens ?? 0;
-        }
-      }
+        // generate_document must carry the entire document body as tool-call JSON
+        // arguments, so a long document can legitimately run out of output tokens
+        // mid tool-call. When that happens the stream ends with stop_reason
+        // 'max_tokens' instead of 'tool_use' — the collected tool calls still need
+        // to be processed (as a reportable failure, see below) rather than silently
+        // dropped, which is why this branch keys off collected calls, not stop_reason.
+        const truncatedByTokenLimit = finalMessage.stop_reason === 'max_tokens';
 
-      // Flush any still-open tool call after the stream ends
-      if (activeToolCall) { collectedToolCalls.push(activeToolCall); activeToolCall = null; }
-
-      const finalMessage = await stream.finalMessage();
-
-      // ── Tool use requested — handle web_search and generate_document calls ──
-      // Claude can emit multiple tool_use blocks in one response. We collect them
-      // all above and must provide a tool_result for EACH one; missing any causes
-      // a 400 "tool_use without tool_result" error from the Anthropic API.
-      const webSearchCalls = collectedToolCalls.filter(
-        (tc) => tc.name === 'web_search' && this.tavilyClient,
-      );
-      const docGenCalls = collectedToolCalls.filter(
-        (tc) => tc.name === 'generate_document' && callbacks.onDocumentRequest,
-      );
-
-      // generate_document must carry the entire document body as tool-call JSON
-      // arguments, so a long document can legitimately run out of output tokens
-      // mid tool-call. When that happens the stream ends with stop_reason
-      // 'max_tokens' instead of 'tool_use' — still gating on 'tool_use' alone
-      // silently dropped the whole tool-use branch (no search, no document, no
-      // tool_result), leaving fullText empty and surfacing the generic "didn't
-      // quite catch that" fallback for a perfectly clear request. Truncated
-      // calls still need to go through this branch so they can be reported as
-      // a real (and explicable) failure instead of vanishing.
-      const truncatedByTokenLimit = finalMessage.stop_reason === 'max_tokens';
-
-      if (
-        (finalMessage.stop_reason === 'tool_use' || truncatedByTokenLimit) &&
-        (webSearchCalls.length > 0 || docGenCalls.length > 0)
-      ) {
         this.logger.log(
-          `Tool use triggered — web_search: ${webSearchCalls.length}, generate_document: ${docGenCalls.length}` +
+          `Tool use triggered (round ${round}/${MAX_ROUNDS}) — web_search: ${webSearchCalls.length}, generate_document: ${docGenCalls.length}` +
             (truncatedByTokenLimit ? ' (truncated by max_tokens)' : ''),
         );
 
@@ -342,8 +363,8 @@ export class ClaudeService implements OnModuleInit {
           }),
         );
 
-        // Combine all search results as research context for document generation
-        const researchContext = [...searchResultsMap.values()].join('\n\n---\n\n');
+        if (searchResultsMap.size > 0) researchContextParts.push(...searchResultsMap.values());
+        const researchContext = researchContextParts.join('\n\n---\n\n');
 
         // ── Step 2: Handle document generation calls (sequential — uses search results) ──
         const docResultsMap = new Map<string, string>();
@@ -407,34 +428,15 @@ export class ClaudeService implements OnModuleInit {
           })),
         ];
 
-        const messagesWithTool: Anthropic.MessageParam[] = [
-          ...messages,
+        currentMessages = [
+          ...currentMessages,
           { role: 'assistant', content: finalMessage.content },
           { role: 'user', content: toolResults },
         ];
 
-        // ── Step 4: Stream the final answer — no tools on follow-up (avoids recursion) ──
-        fullText = '';
-        const followUpStream = this.client.messages.stream({
-          model: this.model,
-          max_tokens: maxTokens,
-          system: systemWithCache,
-          messages: messagesWithTool,
-        });
-
-        for await (const event of followUpStream) {
-          if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-            const token = event.delta.text;
-            fullText += token;
-            callbacks.onToken(token);
-          }
-          if (event.type === 'message_delta' && event.usage) {
-            outputTokens += event.usage.output_tokens ?? 0;
-          }
-          if (event.type === 'message_start' && event.message.usage) {
-            inputTokens += event.message.usage.input_tokens ?? 0;
-          }
-        }
+        // Loop continues — next round re-offers `tools` (unless it's the final,
+        // capped round) so a sequential "search, then generate" instruction can
+        // actually be carried out across two round-trips instead of one.
       }
 
       // Defensive net: if the model still narrates a tool-call/tool-response
