@@ -4,6 +4,13 @@
   "sourceRoot": "src",
   "compilerOptions": {
     "deleteOutDir": true,
-    "plugins": []
+    "plugins": [],
+    "assets": [
+      {
+        "include": "assets/**/*",
+        "outDir": "dist"
+      }
+    ],
+    "watchAssets": true
   }
 }
