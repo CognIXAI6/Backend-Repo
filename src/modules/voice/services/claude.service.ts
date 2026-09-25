@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { tavily } from '@tavily/core';
+import { checkLength, countWords, estimatePages, PAGE_CAPACITY, targetWords } from '@/modules/documents/document-length.util';
 
 export interface DocumentRequest {
   title: string;
@@ -10,6 +11,7 @@ export interface DocumentRequest {
   researchContext: string;
   depth?: 'brief' | 'standard' | 'comprehensive';
   format?: 'docx' | 'pdf';
+  pages?: number;
 }
 
 export interface ClaudeStreamCallbacks {
@@ -52,13 +54,22 @@ const WEB_SEARCH_TOOL: Anthropic.Tool = {
   },
 };
 
+// Model-facing word budget per page count (see document-length.util.ts).
+const PAGE_WORDS_HINT =
+  `Total words across all section headings and bodies must fill the pages: ` +
+  `for .docx about ${targetWords(1, 'docx')} words for 1 page plus ${PAGE_CAPACITY.docx.next} per extra page ` +
+  `(3 pages ≈ ${targetWords(3, 'docx')}, 5 pages ≈ ${targetWords(5, 'docx')}); ` +
+  `for pdf about ${targetWords(1, 'pdf')} plus ${PAGE_CAPACITY.pdf.next} per extra page ` +
+  `(3 pages ≈ ${targetWords(3, 'pdf')}, 5 pages ≈ ${targetWords(5, 'pdf')}).`;
+
 const GENERATE_DOCUMENT_TOOL: Anthropic.Tool = {
   name: 'generate_document',
   description:
     'Generate a downloadable, professionally formatted Word document (.docx) on a specific topic. ' +
     'Use this when the user asks to prepare, create, write, draft, or generate a document, report, ' +
     'proposal, file, or paper. Before calling this tool, use web_search to research the topic so ' +
-    'sections are grounded in current information. Organize the research into clear sections.',
+    'sections are grounded in current information. Organize the research into clear sections. ' +
+    `If the user asks for a specific number of pages, set "pages" and write enough text to fill them: ${PAGE_WORDS_HINT}`,
   input_schema: {
     type: 'object' as const,
     properties: {
@@ -86,11 +97,19 @@ const GENERATE_DOCUMENT_TOOL: Anthropic.Tool = {
           required: ['heading', 'content'],
         },
       },
+      pages: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 30,
+        description:
+          `Exact page count the user asked for (e.g. "3 pages" → 3). Omit if they gave no page count. ` +
+          `${PAGE_WORDS_HINT} Write full paragraphs — do not summarise.`,
+      },
       depth: {
         type: 'string',
         enum: ['brief', 'standard', 'comprehensive'],
         description:
-          'Depth of the document. "brief" = 3-4 short sections, "standard" = 5-7 sections (default), "comprehensive" = 8-12 detailed sections.',
+          'Depth of the document when no page count is given. "brief" = 3-4 short sections, "standard" = 5-7 sections (default), "comprehensive" = 8-12 detailed sections.',
       },
       format: {
         type: 'string',
@@ -221,7 +240,7 @@ export class ClaudeService implements OnModuleInit {
     // call in the same turn — that truncates the tool call mid-JSON, which the
     // caller must be able to detect (see stop_reason handling below), so the
     // budget here just needs to make truncation the exception, not the norm.
-    const maxTokens = options.maxTokens ?? (options.enableDocumentGeneration ? 8192 : 300);
+    const maxTokens = options.maxTokens ?? (options.enableDocumentGeneration ? 16000 : 300);
 
     try {
       let fullText = '';
@@ -253,6 +272,9 @@ export class ClaudeService implements OnModuleInit {
       // the final round always drops tools, which forces the API to return a
       // plain-text answer instead of attempting (and failing) another tool call.
       const MAX_ROUNDS = 4;
+      // A draft that misses the requested page count is bounced back to the model
+      // once; after that we ship what we have rather than loop on the user.
+      let lengthRetryUsed = false;
 
       for (let round = 1; round <= MAX_ROUNDS; round++) {
         const roundTools = round < MAX_ROUNDS ? tools : undefined;
@@ -370,7 +392,7 @@ export class ClaudeService implements OnModuleInit {
         const docResultsMap = new Map<string, string>();
 
         for (const tc of docGenCalls) {
-          let docInput: { title: string; topic: string; sections: Array<{ heading: string; content: string }>; depth?: 'brief' | 'standard' | 'comprehensive'; format?: 'docx' | 'pdf' } | null = null;
+          let docInput: { title: string; topic: string; sections: Array<{ heading: string; content: string }>; depth?: 'brief' | 'standard' | 'comprehensive'; format?: 'docx' | 'pdf'; pages?: number } | null = null;
           try { docInput = JSON.parse(tc.inputJson); } catch {}
 
           // A parse failure (or an empty sections array) means the tool call's JSON
@@ -393,6 +415,20 @@ export class ClaudeService implements OnModuleInit {
             continue;
           }
 
+          const requestedPages = Number.isInteger(docInput.pages) && docInput.pages! > 0 ? docInput.pages : undefined;
+          if (requestedPages) {
+            const check = checkLength(docInput.sections, requestedPages, docInput.format ?? 'docx');
+            this.logger.log(
+              `  → length check: requested ${requestedPages} page(s) (~${targetWords(requestedPages, docInput.format ?? 'docx')} words), ` +
+                `draft ~${check.words} words (≈${check.estimatedPages} pages)`,
+            );
+            if (!check.ok && !lengthRetryUsed) {
+              lengthRetryUsed = true;
+              docResultsMap.set(tc.id, check.message);
+              continue;
+            }
+          }
+
           this.logger.log(`  → generating document: "${docInput.title}" (depth: ${docInput.depth ?? 'standard'}, format: ${docInput.format ?? 'docx'})`);
 
           try {
@@ -403,10 +439,11 @@ export class ClaudeService implements OnModuleInit {
               researchContext,
               depth: docInput.depth,
               format: docInput.format,
+              pages: requestedPages,
             });
             docResultsMap.set(
               tc.id,
-              `Document generated successfully.\nTitle: ${docInput.title}\nDownload URL: ${result.downloadUrl}\nDocument ID: ${result.docId}`,
+              `Document generated successfully (about ${estimatePages(countWords(docInput.sections), docInput.format ?? 'docx')} pages).\nTitle: ${docInput.title}\nDownload URL: ${result.downloadUrl}\nDocument ID: ${result.docId}`,
             );
           } catch (err) {
             this.logger.error(`Document generation error for "${docInput.title}":`, err);
@@ -486,7 +523,7 @@ export class ClaudeService implements OnModuleInit {
     // with the Anthropic API for this call — otherwise, with nothing to invoke,
     // it narrates a fake tool_call as visible text instead of just answering.
     const documentToolBlock = enableDocumentGeneration
-      ? '\n\nYou also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. After the document is generated, respond with a brief confirmation and the download link.'
+      ? `\n\nYou also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. If the user asks for a specific number of pages, pass it as "pages" and write to length: a page holds roughly ${PAGE_CAPACITY.docx.next} words, so 3 pages is about ${targetWords(3, 'docx')} words as .docx (${targetWords(3, 'pdf')} as pdf) and 5 pages about ${targetWords(5, 'docx')} (${targetWords(5, 'pdf')} as pdf). Never write a shorter document than requested, and never pad to reach the length. After the document is generated, respond with a brief confirmation and the download link.`
       : '';
 
     const basePrompt = `You are CognIX AI, a real-time insight assistant for professionals.

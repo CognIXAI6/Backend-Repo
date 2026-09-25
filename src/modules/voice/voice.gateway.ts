@@ -1910,6 +1910,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                     researchContext: req.researchContext,
                     depth: req.depth,
                     format: req.format,
+                    pages: req.pages,
                   });
 
                   // Capture doc info — onDone picks it up to link the assistant

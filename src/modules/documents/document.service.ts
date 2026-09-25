@@ -41,6 +41,9 @@ export interface GenerateDocumentParams {
   researchContext?: string;
   depth?: 'brief' | 'standard' | 'comprehensive';
   format?: 'docx' | 'pdf';
+  // Page count the user asked for. When set, the caller has already validated
+  // the length, so section trimming is skipped to avoid cutting it back down.
+  pages?: number;
 }
 
 export interface GeneratedDocument {
@@ -80,13 +83,13 @@ export class DocumentService {
   };
 
   async generateAndUpload(params: GenerateDocumentParams): Promise<GeneratedDocument> {
-    const { userId, conversationId, title, topic, sections, researchContext, depth = 'standard', format = 'docx' } = params;
+    const { userId, conversationId, title, topic, sections, researchContext, depth = 'standard', format = 'docx', pages } = params;
 
     this.logger.log(`Generating document: "${title}" for user ${userId} (depth: ${depth}, format: ${format})`);
 
-    // Trim sections to the depth limit before enrichment.
-    const sectionLimit = this.DEPTH_SECTION_LIMITS[depth];
-    const trimmedSections = sections.slice(0, sectionLimit);
+    // Trim sections to the depth limit before enrichment — unless a page count was
+    // requested, where trimming would silently shrink the document below it.
+    const trimmedSections = pages ? sections : sections.slice(0, this.DEPTH_SECTION_LIMITS[depth]);
 
     const enrichedSections = researchContext
       ? this.enrichSectionsWithResearch(trimmedSections, researchContext)
