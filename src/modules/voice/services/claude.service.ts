@@ -510,6 +510,7 @@ export class ClaudeService implements OnModuleInit {
     aiMemory?: string,
     documentContext?: string | null,
     enableDocumentGeneration = false,
+    isGuestSession = false,
   ): string {
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', {
@@ -524,7 +525,9 @@ export class ClaudeService implements OnModuleInit {
     // it narrates a fake tool_call as visible text instead of just answering.
     const documentToolBlock = enableDocumentGeneration
       ? `\n\nYou also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. If the user asks for a specific number of pages, pass it as "pages" and write to length: a page holds roughly ${PAGE_CAPACITY.docx.next} words, so 3 pages is about ${targetWords(3, 'docx')} words as .docx (${targetWords(3, 'pdf')} as pdf) and 5 pages about ${targetWords(5, 'docx')} (${targetWords(5, 'pdf')} as pdf). Never write a shorter document than requested, and never pad to reach the length. After the document is generated, respond with a brief confirmation and the download link.`
-      : '';
+      : isGuestSession
+        ? `\n\n## DOCUMENT GENERATION — NOT AVAILABLE TO THIS USER\nYou do NOT have a document generation tool for this conversation (guest session). If the user asks you to prepare, create, write, draft, generate, export, or "put [something] in a doc/document/report/file/proposal", do NOT explain, apologize, offer alternatives, or continue discussing formatting. Respond with ONLY this exact message and nothing else:\n"Document generation is a Pro plan feature. Please sign up to generate documents."`
+        : '';
 
     const basePrompt = `You are CognIX AI, a real-time insight assistant for professionals.
 

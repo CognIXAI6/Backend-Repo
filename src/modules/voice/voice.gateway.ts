@@ -1768,6 +1768,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.cachedAiMemory ?? undefined,
         documentContext,
         documentGenerationEnabled,
+        session.isGuest,
       );
 
       // Load all images attached to this conversation — passed as image content
