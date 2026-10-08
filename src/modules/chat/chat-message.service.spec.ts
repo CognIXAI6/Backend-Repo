@@ -40,7 +40,14 @@ describe('ChatMessageService.submitMessage', () => {
       }),
     });
 
-    const service = new ChatMessageService(knexLike, conversationService);
+    const entitlementsService: any = {
+      getUserEntitlements: jest.fn().mockResolvedValue({ tier: 'free', entitlements: { maxMessagesPerMonth: null } }),
+    };
+    const usageService: any = {
+      tryConsume: jest.fn().mockResolvedValue({ canUse: true, used: 1, limit: null, remaining: null }),
+    };
+
+    const service = new ChatMessageService(knexLike, conversationService, entitlementsService, usageService);
     const result = await service.submitMessage('user-1', {
       clientMessageId: 'client-msg-1',
       conversationId: 'conv-1',
@@ -84,7 +91,7 @@ describe('ChatMessageService.submitMessage', () => {
     knexLike.transaction = jest.fn();
 
     const conversationService = createFakeConversationService();
-    const service = new ChatMessageService(knexLike, conversationService);
+    const service = new ChatMessageService(knexLike, conversationService, {} as any, {} as any);
 
     const result = await service.submitMessage('user-1', {
       clientMessageId: 'client-msg-1',
@@ -116,7 +123,7 @@ describe('ChatMessageService.submitMessage', () => {
     knexLike.transaction = jest.fn();
 
     const conversationService = createFakeConversationService();
-    const service = new ChatMessageService(knexLike, conversationService);
+    const service = new ChatMessageService(knexLike, conversationService, {} as any, {} as any);
 
     await expect(
       service.submitMessage('user-1', {

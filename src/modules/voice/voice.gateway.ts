@@ -32,6 +32,9 @@ import { ProviderSessionState, ProviderCloseInfo } from './interfaces/provider-s
 import { ProviderDisruptionReason } from './interfaces/voice-events.types';
 import { computeBackoffDelayMs, sleep, PROVIDER_RECOVERY_MAX_ATTEMPTS } from './utils/backoff.util';
 import { ToolCallStreamFilter } from './utils/tool-call-stream-filter.util';
+import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
+import { UsageService } from '@/modules/entitlements/usage.service';
+import { PlanEntitlements, PlanType } from '@/modules/entitlements/entitlements.types';
 
 // ─── Mode types ───────────────────────────────────────────────────────────────
 
@@ -85,6 +88,11 @@ interface ActiveSession {
   isGuest: boolean;
   /** Only set for guest sessions */
   guestSessionId?: string;
+  /** Wall-clock ms this session's Deepgram connection opened — used to meter voice-minutes usage on teardown. Guests don't consume a tier's voice-minute cap. */
+  startedAt: number;
+  /** Resolved once at session:start; undefined for guest sessions. */
+  tier?: PlanType;
+  entitlements?: PlanEntitlements;
   deepgramEmitter: EventEmitter;
   sendAudio: (chunk: Buffer) => void;
   sendFinalize: () => void;
@@ -346,6 +354,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly speakersService: SpeakersService,
     private readonly documentService: DocumentService,
     private readonly pushNotificationService: PushNotificationService,
+    private readonly entitlementsService: EntitlementsService,
+    private readonly usageService: UsageService,
   ) {}
 
   private emitError(
@@ -374,6 +384,48 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     });
 
     client.emit('error', { code, message: clientMessage });
+  }
+
+  // Dedicated event (distinct from the generic 'error' emitError sends)
+  // so the client can route this to an upgrade prompt, the same way it
+  // already does for the existing 'guest:limit_reached' event.
+  private emitEntitlementBlocked(
+    client: Socket,
+    reason: string,
+    message: string,
+    extra: Record<string, unknown> = {},
+  ): void {
+    client.emit('entitlement:blocked', { reason, message, ...extra });
+  }
+
+  /**
+   * Read-only check (does not consume) run at every entry point that's
+   * about to call processPrompt for an authenticated turn. The actual
+   * consumption happens once, inside processPrompt's onDone, so a turn
+   * that errors out before completing never burns a message — same
+   * fairness guestSessionService's increment-on-completion already gives
+   * guests. Guests are gated by the existing guest_sessions path, not this.
+   */
+  private async checkMessageQuota(client: Socket, session: ActiveSession): Promise<boolean> {
+    if (session.isGuest || !session.entitlements) return true;
+
+    const status = await this.usageService.getStatus(
+      session.userId,
+      'messages',
+      session.entitlements.maxMessagesPerMonth,
+    );
+
+    if (!status.canUse) {
+      this.emitEntitlementBlocked(
+        client,
+        'messages_exhausted',
+        `You've used all ${status.limit} messages included in your plan this month. Upgrade for more.`,
+        { used: status.used, limit: status.limit },
+      );
+      return false;
+    }
+
+    return true;
   }
 
   private handleAiError(client: Socket, err: Error, context: string): void {
@@ -540,6 +592,46 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const shouldDiarize = isDualSpeaker || isMultiSpeaker;
       const audioFormat = this.normalizeAudioFormatHint(payload.audioFormat);
 
+      // ── Entitlement checks (authenticated users only — guests use the
+      // existing 5-prompt trial, checked above) ────────────────────────────
+      // Checked once at session start, not mid-call, so a user is never cut
+      // off mid-sentence — consistent with the ledger's fair-use framing.
+      let tier: PlanType | undefined;
+      let entitlements: PlanEntitlements | undefined;
+
+      if (!isGuest) {
+        ({ tier, entitlements } = await this.entitlementsService.getUserEntitlements(userId));
+
+        if (!entitlements.allowedVoiceModes.includes(mode)) {
+          this.emitEntitlementBlocked(
+            client,
+            'mode_not_permitted',
+            mode === 'multiple_speaker'
+              ? 'Group meeting mode (3+ speakers) is available on the Xpress plan. Please upgrade to continue.'
+              : 'Dual-speaker conversations require a paid plan. Please upgrade to continue.',
+            { mode, tier },
+          );
+          return;
+        }
+
+        if (entitlements.maxVoiceMinutesPerMonth !== null) {
+          const voiceStatus = await this.usageService.getStatus(
+            userId,
+            'voice_seconds',
+            entitlements.maxVoiceMinutesPerMonth * 60,
+          );
+          if (!voiceStatus.canUse) {
+            this.emitEntitlementBlocked(
+              client,
+              'voice_minutes_exhausted',
+              `You've used all ${entitlements.maxVoiceMinutesPerMonth} voice minutes included in your plan this month. Upgrade for more.`,
+              { usedMinutes: Math.round(voiceStatus.used / 60), limitMinutes: entitlements.maxVoiceMinutesPerMonth },
+            );
+            return;
+          }
+        }
+      }
+
       if (!conversationId) {
         const dbMode: ConversationMode = mode === 'multiple_speaker' ? 'multiple_speaker' : (mode as ConversationMode);
 
@@ -590,6 +682,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         conversationId,
         fieldName: resolvedFieldName,
         isGuest,
+        startedAt: Date.now(),
+        tier,
+        entitlements,
         guestSessionId,
         deepgramEmitter: emitter,
         sendAudio,
@@ -1022,6 +1117,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         });
         return;
       }
+    } else if (!(await this.checkMessageQuota(client, session))) {
+      return;
     }
 
     await this.processPrompt(client, session, transcript, 'voice');
@@ -1061,6 +1158,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         });
         return;
       }
+    } else if (!(await this.checkMessageQuota(client, session))) {
+      return;
     }
 
     await this.processPrompt(client, session, text, 'text');
@@ -1531,6 +1630,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             })
             .catch((err) => this.logger.error('Multi-speaker title generation failed:', err));
 
+          if (session.entitlements) {
+            this.usageService
+              .tryConsume(session.userId, 'messages', 1, session.entitlements.maxMessagesPerMonth)
+              .catch((err) => this.logger.error(`Failed to record message usage for user ${session.userId}:`, err));
+          }
+
           client.emit('ai:done', {
             response: fullText,
             tokensUsed: inputTokens + outputTokens,
@@ -1645,6 +1750,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             })
             .catch((err) => this.logger.error('Dual-speaker title generation failed:', err));
 
+          if (session.entitlements) {
+            this.usageService
+              .tryConsume(session.userId, 'messages', 1, session.entitlements.maxMessagesPerMonth)
+              .catch((err) => this.logger.error(`Failed to record message usage for user ${session.userId}:`, err));
+          }
+
           client.emit('ai:done', {
             response: fullText,
             tokensUsed: inputTokens + outputTokens,
@@ -1746,7 +1857,27 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // pre-guess intent with a regex just reproduces that bug under a new
       // phrasing every time; Claude's own tool-use judgment (guided by the
       // system prompt) is what tool-calling exists to handle instead.
-      const documentGenerationEnabled = !session.isGuest;
+      // Document generation is registered as a real tool for every turn
+      // whose tier currently has quota for it — NOT gated behind a single-
+      // message keyword regex (see comment above on why). A zero-document
+      // tier (Free) or an exhausted monthly cap disables the tool entirely.
+      let documentGenerationEnabled = !session.isGuest;
+      let documentUnavailableReason: string | undefined;
+      let documentUsageLimit: number | null = null;
+
+      if (documentGenerationEnabled && session.entitlements) {
+        if (session.entitlements.maxDocumentsPerMonth <= 0) {
+          documentGenerationEnabled = false;
+          documentUnavailableReason = 'Document generation is available on paid plans. Please upgrade to continue.';
+        } else {
+          documentUsageLimit = session.entitlements.maxDocumentsPerMonth;
+          const docStatus = await this.usageService.getStatus(session.userId, 'documents', documentUsageLimit);
+          if (!docStatus.canUse) {
+            documentGenerationEnabled = false;
+            documentUnavailableReason = `You've used all ${docStatus.limit} documents included in your plan this month. Upgrade for more.`;
+          }
+        }
+      }
 
       // Soft hint used ONLY to decide whether this voice turn is worth the
       // latency of also registering web_search (voice search is off by
@@ -1754,6 +1885,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // generate_document itself is available.
       const documentIntentHint =
         /\b(?:prepar(?:e|es|ing)|creat(?:e|es|ing)|generat(?:e|es|ing)|writ(?:e|es|ing)|mak(?:e|es|ing)|draft(?:s|ing)?|put together)\b.{0,30}\b(document|report|file|proposal|paper|essay|article|doc|write-up)\b/i.test(userMessage);
+
+      // Free tier's web search cap (10/mo) — paid tiers carry
+      // maxWebSearchesPerMonth: null (unlimited/fair-use) and skip the check.
+      let webSearchAllowed = true;
+      if (session.entitlements && session.entitlements.maxWebSearchesPerMonth !== null) {
+        const searchStatus = await this.usageService.getStatus(
+          session.userId,
+          'web_searches',
+          session.entitlements.maxWebSearchesPerMonth,
+        );
+        webSearchAllowed = searchStatus.canUse;
+      }
 
       // Load document context: conversation attachments + field resources (Resources tab).
       const documentContext = await this.conversationService
@@ -1769,6 +1912,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         documentContext,
         documentGenerationEnabled,
         session.isGuest,
+        documentUnavailableReason,
+        session.entitlements?.allowedDocumentDepths,
       );
 
       // Load all images attached to this conversation — passed as image content
@@ -1814,7 +1959,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             if (safeToken) client.emit('ai:token', { token: safeToken });
           },
 
-          onDone: async (fullText: string, inputTokens: number, outputTokens: number) => {
+          onDone: async (fullText: string, inputTokens: number, outputTokens: number, webSearchCalls = 0) => {
             // Safety net: if Claude returned nothing (rare but possible with very garbled
             // or ambiguous input), synthesise a clarification response so the user is
             // never left staring at a blank screen. Emit it as a token first so the
@@ -1878,6 +2023,23 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                   limit: updated.prompt_limit,
                 });
               }
+            } else if (session.entitlements) {
+              this.usageService
+                .tryConsume(session.userId, 'messages', 1, session.entitlements.maxMessagesPerMonth)
+                .catch((err) => this.logger.error(`Failed to record message usage for user ${session.userId}:`, err));
+            }
+
+            if (session.entitlements) {
+              if (generatedDocId && documentUsageLimit !== null) {
+                this.usageService
+                  .tryConsume(session.userId, 'documents', 1, documentUsageLimit)
+                  .catch((err) => this.logger.error(`Failed to record document usage for user ${session.userId}:`, err));
+              }
+              if (webSearchCalls > 0) {
+                this.usageService
+                  .tryConsume(session.userId, 'web_searches', webSearchCalls, session.entitlements.maxWebSearchesPerMonth)
+                  .catch((err) => this.logger.error(`Failed to record web search usage for user ${session.userId}:`, err));
+              }
             }
 
             client.emit('ai:done', {
@@ -1912,6 +2074,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                     depth: req.depth,
                     format: req.format,
                     pages: req.pages,
+                    allowedDepths: session.entitlements?.allowedDocumentDepths,
                   });
 
                   // Capture doc info — onDone picks it up to link the assistant
@@ -1959,7 +2122,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           // look document-adjacent (so a voice-triggered document still
           // gets research-enriched) — voice search stays off by default
           // for response latency otherwise.
-          enableWebSearch: inputType === 'text' || documentIntentHint,
+          enableWebSearch: webSearchAllowed && (inputType === 'text' || documentIntentHint),
           enableDocumentGeneration: documentGenerationEnabled,
           // Include every image attached to this conversation on every call.
           images: visionImages.length > 0 ? visionImages : undefined,
@@ -2669,6 +2832,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return false;
     }
 
+    if (!(await this.checkMessageQuota(client, session))) return false;
+
     // Commit the drain only after threshold is confirmed
     session.pendingMultiSpeakerTurns = [];
     session.accumulatedTranscript = '';
@@ -2970,6 +3135,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             .filter(Boolean).length;
 
           if (combinedWords < 8) return;
+          if (!(await this.checkMessageQuota(client, session))) return;
 
           session.pendingOtherText = '';
           session.pendingOwnerText = '';
@@ -3017,6 +3183,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             });
             return;
           }
+        } else if (!(await this.checkMessageQuota(client, session))) {
+          return;
         }
 
         await this.processPrompt(client, session, transcript, 'voice');
@@ -3266,6 +3434,22 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.recoveryAudioBufferBytes = 0;
 
     session.closeDeepgram();
+
+    // Meter voice-minutes usage against the tier's monthly cap by the
+    // Deepgram-connected duration of this session — the same "connected
+    // minutes, not speaking minutes" driver the ledger identifies as the
+    // real cost (a live session held open through silence still bills).
+    // Fire-and-forget: cleanupSession must stay synchronous for its callers.
+    if (!session.isGuest && session.entitlements) {
+      const elapsedSeconds = Math.round((Date.now() - session.startedAt) / 1000);
+      const maxMinutes = session.entitlements.maxVoiceMinutesPerMonth;
+      if (elapsedSeconds > 0) {
+        this.usageService
+          .tryConsume(session.userId, 'voice_seconds', elapsedSeconds, maxMinutes !== null ? maxMinutes * 60 : null)
+          .catch((err) => this.logger.error(`Failed to record voice usage for user ${session.userId}:`, err));
+      }
+    }
+
     this.logger.log(`Session cleaned up: ${socketId}`);
   }
 }

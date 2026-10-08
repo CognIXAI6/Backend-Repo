@@ -8,6 +8,8 @@ import { AdminService, Period, AdminRole } from './admin.service';
 import { AdminGuard } from './admin.guard';
 import { FieldsService } from '../fields/fields.service';
 import { CreateFieldDto, UpdateFieldDto } from '../fields/dto/fields.dto';
+import { AdminPlansService } from './admin-plans.service';
+import { PlanType } from '../entitlements/entitlements.types';
 
 function adminFromReq(req: Request): any {
   return (req as any).admin;
@@ -18,6 +20,7 @@ export class AdminController {
   constructor(
     private adminService: AdminService,
     private fieldsService: FieldsService,
+    private adminPlansService: AdminPlansService,
   ) {}
 
   // ── Auth ───────────────────────────────────────────────────────────────────
@@ -105,7 +108,7 @@ export class AdminController {
 
   @Patch('users/:id/tier')
   @UseGuards(AdminGuard)
-  updateUserTier(@Param('id') id: string, @Body('tier') tier: 'free' | 'premium') {
+  updateUserTier(@Param('id') id: string, @Body('tier') tier: PlanType) {
     return this.adminService.updateUserTier(id, tier);
   }
 
@@ -228,5 +231,83 @@ export class AdminController {
   @HttpCode(HttpStatus.OK)
   deactivateField(@Param('id') id: string) {
     return this.fieldsService.deactivateField(id);
+  }
+
+  // ── Plans & entitlements (pricing + what each tier unlocks) ───────────────
+  // Everything here is what EntitlementsService and PaymentService read at
+  // request/checkout time — nothing in the app is statically configured
+  // once this is in place. Publishing to Stripe is a separate explicit step
+  // (publishPlan) from editing the price (updatePlan).
+
+  @Get('plans')
+  @UseGuards(AdminGuard)
+  listPlans() {
+    return this.adminPlansService.listPlans();
+  }
+
+  @Post('plans')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.CREATED)
+  createPlan(
+    @Body('planType') planType: PlanType,
+    @Body('billingCycle') billingCycle: 'monthly' | 'quarterly' | 'biannual' | 'yearly',
+    @Body('amountCents') amountCents: number,
+    @Body('label') label: string,
+    @Body('currency') currency?: string,
+    @Body('discountPercent') discountPercent?: number,
+  ) {
+    return this.adminPlansService.createPlan({ planType, billingCycle, amountCents, label, currency, discountPercent });
+  }
+
+  @Patch('plans/:id')
+  @UseGuards(AdminGuard)
+  updatePlan(
+    @Param('id') id: string,
+    @Body('amountCents') amountCents?: number,
+    @Body('discountPercent') discountPercent?: number,
+    @Body('label') label?: string,
+    @Body('isActive') isActive?: boolean,
+  ) {
+    return this.adminPlansService.updatePlan(id, { amountCents, discountPercent, label, isActive });
+  }
+
+  // Mints a fresh Stripe Price for this plan's current amount/currency/cycle
+  // and archives whatever Price it replaces — see StripeSyncService.
+  @Post('plans/:id/publish')
+  @UseGuards(AdminGuard)
+  publishPlan(@Param('id') id: string) {
+    return this.adminPlansService.publish(id);
+  }
+
+  @Post('plans/:id/price-overrides')
+  @UseGuards(AdminGuard)
+  setPlanPriceOverride(
+    @Param('id') id: string,
+    @Body('currency') currency: string,
+    @Body('amount') amount: number,
+  ) {
+    return this.adminPlansService.setPriceOverride(id, currency, amount);
+  }
+
+  @Delete('plans/:id/price-overrides/:currency')
+  @UseGuards(AdminGuard)
+  clearPlanPriceOverride(@Param('id') id: string, @Param('currency') currency: string) {
+    return this.adminPlansService.clearPriceOverride(id, currency);
+  }
+
+  @Get('plans/:planType/entitlements')
+  @UseGuards(AdminGuard)
+  getPlanEntitlements(@Param('planType') planType: PlanType) {
+    return this.adminPlansService.getEntitlements(planType);
+  }
+
+  @Patch('plans/:planType/entitlements')
+  @UseGuards(AdminGuard)
+  updatePlanEntitlements(
+    @Req() req: Request,
+    @Param('planType') planType: PlanType,
+    @Body() dto: Parameters<AdminPlansService['updateEntitlements']>[1],
+  ) {
+    return this.adminPlansService.updateEntitlements(planType, dto, adminFromReq(req).id);
   }
 }

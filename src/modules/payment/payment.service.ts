@@ -6,22 +6,29 @@ import { KNEX_CONNECTION } from '@/database/database.module';
 import { GeoService, getCountryConfig } from './geo.service';
 import { FxService } from './fx.service';
 import { FlutterwaveService, FlutterwaveWebhookPayload } from './flutterwave.service';
+import { PlanType, isPaidTier } from '@/modules/entitlements/entitlements.types';
+import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
+import { UsageService } from '@/modules/entitlements/usage.service';
 
 export type BillingCycle = 'monthly' | 'quarterly' | 'biannual' | 'yearly';
 
 export interface SubscriptionPlan {
   id: string;
+  plan_type: PlanType;
   billing_cycle: BillingCycle;
   amount_cents: number;
   currency: string;
   label: string;
   discount_percent: number;
   is_active: boolean;
+  stripe_product_id: string | null;
+  stripe_price_id: string | null;
   created_at: Date;
   updated_at: Date;
 }
 
 export interface LocalizedPlan {
+  planType: PlanType;
   billingCycle: BillingCycle;
   label: string;
   currency: string;
@@ -43,6 +50,8 @@ export class PaymentService {
     private geoService: GeoService,
     private fxService: FxService,
     private flutterwaveService: FlutterwaveService,
+    private entitlementsService: EntitlementsService,
+    private usageService: UsageService,
   ) {
     const secretKey = this.configService.get<string>('stripe.secretKey');
     if (!secretKey) {
@@ -55,24 +64,26 @@ export class PaymentService {
 
   // ── Plans (from DB) ──────────────────────────────────────────────────────────
 
-  async getSubscriptionPlans(): Promise<SubscriptionPlan[]> {
+  async getSubscriptionPlans(planType?: PlanType): Promise<SubscriptionPlan[]> {
     return this.knex('subscription_plans')
       .where('is_active', true)
+      .modify((q) => { if (planType) q.where('plan_type', planType); })
       .orderByRaw(
-        `ARRAY_POSITION(ARRAY['monthly','quarterly','biannual','yearly']::text[], billing_cycle::text)`,
+        `ARRAY_POSITION(ARRAY['free','standard','plus','xpress']::text[], plan_type::text),
+         ARRAY_POSITION(ARRAY['monthly','quarterly','biannual','yearly']::text[], billing_cycle::text)`,
       )
       .select('*');
   }
 
   // Geo-aware plans: returns prices in the user's local currency using live FX
   // rates, or an admin-pinned override stored in subscription_plan_prices.
-  async getLocalizedPlans(clientIp: string, countryOverride?: string): Promise<LocalizedPlan[]> {
+  async getLocalizedPlans(clientIp: string, countryOverride?: string, planType?: PlanType): Promise<LocalizedPlan[]> {
     const country = countryOverride ?? (await this.geoService.detectCountry(clientIp)) ?? 'US';
     const { currency, provider } = getCountryConfig(country);
 
     this.logger.log(`getLocalizedPlans: ip=${clientIp} → country=${country} → currency=${currency} provider=${provider}`);
 
-    const plans = await this.getSubscriptionPlans();
+    const plans = await this.getSubscriptionPlans(planType);
 
     // Load any admin overrides for this currency in one query
     const overrides = await this.knex('subscription_plan_prices')
@@ -96,6 +107,7 @@ export class PaymentService {
       const amountDisplay = this.fxService.formatAmount(amountCents, currency);
 
       return {
+        planType: plan.plan_type,
         billingCycle: plan.billing_cycle,
         label: plan.label,
         currency,
@@ -108,9 +120,12 @@ export class PaymentService {
     });
   }
 
-  // Backwards-compatible shape for the existing frontend contract.
+  // Backwards-compatible shape for the existing frontend contract — predates
+  // the plan_type dimension, so it stays scoped to 'standard' (the one plan
+  // that existed when this shape was designed) rather than returning a
+  // billing_cycle-keyed map that would now collide across tiers.
   async getSubscriptionPrices(): Promise<Record<string, { label: string; amount: number; discount: number }>> {
-    const plans = await this.getSubscriptionPlans();
+    const plans = await this.getSubscriptionPlans('standard');
     return Object.fromEntries(
       plans.map((p) => [
         p.billing_cycle,
@@ -129,8 +144,9 @@ export class PaymentService {
     billingCycle: BillingCycle,
     currency: string,
     amountMajorUnits: number,
+    planType: PlanType = 'standard',
   ): Promise<{ updated: boolean }> {
-    const plan = await this.getPlanByBillingCycle(billingCycle);
+    const plan = await this.getPlanByBillingCycle(billingCycle, planType);
     const amountCents = Math.round(amountMajorUnits * 100);
 
     await this.knex('subscription_plan_prices')
@@ -143,52 +159,57 @@ export class PaymentService {
       .onConflict(['plan_id', 'currency'])
       .merge({ amount_override_cents: amountCents, updated_at: new Date() });
 
-    this.logger.log(`Price override set: ${billingCycle} / ${currency} = ${amountMajorUnits}`);
+    this.logger.log(`Price override set: ${planType} / ${billingCycle} / ${currency} = ${amountMajorUnits}`);
     return { updated: true };
   }
 
-  async clearPriceOverride(billingCycle: BillingCycle, currency: string): Promise<{ cleared: boolean }> {
-    const plan = await this.getPlanByBillingCycle(billingCycle);
+  async clearPriceOverride(
+    billingCycle: BillingCycle,
+    currency: string,
+    planType: PlanType = 'standard',
+  ): Promise<{ cleared: boolean }> {
+    const plan = await this.getPlanByBillingCycle(billingCycle, planType);
     await this.knex('subscription_plan_prices')
       .where({ plan_id: plan.id, currency: currency.toUpperCase() })
       .delete();
     return { cleared: true };
   }
 
-  private async getPlanByBillingCycle(billingCycle: BillingCycle): Promise<SubscriptionPlan> {
+  private async getPlanByBillingCycle(billingCycle: BillingCycle, planType: PlanType = 'standard'): Promise<SubscriptionPlan> {
     const plan = await this.knex('subscription_plans')
-      .where({ billing_cycle: billingCycle, is_active: true })
+      .where({ billing_cycle: billingCycle, plan_type: planType, is_active: true })
       .first();
 
     if (!plan) {
-      throw new BadRequestException(`No active plan found for billing cycle: ${billingCycle}`);
+      throw new BadRequestException(`No active plan found for "${planType}" / billing cycle "${billingCycle}"`);
     }
 
     return plan;
   }
 
-  // ── Fix 4: price IDs come exclusively from env vars (single source of truth) ─
+  // ── Stripe price IDs: DB-sourced, written by StripeSyncService's "publish"
+  // action (AdminPlansController). Previously read from STRIPE_PRICE_* env
+  // vars exclusively, to avoid drift between ad-hoc manual DB/env edits —
+  // that risk doesn't apply now that a single controlled publish flow owns
+  // this column. ──────────────────────────────────────────────────────────
 
-  private getStripePriceId(billingCycle: BillingCycle): string {
-    const prices = this.configService.get<Record<string, string | undefined>>('stripe.prices') ?? {};
-    const priceId = prices[billingCycle];
+  private async getStripePriceId(billingCycle: BillingCycle, planType: PlanType): Promise<string> {
+    const plan = await this.getPlanByBillingCycle(billingCycle, planType);
 
-    if (!priceId) {
+    if (!plan.stripe_price_id) {
       throw new BadRequestException(
-        `Stripe price ID not configured for "${billingCycle}". ` +
-          `Set STRIPE_PRICE_${billingCycle.toUpperCase()} in your environment.`,
+        `No Stripe price has been published for "${planType}" / "${billingCycle}" yet. ` +
+          `Publish it from the admin pricing page first.`,
       );
     }
 
-    return priceId;
+    return plan.stripe_price_id;
   }
 
-  // Reverse lookup: given a Stripe price ID, return the billing cycle.
-  // Used in syncSubscription so webhook events don't need a DB round-trip.
-  private getBillingCycleForPriceId(priceId: string): BillingCycle | null {
-    const prices = this.configService.get<Record<string, string | undefined>>('stripe.prices') ?? {};
-    const entry = Object.entries(prices).find(([, id]) => id === priceId);
-    return (entry?.[0] as BillingCycle) ?? null;
+  // Reverse lookup: given a Stripe price ID, return the plan it belongs to.
+  // Used in syncSubscription so webhook events don't need to carry metadata.
+  private async getPlanForPriceId(priceId: string): Promise<SubscriptionPlan | null> {
+    return (await this.knex('subscription_plans').where('stripe_price_id', priceId).first()) ?? null;
   }
 
   // ── Fix 2: customer creation serialised with SELECT FOR UPDATE ───────────────
@@ -258,6 +279,10 @@ export class PaymentService {
     successUrl?: string | null,
     cancelUrl?: string | null,
     countryOverride?: string | null,
+    // Defaults to 'standard' — the only paid plan that existed before the
+    // plan_type dimension — so any caller that doesn't pass one yet (older
+    // frontend builds mid-rollout) keeps today's behavior.
+    planType: PlanType = 'standard',
   ): Promise<{ checkoutUrl: string; provider: 'stripe' | 'flutterwave'; currency: string }> {
     // Sync existing Stripe subscription first so missed-webhook users are healed
     // before the duplicate check runs (no-op when user has no stripe_customer_id).
@@ -287,7 +312,7 @@ export class PaymentService {
 
     if (provider === 'flutterwave') {
       const checkoutUrl = await this.createFlutterwaveCheckout({
-        userId, email, name, billingCycle, currency,
+        userId, email, name, billingCycle, planType, currency,
         successUrl: resolvedSuccessUrl,
         cancelUrl: resolvedCancelUrl,
       });
@@ -295,8 +320,7 @@ export class PaymentService {
     }
 
     // ── Stripe path ───────────────────────────────────────────────────────────
-    await this.getPlanByBillingCycle(billingCycle);
-    const stripePriceId = this.getStripePriceId(billingCycle);
+    const stripePriceId = await this.getStripePriceId(billingCycle, planType);
     const customerId = await this.getOrCreateStripeCustomer(userId, email, name);
 
     const baseSuccessUrl = resolvedSuccessUrl;
@@ -310,7 +334,12 @@ export class PaymentService {
       line_items: [{ price: stripePriceId, quantity: 1 }],
       success_url: stripeSuccessUrl,
       cancel_url: resolvedCancelUrl,
-      metadata: { userId, billingCycle },
+      metadata: { userId, billingCycle, planType },
+      // Copied onto the created Subscription object itself (session metadata
+      // isn't) — syncSubscription's renewal path reads it straight from
+      // subscription.metadata without needing the stripe_price_id→plan_type
+      // DB fallback.
+      subscription_data: { metadata: { userId, billingCycle, planType } },
     });
 
     if (!session.url) throw new Error('Stripe did not return a checkout URL');
@@ -323,13 +352,14 @@ export class PaymentService {
     email: string;
     name: string | null | undefined;
     billingCycle: BillingCycle;
+    planType: PlanType;
     currency: string;
     successUrl: string;
     cancelUrl: string;
   }): Promise<string> {
-    const { userId, email, name, billingCycle, currency, successUrl } = params;
+    const { userId, email, name, billingCycle, planType, currency, successUrl } = params;
 
-    const plan = await this.getPlanByBillingCycle(billingCycle);
+    const plan = await this.getPlanByBillingCycle(billingCycle, planType);
 
     // Check for admin override first, then fall back to live FX rate
     const override = await this.knex('subscription_plan_prices')
@@ -355,7 +385,7 @@ export class PaymentService {
       name: name ?? email,
       redirectUrl: successUrl,
       description: `CognIX ${plan.label} subscription`,
-      meta: { userId, billingCycle, provider: 'flutterwave' },
+      meta: { userId, billingCycle, planType, provider: 'flutterwave' },
     });
 
     this.logger.log(`Flutterwave checkout created: txRef=${txRef} amount=${amountMajorUnits} ${currency}`);
@@ -398,6 +428,9 @@ export class PaymentService {
 
     const meta = this.flutterwaveService.parseMeta(data.meta);
     const { userId, billingCycle } = meta;
+    // Older links minted before the plan_type dimension existed carry no
+    // planType in meta — default to 'standard', the only paid plan back then.
+    const planType = (meta.planType as PlanType | undefined) ?? 'standard';
 
     if (!userId || !billingCycle) {
       this.logger.warn(`Flutterwave charge missing meta: txRef=${data.tx_ref}`);
@@ -424,6 +457,7 @@ export class PaymentService {
         stripe_subscription_id: `flw-${data.tx_ref}`, // unique reference in our DB
         stripe_price_id: null,
         billing_cycle: billingCycle,
+        plan_type: planType,
         status: 'active',
         current_period_start: now,
         current_period_end: periodEnd,
@@ -431,6 +465,7 @@ export class PaymentService {
       .onConflict('stripe_subscription_id')
       .merge({
         status: 'active',
+        plan_type: planType,
         current_period_start: now,
         current_period_end: periodEnd,
         updated_at: new Date(),
@@ -438,10 +473,10 @@ export class PaymentService {
 
     await this.knex('users')
       .where('id', userId)
-      .update({ subscription_tier: 'premium', updated_at: new Date() });
+      .update({ subscription_tier: planType, updated_at: new Date() });
 
     this.logger.log(
-      `Flutterwave subscription activated: user=${userId} billingCycle=${billingCycle} periodEnd=${periodEnd.toISOString()}`,
+      `Flutterwave subscription activated: user=${userId} plan=${planType} billingCycle=${billingCycle} periodEnd=${periodEnd.toISOString()}`,
     );
   }
 
@@ -538,6 +573,48 @@ export class PaymentService {
       .first();
   }
 
+  // What the client calls to render a "plan & usage" screen and to decide
+  // locally whether to show an upgrade prompt before even trying an action —
+  // the server-side gates in voice.gateway.ts etc. are the real enforcement;
+  // this is purely informational. tier/entitlements come from
+  // EntitlementsService.resolveUserTier, the same resolution every gate uses,
+  // so this never drifts from what's actually being enforced.
+  async getMyPlan(userId: string) {
+    const [{ tier, entitlements }, subscription] = await Promise.all([
+      this.entitlementsService.getUserEntitlements(userId),
+      this.getUserSubscription(userId),
+    ]);
+
+    const usage = await this.usageService.getAllStatuses(userId, {
+      messages: entitlements.maxMessagesPerMonth,
+      voice_seconds: entitlements.maxVoiceMinutesPerMonth !== null ? entitlements.maxVoiceMinutesPerMonth * 60 : null,
+      documents: entitlements.maxDocumentsPerMonth,
+      video_analyses: entitlements.maxVideoAnalysesPerMonth,
+      web_searches: entitlements.maxWebSearchesPerMonth,
+    });
+
+    const minutes = (status: { used: number; limit: number | null; remaining: number | null; canUse: boolean }) => ({
+      used: Number((status.used / 60).toFixed(1)),
+      limit: status.limit !== null ? status.limit / 60 : null,
+      remaining: status.remaining !== null ? Number((status.remaining / 60).toFixed(1)) : null,
+      canUse: status.canUse,
+    });
+
+    return {
+      tier,
+      isPaid: isPaidTier(tier),
+      entitlements,
+      usage: {
+        messages: usage.messages,
+        voiceMinutes: minutes(usage.voice_seconds),
+        documents: usage.documents,
+        videoAnalyses: usage.video_analyses,
+        webSearches: usage.web_searches,
+      },
+      subscription: subscription ?? null,
+    };
+  }
+
   // Fix 1: ownership check — user can only cancel their own subscription
   // Fix 3: immediately downgrade user tier; webhook acts as self-healing fallback
   async getPaymentHistory(userId: string): Promise<{
@@ -547,6 +624,7 @@ export class PaymentService {
       currency: string;
       status: string;
       billingCycle: string | null;
+      planType: string | null;
       periodStart: Date;
       periodEnd: Date;
       invoiceUrl: string | null;
@@ -571,18 +649,25 @@ export class PaymentService {
       this.getUserSubscription(userId),
     ]);
 
-    const prices = this.configService.get<Record<string, string | undefined>>('stripe.prices') ?? {};
+    const priceIds = [...new Set(stripeInvoices.data.map((inv) => inv.lines.data[0]?.price?.id).filter(Boolean))] as string[];
+    const plansByPriceId = priceIds.length
+      ? new Map(
+          (await this.knex('subscription_plans').whereIn('stripe_price_id', priceIds).select('stripe_price_id', 'plan_type', 'billing_cycle'))
+            .map((p: any) => [p.stripe_price_id, p]),
+        )
+      : new Map();
 
     const invoices = stripeInvoices.data.map((inv) => {
       const priceId = inv.lines.data[0]?.price?.id ?? null;
-      const billingCycle = priceId ? (Object.entries(prices).find(([, id]) => id === priceId)?.[0] ?? null) : null;
+      const plan = priceId ? plansByPriceId.get(priceId) : null;
 
       return {
         id: inv.id,
         amount: inv.amount_paid / 100,
         currency: inv.currency.toUpperCase(),
         status: inv.status ?? 'unknown',
-        billingCycle,
+        billingCycle: plan?.billing_cycle ?? null,
+        planType: plan?.plan_type ?? null,
         periodStart: new Date((inv.period_start) * 1000),
         periodEnd: new Date((inv.period_end) * 1000),
         invoiceUrl: inv.hosted_invoice_url ?? null,
@@ -683,7 +768,7 @@ export class PaymentService {
   // Primary activation path — fires once after the user completes payment on
   // Stripe's hosted page.
   private async handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
-    const { userId, billingCycle } = session.metadata ?? {};
+    const { userId, billingCycle, planType } = (session.metadata ?? {}) as Record<string, string | undefined>;
 
     if (!userId || !session.subscription) {
       this.logger.warn(
@@ -698,6 +783,7 @@ export class PaymentService {
         : session.subscription.id;
 
     const subscription = await this.stripe.subscriptions.retrieve(subscriptionId);
+    const resolvedPlanType = (planType as PlanType | undefined) ?? 'standard';
 
     await this.knex('subscriptions')
       .insert({
@@ -705,6 +791,7 @@ export class PaymentService {
         stripe_subscription_id: subscription.id,
         stripe_price_id: subscription.items.data[0]?.price.id ?? null,
         billing_cycle: billingCycle ?? null,
+        plan_type: resolvedPlanType,
         status: subscription.status,
         current_period_start: new Date(subscription.current_period_start * 1000),
         current_period_end: new Date(subscription.current_period_end * 1000),
@@ -712,6 +799,7 @@ export class PaymentService {
       .onConflict('stripe_subscription_id')
       .merge({
         status: subscription.status,
+        plan_type: resolvedPlanType,
         current_period_start: new Date(subscription.current_period_start * 1000),
         current_period_end: new Date(subscription.current_period_end * 1000),
         updated_at: new Date(),
@@ -719,9 +807,9 @@ export class PaymentService {
 
     await this.knex('users')
       .where('id', userId)
-      .update({ subscription_tier: 'premium', updated_at: new Date() });
+      .update({ subscription_tier: resolvedPlanType, updated_at: new Date() });
 
-    this.logger.log(`Subscription activated for user ${userId} via checkout session ${session.id}`);
+    this.logger.log(`Subscription activated for user ${userId} (plan=${resolvedPlanType}) via checkout session ${session.id}`);
   }
 
   // Self-healing fallback — keeps the row in sync for renewals, plan changes,
@@ -745,11 +833,17 @@ export class PaymentService {
     this.logger.log(`syncSubscription: matched user ${user.id} (${user.email})`);
 
     const priceId = subscription.items.data[0]?.price.id ?? null;
-    const billingCycle = priceId ? this.getBillingCycleForPriceId(priceId) : null;
+    const plan = priceId ? await this.getPlanForPriceId(priceId) : null;
+    const billingCycle = plan?.billing_cycle ?? null;
+    // Metadata carries plan_type from checkout creation for new subscriptions;
+    // falls back to the plan the Stripe price itself resolves to (set by
+    // StripeSyncService's publish flow), then 'standard' for anything older
+    // than both mechanisms.
+    const planType = (subscription.metadata?.planType as PlanType | undefined) ?? plan?.plan_type ?? 'standard';
 
-    if (priceId && !billingCycle) {
+    if (priceId && !plan) {
       this.logger.warn(
-        `syncSubscription: price ${priceId} not found in STRIPE_PRICE_* env vars — billing_cycle will be null`,
+        `syncSubscription: price ${priceId} not found in subscription_plans — billing_cycle will be null`,
       );
     }
 
@@ -761,6 +855,7 @@ export class PaymentService {
         stripe_subscription_id: subscription.id,
         stripe_price_id: priceId,
         billing_cycle: billingCycle,
+        plan_type: planType,
         status: subscription.status,
         current_period_start: new Date(subscription.current_period_start * 1000),
         current_period_end: new Date(subscription.current_period_end * 1000),
@@ -768,6 +863,7 @@ export class PaymentService {
       .onConflict('stripe_subscription_id')
       .merge({
         status: subscription.status,
+        plan_type: planType,
         current_period_start: new Date(subscription.current_period_start * 1000),
         current_period_end: new Date(subscription.current_period_end * 1000),
         updated_at: new Date(),
@@ -775,10 +871,10 @@ export class PaymentService {
 
     await this.knex('users')
       .where('id', user.id)
-      .update({ subscription_tier: isActive ? 'premium' : 'free', updated_at: new Date() });
+      .update({ subscription_tier: isActive ? planType : 'free', updated_at: new Date() });
 
     this.logger.log(
-      `syncSubscription: user ${user.id} → tier=${isActive ? 'premium' : 'free'}, sub=${subscription.id} upserted`,
+      `syncSubscription: user ${user.id} → tier=${isActive ? planType : 'free'}, sub=${subscription.id} upserted`,
     );
   }
 

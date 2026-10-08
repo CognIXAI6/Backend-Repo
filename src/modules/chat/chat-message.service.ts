@@ -1,7 +1,9 @@
-import { ConflictException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { Knex } from 'knex';
 import { ConversationService } from '../voice/services/conversation.service';
 import { SubmitMessageDto } from './dto/chat.dto';
+import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
+import { UsageService } from '@/modules/entitlements/usage.service';
 
 export interface SubmitMessageResult {
   status: 'accepted';
@@ -36,9 +38,30 @@ export class ChatMessageService {
   constructor(
     @Inject('KNEX_CONNECTION') private readonly knex: Knex,
     private readonly conversationService: ConversationService,
+    private readonly entitlementsService: EntitlementsService,
+    private readonly usageService: UsageService,
   ) {}
 
   async submitMessage(userId: string, dto: SubmitMessageDto): Promise<SubmitMessageResult> {
+    const existingByClientId = dto.conversationId
+      ? await this.knex('conversation_messages')
+          .where({ conversation_id: dto.conversationId, client_message_id: dto.clientMessageId })
+          .first()
+      : null;
+
+    // Only gate genuinely new messages — a replay of an already-accepted
+    // clientMessageId (handled below) must stay idempotent even if the
+    // user's quota has since been exhausted by other activity.
+    if (!existingByClientId) {
+      const { entitlements } = await this.entitlementsService.getUserEntitlements(userId);
+      const quota = await this.usageService.tryConsume(userId, 'messages', 1, entitlements.maxMessagesPerMonth);
+      if (!quota.canUse) {
+        throw new ForbiddenException(
+          `You've used all ${quota.limit} messages included in your plan this month. Upgrade for more.`,
+        );
+      }
+    }
+
     let conversationId = dto.conversationId;
     if (conversationId) {
       await this.conversationService.assertOwnership(conversationId, userId);

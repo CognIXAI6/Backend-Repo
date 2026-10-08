@@ -141,6 +141,7 @@ describe('ClaudeService.streamResponse — generate_document truncated by max_to
       expect.stringContaining('too long'),
       expect.any(Number),
       expect.any(Number),
+      expect.any(Number),
     );
 
     const followUpCallArgs = streamMock.mock.calls[1][0];

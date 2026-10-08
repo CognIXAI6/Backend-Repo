@@ -44,6 +44,12 @@ export interface GenerateDocumentParams {
   // Page count the user asked for. When set, the caller has already validated
   // the length, so section trimming is skipped to avoid cutting it back down.
   pages?: number;
+  // Second line of defense behind the system-prompt depth restriction in
+  // claude.service.ts's buildSystemPrompt — that's only a soft instruction
+  // to the model, so a tier's allowed depths are re-checked here too.
+  // Omitted (not an empty array) means "no restriction" — callers that
+  // don't pass it (e.g. existing tests) keep today's unrestricted behavior.
+  allowedDepths?: Array<'brief' | 'standard' | 'comprehensive'>;
 }
 
 export interface GeneratedDocument {
@@ -83,7 +89,13 @@ export class DocumentService {
   };
 
   async generateAndUpload(params: GenerateDocumentParams): Promise<GeneratedDocument> {
-    const { userId, conversationId, title, topic, sections, researchContext, depth = 'standard', format = 'docx', pages } = params;
+    const { userId, conversationId, title, topic, sections, researchContext, depth = 'standard', format = 'docx', pages, allowedDepths } = params;
+
+    if (allowedDepths && !allowedDepths.includes(depth)) {
+      throw new ForbiddenException(
+        `This plan does not permit "${depth}" depth documents. Allowed depths: ${allowedDepths.join(', ')}.`,
+      );
+    }
 
     this.logger.log(`Generating document: "${title}" for user ${userId} (depth: ${depth}, format: ${format})`);
 

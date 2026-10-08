@@ -18,6 +18,7 @@ import { ConfigService } from '@nestjs/config';
 import { PaymentService, BillingCycle } from './payment.service';
 import { GeoService } from './geo.service';
 import { JwtAuthGuard, CurrentUser } from '@/common';
+import { PlanType } from '@/modules/entitlements/entitlements.types';
 
 @Controller('payment')
 export class PaymentController {
@@ -32,11 +33,13 @@ export class PaymentController {
   // Returns plans priced in the caller's local currency (detected from IP).
   // Pass ?country=NG to override detection (useful for mobile apps that know
   // the user's country from their profile).
+  // Pass ?planType=plus to scope to one tier; omitted returns all tiers.
   @Get('plans')
   getPlans(@Req() req: Request) {
     const ip = this.geoService.getClientIp(req as any);
     const countryOverride = (req.query['country'] as string) ?? null;
-    return this.paymentService.getLocalizedPlans(ip, countryOverride);
+    const planType = (req.query['planType'] as PlanType) ?? undefined;
+    return this.paymentService.getLocalizedPlans(ip, countryOverride, planType);
   }
 
   // Legacy endpoint kept for backwards compatibility with existing frontend code.
@@ -46,6 +49,16 @@ export class PaymentController {
   }
 
   // ── User subscription ────────────────────────────────────────────────────
+
+  // The one the client actually wants for a "plan & usage" screen or an
+  // upfront upgrade prompt: current tier, its entitlements, this month's
+  // usage against every cap, and the raw subscription row. my-subscription
+  // below is kept as-is for existing callers of that narrower shape.
+  @Get('my-plan')
+  @UseGuards(JwtAuthGuard)
+  getMyPlan(@CurrentUser('id') userId: string) {
+    return this.paymentService.getMyPlan(userId);
+  }
 
   @Get('my-subscription')
   @UseGuards(JwtAuthGuard)
@@ -78,6 +91,8 @@ export class PaymentController {
     @Body('successUrl') successUrl?: string,
     @Body('cancelUrl') cancelUrl?: string,
     @Body('country') countryOverride?: string,
+    // Defaults to 'standard' in the service when omitted (pre-rollout frontend builds).
+    @Body('planType') planType?: PlanType,
   ) {
     const clientIp = this.geoService.getClientIp(req as any);
     return this.paymentService.createCheckoutSession(
@@ -89,6 +104,7 @@ export class PaymentController {
       successUrl,
       cancelUrl,
       countryOverride,
+      planType,
     );
   }
 

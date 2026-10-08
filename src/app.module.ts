@@ -49,6 +49,7 @@ import { ErrorLogModule } from './modules/error-log/error-log.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { DocumentModule } from './modules/documents/document.module';
 import { PushNotificationModule } from './modules/notifications/push-notification.module';
+import { EntitlementsModule } from './modules/entitlements/entitlements.module';
 
 @Module({
   imports: [
@@ -74,6 +75,7 @@ import { PushNotificationModule } from './modules/notifications/push-notificatio
     ScheduleModule.forRoot(),
     LoggerModule,
     DatabaseModule,
+    EntitlementsModule,
     EmailModule,
     UploadModule,
     AuthModule,

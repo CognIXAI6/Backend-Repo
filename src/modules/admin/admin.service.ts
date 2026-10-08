@@ -15,6 +15,7 @@ import { randomBytes } from 'crypto';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { FxService } from '../payment/fx.service';
 import { EmailService } from '../email/email.service';
+import { PlanType } from '../entitlements/entitlements.types';
 
 export type AdminRole = 'super_admin' | 'admin';
 export type Period = '7d' | '30d' | '90d' | 'all';
@@ -329,7 +330,7 @@ export class AdminService {
     };
   }
 
-  async updateUserTier(userId: string, tier: 'free' | 'premium') {
+  async updateUserTier(userId: string, tier: PlanType) {
     const user = await this.knex('users').where('id', userId).first();
     if (!user) throw new NotFoundException('User not found');
     await this.knex('users').where('id', userId).update({ subscription_tier: tier, updated_at: new Date() });
@@ -350,7 +351,7 @@ export class AdminService {
     const since = periodToDate(period);
 
     let subQuery = this.knex('subscriptions as s')
-      .join('subscription_plans as sp', 'sp.billing_cycle', 's.billing_cycle')
+      .join('subscription_plans as sp', (j) => j.on('sp.billing_cycle', 's.billing_cycle').andOn('sp.plan_type', 's.plan_type'))
       .whereIn('s.status', ['active', 'trialing', 'canceled']);
 
     if (since) subQuery = subQuery.where('s.created_at', '>=', since);
@@ -358,6 +359,7 @@ export class AdminService {
     const rows = await subQuery.select(
       this.knex.raw(`CASE WHEN s.stripe_subscription_id LIKE 'flw-%' THEN 'flutterwave' ELSE 'stripe' END as provider`),
       's.billing_cycle',
+      's.plan_type',
       's.status',
       's.created_at',
       'sp.amount_cents',
@@ -372,12 +374,15 @@ export class AdminService {
     let flutterwaveCount = 0;
 
     const monthlyTrend: Record<string, number> = {};
+    const planTypeUsd: Record<string, number> = {};
 
     for (const row of rows) {
       const amountUsd = row.amount_cents / 100;
       totalUsd += amountUsd;
       const month = new Date(row.created_at).toISOString().slice(0, 7);
       monthlyTrend[month] = (monthlyTrend[month] ?? 0) + amountUsd;
+      const planType = row.plan_type ?? 'standard';
+      planTypeUsd[planType] = (planTypeUsd[planType] ?? 0) + amountUsd;
 
       if (row.provider === 'stripe') { stripeUsd += amountUsd; stripeCount++; }
       else { flutterwaveUsd += amountUsd; flutterwaveCount++; }
@@ -405,6 +410,9 @@ export class AdminService {
       flutterwave: { amount: convert(flutterwaveUsd), display: formatted(flutterwaveUsd), subscriptions: flutterwaveCount },
       trend,
       tierBreakdown: Object.fromEntries(tierCounts.map((r: any) => [r.subscription_tier, Number(r.count)])),
+      revenueByPlanType: Object.fromEntries(
+        Object.entries(planTypeUsd).map(([planType, usd]) => [planType, { amount: convert(usd), display: formatted(usd) }]),
+      ),
     };
   }
 
@@ -414,7 +422,7 @@ export class AdminService {
 
     let query = this.knex('subscriptions as s')
       .join('users as u', 'u.id', 's.user_id')
-      .join('subscription_plans as sp', 'sp.billing_cycle', 's.billing_cycle');
+      .join('subscription_plans as sp', (j) => j.on('sp.billing_cycle', 's.billing_cycle').andOn('sp.plan_type', 's.plan_type'));
 
     if (provider === 'stripe') query = query.whereRaw(`s.stripe_subscription_id NOT LIKE 'flw-%'`);
     if (provider === 'flutterwave') query = query.whereRaw(`s.stripe_subscription_id LIKE 'flw-%'`);
@@ -453,7 +461,7 @@ export class AdminService {
   async getRevenueByCurrency(displayCurrency: string) {
     // Stripe subscriptions count as USD; Flutterwave subs need a per-currency lookup.
     const allSubs = await this.knex('subscriptions as s')
-      .join('subscription_plans as sp', 'sp.billing_cycle', 's.billing_cycle')
+      .join('subscription_plans as sp', (j) => j.on('sp.billing_cycle', 's.billing_cycle').andOn('sp.plan_type', 's.plan_type'))
       .whereIn('s.status', ['active', 'trialing', 'canceled'])
       .select(
         this.knex.raw(`CASE WHEN s.stripe_subscription_id LIKE 'flw-%' THEN 'flutterwave' ELSE 'stripe' END as provider`),
@@ -527,7 +535,7 @@ export class AdminService {
           .countDistinct('u.id as c')
           .first(),
 
-        this.knex('users').where('subscription_tier', 'premium').whereNull('deleted_at').count('id as c').first(),
+        this.knex('users').whereNot('subscription_tier', 'free').whereNull('deleted_at').count('id as c').first(),
 
         this.knex('conversations').whereNull('deleted_at').count('id as c').first(),
 

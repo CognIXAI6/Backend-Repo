@@ -1,8 +1,16 @@
 import { Module, Global, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import knex, { Knex } from 'knex';
+import { types as pgTypes } from 'pg';
 
 export const KNEX_CONNECTION = 'KNEX_CONNECTION';
+
+// node-pg returns NUMERIC/DECIMAL columns as strings by default (it can't
+// otherwise guarantee precision). subscription_plans.discount_percent is a
+// decimal (needed for fractional discounts like 5.3%) read as a plain
+// `number` throughout payment.service.ts — parse it at the driver level
+// once, globally, instead of remembering to Number() every read site.
+pgTypes.setTypeParser(pgTypes.builtins.NUMERIC, (value: string) => parseFloat(value));
 
 @Global()
 @Module({

@@ -19,7 +19,7 @@ export interface ClaudeStreamCallbacks {
   // Declared as Promise<void> so callers can do async work (DB saves, etc.)
   // and errors inside onDone propagate to onError instead of becoming silent
   // unhandled rejections that leave the session in a broken state.
-  onDone: (fullText: string, inputTokens: number, outputTokens: number) => Promise<void> | void;
+  onDone: (fullText: string, inputTokens: number, outputTokens: number, webSearchCalls?: number) => Promise<void> | void;
   onError: (error: Error) => void;
   /** Called when Claude requests document generation. Must return the download URL. */
   onDocumentRequest?: (req: DocumentRequest) => Promise<{ downloadUrl: string; docId: string }>;
@@ -246,6 +246,10 @@ export class ClaudeService implements OnModuleInit {
       let fullText = '';
       let inputTokens = 0;
       let outputTokens = 0;
+      // Cumulative across rounds — passed to onDone so a caller gating web
+      // search against a monthly cap (see EntitlementsService) can meter
+      // actual tool-call count rather than a flat per-turn guess.
+      let totalWebSearchCalls = 0;
       let currentMessages: Anthropic.MessageParam[] = messages;
       // Cumulative across rounds: generate_document commonly gets called in a
       // LATER round than the web_search(es) that fed it (see MAX_ROUNDS below),
@@ -335,6 +339,7 @@ export class ClaudeService implements OnModuleInit {
         const docGenCalls = collectedToolCalls.filter(
           (tc) => tc.name === 'generate_document' && callbacks.onDocumentRequest,
         );
+        totalWebSearchCalls += webSearchCalls.length;
 
         if (webSearchCalls.length === 0 && docGenCalls.length === 0) {
           // No tool use this round — fullText is the real answer. Done.
@@ -481,7 +486,7 @@ export class ClaudeService implements OnModuleInit {
       // persisting. This matters beyond cosmetics — a contaminated turn left
       // in conversation history teaches the model (via its own prior turn)
       // to keep repeating the pattern on subsequent messages.
-      await callbacks.onDone(this.stripToolCallArtifacts(fullText), inputTokens, outputTokens);
+      await callbacks.onDone(this.stripToolCallArtifacts(fullText), inputTokens, outputTokens, totalWebSearchCalls);
     } catch (error) {
       this.logger.error('Claude stream error:', error);
       callbacks.onError(error instanceof Error ? error : new Error(String(error)));
@@ -511,6 +516,10 @@ export class ClaudeService implements OnModuleInit {
     documentContext?: string | null,
     enableDocumentGeneration = false,
     isGuestSession = false,
+    /** Authenticated-but-blocked case (free tier, or monthly document cap hit) — takes precedence over the guest copy below. */
+    documentUnavailableReason?: string,
+    /** Depths this user's tier is entitled to — Claude is told not to offer the rest even if asked. */
+    allowedDocumentDepths?: Array<'brief' | 'standard' | 'comprehensive'>,
   ): string {
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', {
@@ -523,11 +532,18 @@ export class ClaudeService implements OnModuleInit {
     // Only tell the model it has this tool when it's actually being registered
     // with the Anthropic API for this call — otherwise, with nothing to invoke,
     // it narrates a fake tool_call as visible text instead of just answering.
-    const documentToolBlock = enableDocumentGeneration
-      ? `\n\nYou also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. If the user asks for a specific number of pages, pass it as "pages" and write to length: a page holds roughly ${PAGE_CAPACITY.docx.next} words, so 3 pages is about ${targetWords(3, 'docx')} words as .docx (${targetWords(3, 'pdf')} as pdf) and 5 pages about ${targetWords(5, 'docx')} (${targetWords(5, 'pdf')} as pdf). Never write a shorter document than requested, and never pad to reach the length. After the document is generated, respond with a brief confirmation and the download link.`
-      : isGuestSession
-        ? `\n\n## DOCUMENT GENERATION — NOT AVAILABLE TO THIS USER\nYou do NOT have a document generation tool for this conversation (guest session). If the user asks you to prepare, create, write, draft, generate, export, or "put [something] in a doc/document/report/file/proposal", do NOT explain, apologize, offer alternatives, or continue discussing formatting. Respond with ONLY this exact message and nothing else:\n"Document generation is a Pro plan feature. Please sign up to generate documents."`
+    const depthRestriction =
+      allowedDocumentDepths && allowedDocumentDepths.length > 0 && allowedDocumentDepths.length < 3
+        ? ` This user's plan only permits ${allowedDocumentDepths.join(' and ')}-depth documents — never pass a different depth to generate_document even if the user explicitly asks for it; instead, generate at the best depth available to them and mention that a deeper report needs a plan upgrade.`
         : '';
+
+    const documentToolBlock = enableDocumentGeneration
+      ? `\n\nYou also have access to a generate_document tool. Use it when the user asks to prepare, create, write, draft, or generate a document, report, proposal, or file. Always use web_search first to research the topic, then call generate_document with organized sections. If the user asks for a specific number of pages, pass it as "pages" and write to length: a page holds roughly ${PAGE_CAPACITY.docx.next} words, so 3 pages is about ${targetWords(3, 'docx')} words as .docx (${targetWords(3, 'pdf')} as pdf) and 5 pages about ${targetWords(5, 'docx')} (${targetWords(5, 'pdf')} as pdf). Never write a shorter document than requested, and never pad to reach the length.${depthRestriction} After the document is generated, respond with a brief confirmation and the download link.`
+      : documentUnavailableReason
+        ? `\n\n## DOCUMENT GENERATION — NOT AVAILABLE TO THIS USER\nYou do NOT have a document generation tool for this conversation. If the user asks you to prepare, create, write, draft, generate, export, or "put [something] in a doc/document/report/file/proposal", do NOT explain, apologize, offer alternatives, or continue discussing formatting. Respond with ONLY this exact message and nothing else:\n"${documentUnavailableReason}"`
+        : isGuestSession
+          ? `\n\n## DOCUMENT GENERATION — NOT AVAILABLE TO THIS USER\nYou do NOT have a document generation tool for this conversation (guest session). If the user asks you to prepare, create, write, draft, generate, export, or "put [something] in a doc/document/report/file/proposal", do NOT explain, apologize, offer alternatives, or continue discussing formatting. Respond with ONLY this exact message and nothing else:\n"Document generation is a Pro plan feature. Please sign up to generate documents."`
+          : '';
 
     const basePrompt = `You are CognIX AI, a real-time insight assistant for professionals.
 
