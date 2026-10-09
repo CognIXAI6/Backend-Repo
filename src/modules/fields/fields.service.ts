@@ -21,22 +21,44 @@ export interface Field {
 export class FieldsService {
   constructor(@Inject(KNEX_CONNECTION) private knex: Knex) {}
 
+  // The active system-fields list is identical for every caller and only
+  // changes via the three admin mutations below (createField/updateField/
+  // deactivateField), which all invalidate it explicitly — so a short TTL
+  // cache turns every GET /fields (hit on every app bootstrap, for every
+  // user) from a DB round trip into an in-memory read. Under DB/event-loop
+  // pressure this is the difference between this endpoint responding
+  // instantly and it queueing behind whatever's actually slow.
+  private readonly SYSTEM_FIELDS_CACHE_TTL_MS = 60_000;
+  // Deliberately untyped (matches the pre-existing implicit `any[]` this
+  // query always returned) — only 6 of Field's columns are selected here,
+  // so a Field[] annotation would be inaccurate without widening every
+  // caller's handling of the other columns, which is out of scope for this
+  // caching change.
+  private systemFieldsCache: { value: any[]; expiresAt: number } | null = null;
+
+  private invalidateSystemFieldsCache(): void {
+    this.systemFieldsCache = null;
+  }
+
+  private async getActiveSystemFields(): Promise<any[]> {
+    if (this.systemFieldsCache && this.systemFieldsCache.expiresAt > Date.now()) {
+      return this.systemFieldsCache.value;
+    }
+
+    const fields = await this.knex('fields')
+      .select('id', 'name', 'slug', 'description', 'icon', 'requires_verification')
+      .where('is_active', true);
+
+    this.systemFieldsCache = { value: fields, expiresAt: Date.now() + this.SYSTEM_FIELDS_CACHE_TTL_MS };
+    return fields;
+  }
+
   async findAll(): Promise<Field[]> {
     return this.knex('fields').where('is_active', true).orderBy('name');
   }
 
   async findAllWithCustomFields(userId?: string): Promise<Field[]> {
-    // Get system fields
-    const systemFields = await this.knex('fields')
-      .select(
-        'id',
-        'name',
-        'slug',
-        'description',
-        'icon',
-        'requires_verification'
-      )
-      .where('is_active', true);
+    const systemFields = await this.getActiveSystemFields();
     // Format system fields
     const formattedSystemFields = systemFields.map((field) => ({
       ...field,
@@ -262,6 +284,7 @@ export class FieldsService {
           is_active: dto.isActive ?? true,
         })
         .returning('*');
+      this.invalidateSystemFieldsCache();
       return field;
     } catch (err: any) {
       if (err?.code === '23505') throw new BadRequestException('A field with this name or slug already exists');
@@ -291,6 +314,7 @@ export class FieldsService {
 
     try {
       const [field] = await this.knex('fields').where('id', id).update(updatePayload).returning('*');
+      this.invalidateSystemFieldsCache();
       return field;
     } catch (err: any) {
       if (err?.code === '23505') throw new BadRequestException('A field with this name or slug already exists');
@@ -309,6 +333,7 @@ export class FieldsService {
     if (!existing) throw new NotFoundException('Field not found');
 
     const [field] = await this.knex('fields').where('id', id).update({ is_active: false }).returning('*');
+    this.invalidateSystemFieldsCache();
     return field;
   }
 }

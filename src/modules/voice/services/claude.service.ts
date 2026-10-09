@@ -175,20 +175,31 @@ export class ClaudeService implements OnModuleInit {
   ): Promise<void> {
     // Sanitize history: if content is somehow an array (defensive against DB edge cases),
     // flatten to text-only so no tool_use blocks leak into the messages array.
+    // Also guards against empty/whitespace-only content reaching the API —
+    // Anthropic rejects a message with blank text content outright (seen in
+    // production as a 400 "messages.N.content..." error), and a blank entry
+    // can end up in history from more than one write path, so this is
+    // enforced once here rather than trying to catch it at every writer.
     const historyMessages: Anthropic.MessageParam[] = history.map((turn) => {
       const c = turn.content as unknown;
+      let text: string;
       if (Array.isArray(c)) {
-        const text = (c as Array<{ type: string; text?: string }>)
+        text = (c as Array<{ type: string; text?: string }>)
           .filter((b) => b.type === 'text')
           .map((b) => b.text ?? '')
-          .join('') || '…';
-        return { role: turn.role as 'user' | 'assistant', content: text };
+          .join('');
+      } else {
+        text = String(c ?? '');
       }
-      return { role: turn.role as 'user' | 'assistant', content: String(c) };
+      return { role: turn.role as 'user' | 'assistant', content: text.trim() ? text : '…' };
     });
 
     // Build the user message content.  If images are provided, prepend each as
     // an image block so Claude Vision can analyse them before reading the text.
+    // Same blank-content guard as the history sanitization above — a blank
+    // text block is rejected by the API outright, and this is the one call
+    // site every live turn (voice, text, dual/multi-speaker) funnels through.
+    const safeUserMessage = userMessage.trim() ? userMessage : '…';
     const userContent: Anthropic.ContentBlockParam[] = [];
     if (options.images?.length) {
       for (const img of options.images) {
@@ -202,14 +213,14 @@ export class ClaudeService implements OnModuleInit {
         } as Anthropic.ImageBlockParam);
       }
     }
-    userContent.push({ type: 'text', text: userMessage });
+    userContent.push({ type: 'text', text: safeUserMessage });
 
     const messages: Anthropic.MessageParam[] = [
       ...historyMessages,
       {
         role: 'user',
         content: userContent.length === 1 && userContent[0].type === 'text'
-          ? userMessage  // plain string — avoids wrapping in array when no images
+          ? safeUserMessage  // plain string — avoids wrapping in array when no images
           : userContent,
       },
     ];
@@ -869,5 +880,65 @@ No intro sentence. No headers. Just bullets.`;
 
     const block = response.content[0];
     return block.type === 'text' ? block.text : '';
+  }
+
+  /**
+   * Structured recap of a just-ended conversation — title, topic, and four
+   * fixed sections (Summary / Key Insights / Follow-up Actions / Suggested
+   * Questions) — for VoiceGateway's auto-generate-on-session-end feature.
+   * Unlike the generate_document tool, this isn't triggered by the model
+   * deciding to call a tool mid-turn; it's a single direct call made once
+   * the conversation is over, strictly grounded in the transcript (no
+   * web_search — there's nothing to research, only to summarize).
+   *
+   * Returns null (never throws) on anything that isn't a clean, parseable
+   * result — the caller treats that as "skip the auto-summary this time"
+   * rather than surfacing an error for a feature the user didn't explicitly ask for.
+   */
+  async generateConversationSummaryDocument(
+    conversationHistory: ConversationTurn[],
+    fieldName?: string,
+  ): Promise<{ title: string; topic: string; sections: Array<{ heading: string; content: string }> } | null> {
+    if (conversationHistory.length === 0) return null;
+
+    const transcript = conversationHistory
+      .map((m) => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`)
+      .join('\n')
+      .slice(0, 12000); // bounds token cost on very long conversations
+
+    const system = `You write a structured recap of a just-finished conversation with an AI assistant${fieldName ? ` specialising in ${fieldName}` : ''}. Output ONLY valid JSON, nothing else — no markdown fences, no commentary before or after:
+{"title": "<= 8 words, specific to what was actually discussed", "topic": "one sentence topic", "sections": [{"heading": "Summary", "content": "..."}, {"heading": "Key Insights", "content": "..."}, {"heading": "Follow-up Actions", "content": "..."}, {"heading": "Suggested Questions", "content": "..."}]}
+
+Rules:
+- Summary: 2-4 sentences covering what was actually discussed.
+- Key Insights: the non-obvious takeaways or conclusions reached, as "- " bullet lines within the content string. If the conversation was too short/shallow for real insights, write "Nothing notable surfaced." — never invent them.
+- Follow-up Actions: concrete next steps implied by the conversation, as "- " bullet lines. If none, write "No specific follow-up actions were identified."
+- Suggested Questions: 2-4 questions the user might want to ask next to go deeper, as "- " bullet lines.
+- Base everything strictly on the transcript below. Never invent facts, names, or numbers not present in it.`;
+
+    try {
+      const response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 1200,
+        system,
+        messages: [{ role: 'user', content: `Transcript:\n${transcript}` }],
+      });
+
+      const block = response.content[0];
+      if (block.type !== 'text') return null;
+
+      const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+      const parsed = JSON.parse(cleaned);
+
+      if (typeof parsed.title !== 'string' || !Array.isArray(parsed.sections) || parsed.sections.length === 0) {
+        this.logger.warn('generateConversationSummaryDocument: unexpected shape from model, skipping');
+        return null;
+      }
+
+      return { title: parsed.title, topic: parsed.topic ?? '', sections: parsed.sections };
+    } catch (err) {
+      this.logger.warn(`generateConversationSummaryDocument failed: ${(err as Error).message}`);
+      return null;
+    }
   }
 }

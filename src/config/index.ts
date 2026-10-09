@@ -3,6 +3,13 @@ import { registerAs } from '@nestjs/config';
 export const appConfig = registerAs('app', () => ({
   nodeEnv: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '3000', 10),
+  // Separate port for the voice-gateway process (main-gateway.ts) — a
+  // distinct process from the REST API so a burst of concurrent voice
+  // sessions can't starve plain REST reads. nginx routes /socket.io/* to
+  // this port and everything else to `port` above; both live behind the
+  // same public domain. Defaults one above the API port so local dev needs
+  // no extra setup, but production should set this explicitly.
+  voiceGatewayPort: parseInt(process.env.VOICE_GATEWAY_PORT || String(parseInt(process.env.PORT || '3000', 10) + 1), 10),
   apiPrefix: process.env.API_PREFIX || 'api',
   apiVersion: process.env.API_VERSION || 'v1',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:3001',

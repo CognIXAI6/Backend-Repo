@@ -95,6 +95,23 @@ async function bootstrap() {
 
   await app.listen(port);
 
+  // A stuck REST request (e.g. waiting on a starved DB-pool connection)
+  // previously had no cap — it just held the connection open until the
+  // client's own 15s axios timeout gave up client-side, with nothing
+  // server-side ever failing fast, logging, or freeing the connection.
+  // This forces a definite end: Node emits 'timeout' on the socket, Express
+  // writes a real 503 the client's retry logic can react to immediately,
+  // and the connection/pool slot gets freed instead of sitting open.
+  // Node's socket timeout only governs the HTTP request/response cycle —
+  // once Socket.IO upgrades a connection to a WebSocket, that socket is no
+  // longer driven through this path, so the voice gateway is unaffected.
+  const httpServer = app.getHttpServer();
+  httpServer.setTimeout(30_000, (socket: import('net').Socket) => {
+    if (!socket.destroyed) {
+      socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+    }
+  });
+
   const logger = app.get(Logger);
   logger.log(`🚀 CognIX AI API running on: http://localhost:${port}`);
   logger.log(`📚 API Version: ${apiVersion}`);

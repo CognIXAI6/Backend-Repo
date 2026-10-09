@@ -4,7 +4,6 @@ import { JwtModule } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { VoiceController } from './controllers/voice.controller';
 import { VideoAnalysisController } from './controllers/video-analysis.controller';
-import { VoiceGateway } from './voice.gateway';
 import { DeepgramService } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService } from './services/conversation.service';
@@ -40,7 +39,13 @@ import { PushNotificationModule } from '@/modules/notifications/push-notificatio
   ],
   controllers: [VoiceController, VideoAnalysisController],
   providers: [
-    VoiceGateway,
+    // VoiceGateway deliberately lives in VoiceGatewayModule (see
+    // voice-gateway.module.ts), not here — it's bootstrapped as its own
+    // process (main-gateway.ts), separate from the REST API (main.ts), so
+    // a burst of concurrent voice sessions can no longer starve the event
+    // loop simple REST reads (GET /fields etc.) run on. This module stays
+    // the home for the voice *domain's* REST controllers and the services
+    // shared by both processes.
     VoiceService,
     DeepgramService,
     ClaudeService,
@@ -50,6 +55,10 @@ import { PushNotificationModule } from '@/modules/notifications/push-notificatio
     VoiceVerificationService,
     VideoAnalysisService,
   ],
-  exports: [ConversationService, ClaudeService, DeepgramService, VoiceService],
+  // GuestSessionService and VoiceVerificationService are exported
+  // specifically so VoiceGatewayModule (a separate process) can inject
+  // them for VoiceGateway — they weren't previously exported because
+  // VoiceGateway used to resolve them as same-module providers.
+  exports: [ConversationService, ClaudeService, DeepgramService, VoiceService, GuestSessionService, VoiceVerificationService],
 })
 export class VoiceModule {}

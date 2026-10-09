@@ -106,6 +106,16 @@ export async function seed(knex: Knex): Promise<void> {
       is_free: false,
       is_active: true,
     },
+    {
+      name: 'Engineering & Science',
+      slug: 'engineering-science',
+      description: 'Technical & scientific transcription',
+      icon: 'flask',
+      requires_verification: false,
+      is_system: true,
+      is_free: false,
+      is_active: true,
+    },
   ]);
 
   // Insert app settings

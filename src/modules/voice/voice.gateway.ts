@@ -526,16 +526,25 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           return;
         }
       } else if (payload.guestSessionId) {
-        guestSessionId = payload.guestSessionId;
+        const guestStatus = await this.guestSessionService.getStatus(payload.guestSessionId);
+        // getStatus resolves to a fresh valid UUID when the client-supplied
+        // id wasn't one (see GuestSessionService.resolveId) — everything
+        // downstream (pseudo userId, conversations, the increment call in
+        // processPrompt's onDone) must use that resolved id consistently,
+        // not the possibly-invalid one the client sent.
+        guestSessionId = guestStatus.id;
         userId = guestSessionId;
-
-        const guestStatus = await this.guestSessionService.getStatus(guestSessionId);
         isGuest = true;
 
         client.emit('guest:status', {
           used: guestStatus.used,
           limit: guestStatus.limit,
           remaining: guestStatus.remaining,
+          // Only present when it differs from what the client sent — an
+          // up-to-date client ignores an unknown field; one that's been
+          // updated to look for it can persist the corrected id so it
+          // stops minting a fresh (and fresh-trial) id every session.
+          ...(guestStatus.id !== payload.guestSessionId ? { resolvedGuestSessionId: guestStatus.id } : {}),
         });
 
         if (!guestStatus.canSend) {
@@ -1525,10 +1534,83 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       this.saveSessionMemory(session).catch((err) =>
         this.logger.error('Memory save failed:', err),
       );
+      // Fire-and-forget: the client disconnects its socket immediately after
+      // emitting session:end (doesn't wait for any ack), so this routinely
+      // finishes after the live connection is already gone — delivery is via
+      // the conversation's document list + push notification, same as any
+      // document generated mid-conversation after the user has moved on.
+      this.autoGenerateConversationSummary(client, session).catch((err) =>
+        this.logger.error(`Auto-summary failed for conversation ${session.conversationId}:`, err),
+      );
     }
 
     this.cleanupSession(client.id);
     client.emit('session:ended');
+  }
+
+  /**
+   * Generates a brief recap document (Summary / Key Insights / Follow-up
+   * Actions / Suggested Questions) the moment a conversation ends, instead
+   * of waiting for the user to ask for one via chat. Obeys the exact same
+   * entitlement rules as an explicitly requested document — same monthly
+   * cap, same depth restriction — so this convenience path can't be used to
+   * bypass the document quota a tier is supposed to enforce; it only
+   * applies to conversations with enough actual content to summarize.
+   */
+  private async autoGenerateConversationSummary(client: Socket, session: ActiveSession): Promise<void> {
+    const entitlements = session.entitlements;
+    if (!entitlements || entitlements.maxDocumentsPerMonth <= 0 || entitlements.allowedDocumentDepths.length === 0) {
+      return; // tier doesn't include document generation — stay silent, this is a bonus, not an explicit request
+    }
+
+    const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 80);
+    const wordCount = history.reduce((sum, m) => sum + m.content.split(/\s+/).filter(Boolean).length, 0);
+    if (history.length < 2 || wordCount < 40) return; // too short to be worth a recap
+
+    const docStatus = await this.usageService.getStatus(session.userId, 'documents', entitlements.maxDocumentsPerMonth);
+    if (!docStatus.canUse) return; // monthly document cap already hit — stay silent
+
+    const summary = await this.claudeService.generateConversationSummaryDocument(history, session.fieldName);
+    if (!summary) return;
+
+    client.emit('document:generating', { title: summary.title, topic: summary.topic, auto: true });
+
+    try {
+      const result = await this.documentService.generateAndUpload({
+        userId: session.userId,
+        conversationId: session.conversationId,
+        title: summary.title,
+        topic: summary.topic,
+        sections: summary.sections,
+        depth: 'brief',
+        format: 'docx',
+        allowedDepths: entitlements.allowedDocumentDepths,
+      });
+
+      await this.usageService.tryConsume(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
+
+      client.emit('document:ready', {
+        docId: result.docId,
+        title: summary.title,
+        topic: summary.topic,
+        format: 'docx',
+        downloadUrl: result.downloadUrl,
+        auto: true,
+      });
+
+      this.pushNotificationService
+        .sendToUser(session.userId, {
+          title: 'Your conversation summary is ready',
+          body: summary.title,
+          data: { docId: result.docId, downloadUrl: result.downloadUrl },
+        })
+        .catch((err) => this.logger.warn(`Push notification failed for auto-summary ${result.docId}:`, err));
+
+      this.logger.log(`Auto-summary generated for conversation ${session.conversationId}: ${result.downloadUrl}`);
+    } catch (err) {
+      client.emit('document:failed', { title: summary.title, reason: "We couldn't generate your conversation summary.", auto: true });
+      throw err;
+    }
   }
 
   // ─── Multi-speaker prompt processing (Gap 4) ─────────────────────────────────

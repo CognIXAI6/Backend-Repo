@@ -8,6 +8,8 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
+    "start:gateway": "ts-node -r tsconfig-paths/register src/main-gateway.ts",
+    "start:gateway:prod": "node dist/main-gateway",
     "migrate:make": "knex migrate:make",
     "migrate:latest": "knex migrate:latest",
     "migrate:rollback": "knex migrate:rollback",
