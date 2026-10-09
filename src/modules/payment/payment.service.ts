@@ -692,7 +692,25 @@ export class PaymentService {
       throw new NotFoundException('Subscription not found');
     }
 
-    await this.stripe.subscriptions.cancel(subscriptionId);
+    try {
+      await this.stripe.subscriptions.cancel(subscriptionId);
+    } catch (err) {
+      // "No such subscription" — Stripe has no record of it (already
+      // canceled/deleted directly in the Stripe dashboard, or the ID is
+      // stale from a test/live key mismatch — same class of drift
+      // getOrCreateStripeCustomer and syncSubscriptionFromStripe already
+      // guard against elsewhere in this file). Previously this threw
+      // straight through as an uncaught 500: the user had no live Stripe
+      // subscription (so no actual billing), yet our own DB still showed
+      // them as active, and every retry of "Cancel" failed the same way —
+      // no path forward for the user at all. Since Stripe itself confirms
+      // nothing is left to cancel, treat it the same as a successful
+      // cancellation instead of blocking on it.
+      if ((err as any).code !== 'resource_missing') throw err;
+      this.logger.warn(
+        `cancelSubscription: Stripe has no record of ${subscriptionId} (user ${userId}) — treating as already canceled`,
+      );
+    }
 
     await this.knex('subscriptions')
       .where('stripe_subscription_id', subscriptionId)
