@@ -5,9 +5,6 @@
 		},
 		{
 			"path": "../speechbrain-api"
-		},
-		{
-			"path": "../CognixAI"
 		}
 	]
 }
