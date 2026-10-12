@@ -910,10 +910,10 @@ No intro sentence. No headers. Just bullets.`;
 {"title": "<= 8 words, specific to what was actually discussed", "topic": "one sentence topic", "sections": [{"heading": "Summary", "content": "..."}, {"heading": "Key Insights", "content": "..."}, {"heading": "Follow-up Actions", "content": "..."}, {"heading": "Suggested Questions", "content": "..."}]}
 
 Rules:
-- Summary: 2-4 sentences covering what was actually discussed.
-- Key Insights: the non-obvious takeaways or conclusions reached, as "- " bullet lines within the content string. If the conversation was too short/shallow for real insights, write "Nothing notable surfaced." — never invent them.
-- Follow-up Actions: concrete next steps implied by the conversation, as "- " bullet lines. If none, write "No specific follow-up actions were identified."
-- Suggested Questions: 2-4 questions the user might want to ask next to go deeper, as "- " bullet lines.
+- Summary: 2-4 sentences covering what was actually discussed, in the order it was discussed (earliest topic first, most recent last) — never lead with the most recent or most salient point.
+- Key Insights: the non-obvious takeaways or conclusions reached, as "- " bullet lines within the content string, ordered by when each was raised in the conversation (earliest first). If the conversation was too short/shallow for real insights, write "Nothing notable surfaced." — never invent them.
+- Follow-up Actions: concrete next steps implied by the conversation, as "- " bullet lines, ordered by when they came up (earliest first). If none, write "No specific follow-up actions were identified."
+- Suggested Questions: 2-4 questions the user might want to ask next to go deeper, as "- " bullet lines, ordered to follow naturally from earliest to latest topic covered.
 - Base everything strictly on the transcript below. Never invent facts, names, or numbers not present in it.`;
 
     try {

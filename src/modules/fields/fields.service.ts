@@ -261,6 +261,18 @@ export class FieldsService {
     return setting?.value;
   }
 
+  async setAppSetting(key: string, value: unknown, description?: string) {
+    const row: Record<string, unknown> = { key, value: JSON.stringify(value), updated_at: this.knex.fn.now() };
+    if (description !== undefined) row.description = description;
+
+    await this.knex('app_settings')
+      .insert(row)
+      .onConflict('key')
+      .merge(description !== undefined ? ['value', 'description', 'updated_at'] : ['value', 'updated_at']);
+
+    return { key, value };
+  }
+
   // ── Admin management ────────────────────────────────────────────────────────
 
   /** All fields regardless of is_active — the public findAll() only returns active ones. */

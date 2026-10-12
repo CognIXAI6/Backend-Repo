@@ -233,6 +233,30 @@ export class AdminController {
     return this.fieldsService.deactivateField(id);
   }
 
+  // ── Payment provider toggle ────────────────────────────────────────────────
+  // Flutterwave account is currently inactive — PaymentService.resolveProviderConfig
+  // reads this flag and routes every checkout/pricing lookup to Stripe while
+  // it's false, regardless of detected country. Flip it back once the
+  // Flutterwave account is restored; no deploy needed.
+
+  @Get('settings/flutterwave-enabled')
+  @UseGuards(AdminGuard)
+  async getFlutterwaveEnabled() {
+    const value = await this.fieldsService.getAppSetting('flutterwave_enabled');
+    return { flutterwaveEnabled: value === true };
+  }
+
+  @Patch('settings/flutterwave-enabled')
+  @UseGuards(AdminGuard)
+  async setFlutterwaveEnabled(@Body('enabled') enabled: boolean) {
+    await this.fieldsService.setAppSetting(
+      'flutterwave_enabled',
+      enabled === true,
+      'When false, all payments route through Stripe regardless of detected country (Flutterwave account inactive).',
+    );
+    return { flutterwaveEnabled: enabled === true };
+  }
+
   // ── Plans & entitlements (pricing + what each tier unlocks) ───────────────
   // Everything here is what EntitlementsService and PaymentService read at
   // request/checkout time — nothing in the app is statically configured

@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
-import { GeoService, getCountryConfig } from './geo.service';
+import { GeoService, getCountryConfig, CountryConfig } from './geo.service';
 import { FxService } from './fx.service';
 import { FlutterwaveService, FlutterwaveWebhookPayload } from './flutterwave.service';
 import { PlanType, isPaidTier } from '@/modules/entitlements/entitlements.types';
@@ -75,11 +75,26 @@ export class PaymentService {
       .select('*');
   }
 
+  // Admin kill switch for Flutterwave (app_settings key 'flutterwave_enabled',
+  // seeded false — no active Flutterwave account as of this writing). When
+  // off, every country that would otherwise route to Flutterwave falls back
+  // to Stripe/USD instead. Flip it back via PATCH /admin/settings/flutterwave_enabled
+  // once the account is restored — no deploy needed.
+  private async resolveProviderConfig(country: string): Promise<CountryConfig> {
+    const config = getCountryConfig(country);
+    if (config.provider !== 'flutterwave') return config;
+
+    const setting = await this.knex('app_settings').where('key', 'flutterwave_enabled').first();
+    const flutterwaveEnabled = setting?.value === true;
+
+    return flutterwaveEnabled ? config : { countryCode: country, currency: 'USD', provider: 'stripe' };
+  }
+
   // Geo-aware plans: returns prices in the user's local currency using live FX
   // rates, or an admin-pinned override stored in subscription_plan_prices.
   async getLocalizedPlans(clientIp: string, countryOverride?: string, planType?: PlanType): Promise<LocalizedPlan[]> {
     const country = countryOverride ?? (await this.geoService.detectCountry(clientIp)) ?? 'US';
-    const { currency, provider } = getCountryConfig(country);
+    const { currency, provider } = await this.resolveProviderConfig(country);
 
     this.logger.log(`getLocalizedPlans: ip=${clientIp} → country=${country} → currency=${currency} provider=${provider}`);
 
@@ -302,7 +317,7 @@ export class PaymentService {
     }
 
     const country = countryOverride ?? (await this.geoService.detectCountry(clientIp)) ?? 'US';
-    const { provider, currency } = getCountryConfig(country);
+    const { provider, currency } = await this.resolveProviderConfig(country);
 
     this.logger.log(`createCheckoutSession: user=${userId} country=${country} provider=${provider} currency=${currency}`);
 
