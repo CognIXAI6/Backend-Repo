@@ -329,7 +329,7 @@ export class DeepgramService implements OnModuleInit {
     const close = (): void => {
       if (keepAliveTimer) clearInterval(keepAliveTimer);
       try {
-        if (socket.readyState === 1) socket.sendCloseStream({} as any);
+        if (socket.readyState === 1) socket.sendCloseStream({ type: 'CloseStream' });
       } catch (_) {}
       try {
         if (socket.readyState === 1) socket.close();

@@ -664,26 +664,28 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         }
       }
 
-      // ── Resolve speaker roster (multi-speaker) ────────────────────────────
-      const speakerRoster = (!isGuest && isMultiSpeaker)
-        ? await this.resolveSpeakerRoster(userId, payload.speakerRoster)
-        : [];
-      const speakerRosterByVoiceId = new Map<string, SpeakerRosterEntry>(
-        speakerRoster
-          .filter((e) => e.voiceSpeakerId)
-          .map((e) => [e.voiceSpeakerId!, e]),
-      );
-
-      // ── Open Deepgram live session ────────────────────────────────────────
+      // ── Resolve speaker roster (multi-speaker) + open Deepgram live session ──
+      // Run concurrently — resolveSpeakerRoster is a DB round-trip independent
+      // of providerConnectOptions, and serializing it in front of the Deepgram
+      // connect pushed multi-speaker's session:start past the frontend's
+      // "ready" timeout (the only mode that does this extra lookup).
       const providerConnectOptions = {
         diarize: shouldDiarize,
         utteranceEndMs: shouldDiarize ? 2000 : 1500,
         meetingMode: shouldDiarize,
         audioFormat,
       };
-      const { emitter, sendAudio, sendFinalize, close } = await this.deepgramService.createLiveSession(
-        client.id,
-        providerConnectOptions,
+      const [speakerRoster, deepgramSession] = await Promise.all([
+        (!isGuest && isMultiSpeaker)
+          ? this.resolveSpeakerRoster(userId, payload.speakerRoster)
+          : Promise.resolve([]),
+        this.deepgramService.createLiveSession(client.id, providerConnectOptions),
+      ]);
+      const { emitter, sendAudio, sendFinalize, close } = deepgramSession;
+      const speakerRosterByVoiceId = new Map<string, SpeakerRosterEntry>(
+        speakerRoster
+          .filter((e) => e.voiceSpeakerId)
+          .map((e) => [e.voiceSpeakerId!, e]),
       );
 
       const session: ActiveSession = {
