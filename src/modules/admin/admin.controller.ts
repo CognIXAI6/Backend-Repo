@@ -114,6 +114,21 @@ export class AdminController {
     return this.adminService.updateUserTier(id, tier, adminFromReq(req).id);
   }
 
+  // ── Beta/test users (admin-granted plans, no real payment) ────────────────
+
+  @Get('beta-users')
+  @UseGuards(AdminGuard)
+  getBetaUsers(@Query('page') page = '1', @Query('limit') limit = '20') {
+    return this.adminService.getBetaUsers({ page: Number(page), limit: Number(limit) });
+  }
+
+  @Delete('beta-users/:userId')
+  @UseGuards(AdminGuard)
+  @HttpCode(HttpStatus.OK)
+  removeBetaUser(@Param('userId') userId: string) {
+    return this.adminService.removeBetaUser(userId);
+  }
+
   @Patch('users/:id/status')
   @UseGuards(AdminGuard)
   toggleUserStatus(@Param('id') id: string) {

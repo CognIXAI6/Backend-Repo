@@ -382,6 +382,71 @@ export class AdminService {
     return { id: userId, subscription_tier: tier };
   }
 
+  // Beta/test accounts = users with a currently active is_admin_grant row.
+  // Separate from getUsers' tier filter because a real paying "standard" user
+  // and a beta-granted "standard" user share the same subscription_tier value
+  // and are only distinguishable via the subscriptions row.
+  async getBetaUsers(params: { page: number; limit: number }) {
+    const { page, limit } = params;
+    const offset = (page - 1) * limit;
+
+    const baseQuery = this.knex('subscriptions as s')
+      .where('s.is_admin_grant', true)
+      .whereIn('s.status', ['active', 'trialing']);
+
+    const [{ total }] = await baseQuery.clone().count('s.id as total');
+
+    const rows = await baseQuery
+      .clone()
+      .join('users as u', 'u.id', 's.user_id')
+      .leftJoin('admins as a', 'a.id', 's.granted_by_admin_id')
+      .select(
+        'u.id as user_id', 'u.email', 'u.name',
+        's.plan_type', 's.status',
+        's.current_period_start as granted_at', 's.current_period_end as expires_at',
+        's.granted_by_admin_id', 'a.email as granted_by_admin_email',
+      )
+      .orderBy('s.updated_at', 'desc')
+      .limit(limit)
+      .offset(offset);
+
+    return {
+      data: rows.map((r: any) => ({
+        userId: r.user_id,
+        email: r.email,
+        name: r.name,
+        planType: r.plan_type,
+        status: r.status,
+        grantedAt: r.granted_at,
+        expiresAt: r.expires_at,
+        grantedByAdminId: r.granted_by_admin_id,
+        grantedByAdminEmail: r.granted_by_admin_email,
+      })),
+      meta: { total: Number(total), page, limit, totalPages: Math.ceil(Number(total) / limit) },
+    };
+  }
+
+  // Dedicated revoke endpoint for the beta-users list UI — same underlying
+  // writes as updateUserTier(userId, 'free', ...), but 404s when the user
+  // was never a beta grant (clearer than a silent no-op from the generic path).
+  async removeBetaUser(userId: string) {
+    const grant = await this.knex('subscriptions')
+      .where({ user_id: userId, is_admin_grant: true })
+      .whereIn('status', ['active', 'trialing'])
+      .first();
+
+    if (!grant) throw new NotFoundException('User has no active beta grant');
+
+    const now = new Date();
+    await this.knex('subscriptions')
+      .where('id', grant.id)
+      .update({ status: 'canceled', canceled_at: now, updated_at: now });
+
+    await this.knex('users').where('id', userId).update({ subscription_tier: 'free', updated_at: now });
+
+    return { id: userId, subscription_tier: 'free' };
+  }
+
   async toggleUserStatus(userId: string) {
     const user = await this.knex('users').where('id', userId).first();
     if (!user) throw new NotFoundException('User not found');
