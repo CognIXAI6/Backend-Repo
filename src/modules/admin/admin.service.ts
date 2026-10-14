@@ -330,10 +330,55 @@ export class AdminService {
     };
   }
 
-  async updateUserTier(userId: string, tier: PlanType) {
+  // Grants (or revokes) a plan tier for beta/test accounts without a real
+  // Stripe/Flutterwave subscription. Writing users.subscription_tier alone
+  // isn't enough — EntitlementsService.resolveUserTier (entitlements.service.ts:85-102)
+  // immediately downgrades back to 'free' unless a matching active/trialing
+  // subscriptions row also exists, so this mirrors the same two writes the
+  // real payment webhooks make. is_admin_grant marks the row so revenue
+  // analytics (getRevenueOverview/getTransactions/getRevenueByCurrency)
+  // never counts it as real paid revenue.
+  async updateUserTier(userId: string, tier: PlanType, grantedByAdminId: string) {
     const user = await this.knex('users').where('id', userId).first();
     if (!user) throw new NotFoundException('User not found');
-    await this.knex('users').where('id', userId).update({ subscription_tier: tier, updated_at: new Date() });
+
+    const now = new Date();
+
+    if (tier === 'free') {
+      await this.knex('subscriptions')
+        .where({ user_id: userId, is_admin_grant: true })
+        .whereIn('status', ['active', 'trialing'])
+        .update({ status: 'canceled', canceled_at: now, updated_at: now });
+    } else {
+      // One admin-grant row per user (fixed id) — re-granting/switching tiers
+      // updates it in place rather than accumulating a new row each time.
+      const oneYearOut = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
+      await this.knex('subscriptions')
+        .insert({
+          user_id: userId,
+          stripe_subscription_id: `admin-grant-${userId}`,
+          plan_type: tier,
+          billing_cycle: 'yearly',
+          status: 'active',
+          current_period_start: now,
+          current_period_end: oneYearOut,
+          granted_by_admin_id: grantedByAdminId,
+          is_admin_grant: true,
+          updated_at: now,
+        })
+        .onConflict('stripe_subscription_id')
+        .merge({
+          plan_type: tier,
+          status: 'active',
+          current_period_start: now,
+          current_period_end: oneYearOut,
+          granted_by_admin_id: grantedByAdminId,
+          canceled_at: null,
+          updated_at: now,
+        });
+    }
+
+    await this.knex('users').where('id', userId).update({ subscription_tier: tier, updated_at: now });
     return { id: userId, subscription_tier: tier };
   }
 
@@ -352,7 +397,8 @@ export class AdminService {
 
     let subQuery = this.knex('subscriptions as s')
       .join('subscription_plans as sp', (j) => j.on('sp.billing_cycle', 's.billing_cycle').andOn('sp.plan_type', 's.plan_type'))
-      .whereIn('s.status', ['active', 'trialing', 'canceled']);
+      .whereIn('s.status', ['active', 'trialing', 'canceled'])
+      .where('s.is_admin_grant', false);
 
     if (since) subQuery = subQuery.where('s.created_at', '>=', since);
 
@@ -422,7 +468,8 @@ export class AdminService {
 
     let query = this.knex('subscriptions as s')
       .join('users as u', 'u.id', 's.user_id')
-      .join('subscription_plans as sp', (j) => j.on('sp.billing_cycle', 's.billing_cycle').andOn('sp.plan_type', 's.plan_type'));
+      .join('subscription_plans as sp', (j) => j.on('sp.billing_cycle', 's.billing_cycle').andOn('sp.plan_type', 's.plan_type'))
+      .where('s.is_admin_grant', false);
 
     if (provider === 'stripe') query = query.whereRaw(`s.stripe_subscription_id NOT LIKE 'flw-%'`);
     if (provider === 'flutterwave') query = query.whereRaw(`s.stripe_subscription_id LIKE 'flw-%'`);
@@ -463,6 +510,7 @@ export class AdminService {
     const allSubs = await this.knex('subscriptions as s')
       .join('subscription_plans as sp', (j) => j.on('sp.billing_cycle', 's.billing_cycle').andOn('sp.plan_type', 's.plan_type'))
       .whereIn('s.status', ['active', 'trialing', 'canceled'])
+      .where('s.is_admin_grant', false)
       .select(
         this.knex.raw(`CASE WHEN s.stripe_subscription_id LIKE 'flw-%' THEN 'flutterwave' ELSE 'stripe' END as provider`),
         'sp.amount_cents',

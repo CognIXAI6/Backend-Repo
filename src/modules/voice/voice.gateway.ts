@@ -395,6 +395,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     message: string,
     extra: Record<string, unknown> = {},
   ): void {
+    // This used to be silent server-side — a blocked session:start looked
+    // identical in the logs to a client that simply vanished (connect, then
+    // disconnect with nothing in between), which made the free-tier
+    // dual/multi-speaker block indistinguishable from an actual backend hang.
+    this.logger.log(`[${client.id}] entitlement:blocked — reason=${reason} extra=${JSON.stringify(extra)}`);
     client.emit('entitlement:blocked', { reason, message, ...extra });
   }
 

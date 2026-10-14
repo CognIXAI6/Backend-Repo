@@ -106,10 +106,12 @@ export class AdminController {
     return this.adminService.getUserDetails(id);
   }
 
+  // Grants a plan tier to a test/beta account (or revokes back to 'free')
+  // without a real Stripe/Flutterwave subscription — see AdminService.updateUserTier.
   @Patch('users/:id/tier')
   @UseGuards(AdminGuard)
-  updateUserTier(@Param('id') id: string, @Body('tier') tier: PlanType) {
-    return this.adminService.updateUserTier(id, tier);
+  updateUserTier(@Req() req: Request, @Param('id') id: string, @Body('tier') tier: PlanType) {
+    return this.adminService.updateUserTier(id, tier, adminFromReq(req).id);
   }
 
   @Patch('users/:id/status')
