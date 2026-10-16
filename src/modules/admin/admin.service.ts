@@ -274,7 +274,7 @@ export class AdminService {
     const user = await this.knex('users').where('id', userId).whereNull('deleted_at').first();
     if (!user) throw new NotFoundException('User not found');
 
-    const [subscription, conversationStats, voiceStats] = await Promise.all([
+    const [subscription, conversationStats, voiceStats, monthlyRows] = await Promise.all([
       this.knex('subscriptions')
         .where('user_id', userId)
         .whereIn('status', ['active', 'trialing', 'past_due'])
@@ -301,10 +301,42 @@ export class AdminService {
           this.knex.raw('COUNT(CASE WHEN cm.audio_url IS NOT NULL THEN 1 END) as voice_messages'),
         )
         .first(),
+
+      // Last 12 calendar months of usage, oldest first — same blended-rate
+      // estimate as the lifetime total, just grouped by month.
+      this.knex('conversation_messages as cm')
+        .join('conversations as c', 'c.id', 'cm.conversation_id')
+        .where('c.user_id', userId)
+        .whereNull('c.deleted_at')
+        .where('cm.created_at', '>=', this.knex.raw("date_trunc('month', now()) - interval '11 months'"))
+        .select(
+          this.knex.raw(`TO_CHAR(cm.created_at, 'YYYY-MM') as month`),
+          this.knex.raw('COALESCE(SUM(cm.tokens_used), 0) as total_tokens'),
+          this.knex.raw('COALESCE(SUM(cm.audio_duration_ms), 0) as total_audio_ms'),
+        )
+        .groupByRaw(`TO_CHAR(cm.created_at, 'YYYY-MM')`),
     ]);
 
     const totalAudioMinutes = Number(voiceStats?.total_audio_ms ?? 0) / 60000;
     const totalTokens = Number(voiceStats?.total_tokens ?? 0);
+
+    const monthlyByKey = new Map(monthlyRows.map((r) => [r.month, r]));
+    const monthlySpend = Array.from({ length: 12 }, (_, i) => {
+      const d = new Date();
+      d.setDate(1);
+      d.setMonth(d.getMonth() - (11 - i));
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const row = monthlyByKey.get(key);
+      const tokens = Number(row?.total_tokens ?? 0);
+      const audioMinutes = Number(row?.total_audio_ms ?? 0) / 60000;
+      return {
+        month: key,
+        totalTokensUsed: tokens,
+        estimatedAiCostUsd: Number(((tokens / 1_000_000) * 9).toFixed(4)), // ~$9/1M tokens blended
+        totalAudioMinutes: Number(audioMinutes.toFixed(2)),
+        estimatedDeepgramCostUsd: Number((audioMinutes * 0.0043).toFixed(4)),
+      };
+    });
 
     return {
       user: {
@@ -327,6 +359,7 @@ export class AdminService {
         estimatedDeepgramCostUsd: Number((totalAudioMinutes * 0.0043).toFixed(4)),
         voiceMessages: Number(voiceStats?.voice_messages ?? 0),
       },
+      monthlySpend,
     };
   }
 
