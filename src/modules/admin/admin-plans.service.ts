@@ -1,4 +1,4 @@
-import { Injectable, Inject, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Inject, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
 import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { EntitlementsService } from '../entitlements/entitlements.service';
@@ -71,6 +71,16 @@ export class AdminPlansService {
   }
 
   async createPlan(dto: CreatePlanDto) {
+    const existing = await this.knex('subscription_plans')
+      .where({ plan_type: dto.planType, billing_cycle: dto.billingCycle })
+      .first();
+    if (existing) {
+      throw new ConflictException(
+        `A plan for "${dto.planType}" / "${dto.billingCycle}" already exists (id ${existing.id}). ` +
+          `Use PATCH /admin/plans/${existing.id} to edit it, or publish it if it has no Stripe price yet.`,
+      );
+    }
+
     const [plan] = await this.knex('subscription_plans')
       .insert({
         plan_type: dto.planType,
