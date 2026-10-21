@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Response } from 'express';
+import { MulterError } from 'multer';
 import * as Sentry from '@sentry/nestjs';
 import { GIT_SHA } from '../utils/deployment-metadata.util';
 import { RequestWithCorrelation } from '../middleware/correlation-id.middleware';
@@ -36,6 +37,18 @@ export class GlobalExceptionFilter implements ExceptionFilter {
         // Preserve array of validation messages in full — callers get all failures.
         message = (body.message as string | string[]) ?? exception.message;
       }
+    } else if (exception instanceof MulterError) {
+      // Upload-related errors (oversized file, unexpected field, etc.) are
+      // client errors — map them to a clean 4xx instead of falling through
+      // to the generic 500 branch below.
+      status =
+        exception.code === 'LIMIT_FILE_SIZE'
+          ? HttpStatus.PAYLOAD_TOO_LARGE
+          : HttpStatus.BAD_REQUEST;
+      message =
+        exception.code === 'LIMIT_FILE_SIZE'
+          ? 'File is too large.'
+          : exception.message;
     } else if (exception instanceof Error) {
       // Never expose raw database errors (SQL statements, constraint names, etc.)
       // to the client — replace them with a safe generic message in all environments.
