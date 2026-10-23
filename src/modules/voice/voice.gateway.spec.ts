@@ -94,6 +94,7 @@ function createGateway() {
     noop, // pushNotificationService
     noop, // entitlementsService
     noop, // usageService
+    noop, // settingsService
   );
 
   return { gateway: gateway as any, deepgramService, errorLogService };

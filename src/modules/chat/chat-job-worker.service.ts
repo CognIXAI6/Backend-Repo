@@ -9,11 +9,9 @@ import {
 import { ConversationService } from '../voice/services/conversation.service';
 import { UsersService } from '../users/users.service';
 import { FieldsService } from '../fields/fields.service';
+import { SettingsService } from '../settings/settings.service';
 import { computeBackoffDelayMs } from '../voice/utils/backoff.util';
-
-const EMPTY_RESPONSE_FALLBACK =
-  "- I didn't quite catch that — could you rephrase?\n" +
-  '- Try asking something specific about your question.';
+import { buildEmptyResponseFallback } from '../voice/constants/fallback-messages.constant';
 
 /**
  * Minimal polling worker for ai_response_jobs, created for the durable chat
@@ -34,6 +32,7 @@ export class ChatJobWorkerService {
     private readonly claudeService: ClaudeService,
     private readonly usersService: UsersService,
     private readonly fieldsService: FieldsService,
+    private readonly settingsService: SettingsService,
     private readonly configService: ConfigService,
   ) {}
 
@@ -98,12 +97,13 @@ export class ChatJobWorkerService {
 
       const userId: string = conversation.user_id;
 
-      const [user, field, history, documentContext, images] = await Promise.all([
+      const [user, field, history, documentContext, images, outputLanguage] = await Promise.all([
         this.usersService.findById(userId),
         conversation.field_id ? this.fieldsService.findById(conversation.field_id) : Promise.resolve(null),
         this.conversationService.getRecentHistoryForAI(job.conversation_id, 40),
         this.conversationService.getFullDocumentContext(job.conversation_id, userId).catch(() => null),
         this.conversationService.getConversationImagesForAI(job.conversation_id).catch(() => []),
+        this.settingsService.getEffectiveLanguage(userId),
       ]);
 
       const visionImages: ClaudeConversationImage[] = images.map((img) => ({
@@ -123,6 +123,10 @@ export class ChatJobWorkerService {
         user?.ai_memory ?? undefined,
         documentContext,
         false,
+        false,
+        undefined,
+        undefined,
+        outputLanguage,
       );
 
       const startedAt = Date.now();
@@ -141,7 +145,7 @@ export class ChatJobWorkerService {
             {
               onToken: () => {},
               onDone: (fullText, inTok, outTok) => {
-                resolve({ text: fullText.trim() ? fullText : EMPTY_RESPONSE_FALLBACK, inputTokens: inTok, outputTokens: outTok });
+                resolve({ text: fullText.trim() ? fullText : buildEmptyResponseFallback(outputLanguage), inputTokens: inTok, outputTokens: outTok });
               },
               onError: (err) => reject(err),
             },

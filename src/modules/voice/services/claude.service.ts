@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { tavily } from '@tavily/core';
 import { checkLength, countWords, estimatePages, PAGE_CAPACITY, targetWords } from '@/modules/documents/document-length.util';
+import { buildLanguageDirective } from '@/common/constants/conversation-languages.constant';
 
 export interface DocumentRequest {
   title: string;
@@ -531,6 +532,8 @@ export class ClaudeService implements OnModuleInit {
     documentUnavailableReason?: string,
     /** Depths this user's tier is entitled to — Claude is told not to offer the rest even if asked. */
     allowedDocumentDepths?: Array<'brief' | 'standard' | 'comprehensive'>,
+    /** The user's saved conversation output language (canonical code). Defaults to English. */
+    outputLanguage = 'en',
   ): string {
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', {
@@ -640,7 +643,7 @@ ${this.getFieldLinkGuide(fieldName)}`
       ? `\n\n## DOCUMENTS ATTACHED TO THIS CONVERSATION\nThe user has uploaded the following document(s) into this conversation. Read them carefully. When the user asks any question about "the document", "the file", "the CV", "the report", etc., answer using the content below. Quote or reference specific sections when relevant.\n\n${documentContext}`
       : '';
 
-    return basePrompt + fieldContext + memoryBlock + documentBlock;
+    return basePrompt + fieldContext + memoryBlock + documentBlock + buildLanguageDirective(outputLanguage);
   }
 
   private getFieldBreadthNote(fieldName: string): string {
@@ -726,7 +729,13 @@ so the user can read the full content directly. Keep your response to a short in
     return keywords.some((kw) => field.includes(kw));
   }
 
-  buildDualSpeakerPrompt(fieldName?: string, aiMemory?: string, documentContext?: string | null): string {
+  buildDualSpeakerPrompt(
+    fieldName?: string,
+    aiMemory?: string,
+    documentContext?: string | null,
+    /** The user's saved conversation output language (canonical code). Defaults to English. */
+    outputLanguage = 'en',
+  ): string {
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
@@ -776,7 +785,7 @@ Your job: give the OWNER a brief, actionable insight based on what the other per
 - They're questioning the tension between faith and doubt — a normal spiritual phase
 - Validate their honesty; doubt can deepen genuine faith
 - [Read Mark 9:24 — "I believe; help my unbelief"](https://www.biblegateway.com/passage/?search=Mark+9:24&version=NIV)
-${fieldBlock}${memoryBlock}${documentBlock}`;
+${fieldBlock}${memoryBlock}${documentBlock}${buildLanguageDirective(outputLanguage)}`;
   }
 
   /**
@@ -788,20 +797,34 @@ ${fieldBlock}${memoryBlock}${documentBlock}`;
     userPrompt: string,
     aiResponse: string,
     fieldName?: string,
+    /** The user's saved conversation output language (canonical code). Defaults to English. */
+    outputLanguage = 'en',
   ): Promise<string> {
-    const response = await this.client.messages.create({
-      model: 'claude-haiku-4-5-20251001', // fast + cheap for a title
-      max_tokens: 20,
-      system: 'You generate short conversation titles. Output ONLY the title — no quotes, no explanation, no punctuation at the end. Max 7 words.',
-      messages: [
-        {
-          role: 'user',
-          content: `Generate a title for this conversation${fieldName ? ` (context: ${fieldName})` : ''}.\nUser said: "${userPrompt.slice(0, 200)}"\nAI responded about: "${aiResponse.slice(0, 200)}"`,
-        },
-      ],
-    });
+    const response = await this.client.messages.create(
+      {
+        model: 'claude-haiku-4-5-20251001', // fast + cheap for a title
+        max_tokens: 20,
+        system:
+          'You generate short conversation titles. Output ONLY the title — no quotes, no explanation, no punctuation at the end. Max 7 words.' +
+          buildLanguageDirective(outputLanguage),
+        messages: [
+          {
+            role: 'user',
+            content: `Generate a title for this conversation${fieldName ? ` (context: ${fieldName})` : ''}.\nUser said: "${userPrompt.slice(0, 200)}"\nAI responded about: "${aiResponse.slice(0, 200)}"`,
+          },
+        ],
+      },
+      { timeout: 10_000 }, // bounded, no automatic retry
+    );
     const block = response.content[0];
-    return block.type === 'text' ? block.text.trim() : userPrompt.slice(0, 50);
+    const title = block.type === 'text' ? block.text.trim() : '';
+    if (!title) {
+      // Never fall back to raw (untranslated) user input as a title — the
+      // caller treats a thrown error as "no title this turn" and keeps
+      // the conversation untitled rather than overwriting anything.
+      throw new Error('Title generation returned empty or non-text output');
+    }
+    return title;
   }
 
   /**

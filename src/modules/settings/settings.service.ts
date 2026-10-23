@@ -3,6 +3,7 @@ import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
 import { UpdateProfileDto, UpdateAiPreferencesDto } from './dto/settings.dto';
+import { normalizeLanguageCode } from '@/common/constants/conversation-languages.constant';
 
 @Injectable()
 export class SettingsService {
@@ -111,9 +112,19 @@ export class SettingsService {
     return {
       responseLength: preferences.response_length,
       tone: preferences.tone,
-      language: preferences.language,
+      language: normalizeLanguageCode(preferences.language),
       customInstructions: preferences.custom_instructions,
     };
+  }
+
+  /**
+   * The language that should actually drive generation output for this
+   * user right now. Read fresh (no caching) so a saved preference change
+   * takes effect on the very next AI turn without any session/socket work.
+   */
+  async getEffectiveLanguage(userId: string): Promise<string> {
+    const preferences = await this.knex('user_preferences').where('user_id', userId).first();
+    return normalizeLanguageCode(preferences?.language);
   }
 
   async updateAiPreferences(userId: string, dto: UpdateAiPreferencesDto) {
@@ -155,32 +166,8 @@ export class SettingsService {
     return {
       responseLength: preferences.response_length,
       tone: preferences.tone,
-      language: preferences.language,
+      language: normalizeLanguageCode(preferences.language),
       customInstructions: preferences.custom_instructions,
     };
   }
-
-  // Get AI prompt context based on user preferences
-//   async getAiPromptContext(userId: string) {
-//     const preferences = await this.getAiPreferences(userId);
-
-//     const responseLengthMap = {
-//       concise: 'Provide short, direct answers without unnecessary elaboration.',
-//       balanced: 'Provide clear explanations without too much detail.',
-//       detailed: 'Provide in-depth reasoning and step-by-step explanations.',
-//     };
-
-//     const toneMap = {
-//       professional: 'Use a clear, neutral, and work-focused tone.',
-//       friendly: 'Use a warm and conversational tone.',
-//       direct: 'Be straight to the point with minimal pleasantries.',
-//     };
-
-//     return {
-//       responseLength: responseLengthMap[preferences.responseLength] || responseLengthMap.balanced,
-//       tone: toneMap[preferences.tone] || toneMap.professional,
-//       language: preferences.language,
-//       customInstructions: preferences.customInstructions,
-//     };
-//   }
 }

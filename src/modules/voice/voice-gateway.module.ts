@@ -10,6 +10,7 @@ import { PushNotificationModule } from '@/modules/notifications/push-notificatio
 import { UploadModule } from '@/modules/upload/upload.module';
 import { ErrorLogModule } from '@/modules/error-log/error-log.module';
 import { SpeakersModule } from '@/modules/speakers/speakers.module';
+import { SettingsModule } from '@/modules/settings/settings.module';
 
 /**
  * Everything the live Socket.IO voice gateway needs, bootstrapped as its
@@ -50,6 +51,7 @@ import { SpeakersModule } from '@/modules/speakers/speakers.module';
     UploadModule,
     ErrorLogModule,
     SpeakersModule,
+    SettingsModule, // SettingsService.getEffectiveLanguage() for VoiceGateway's per-generation language resolution
     JwtModule.registerAsync({
       useFactory: (configService: ConfigService) => ({
         secret: configService.get('jwt.secret'),

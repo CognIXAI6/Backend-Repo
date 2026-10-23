@@ -151,3 +151,63 @@ describe('ClaudeService.streamResponse — generate_document truncated by max_to
     expect(toolResultMessage.content[0].content).toContain('cut off');
   });
 });
+
+describe('ClaudeService — output language directive', () => {
+  it('buildSystemPrompt defaults to English and omits the mandatory directive', () => {
+    const service = createService();
+    const prompt = service.buildSystemPrompt();
+
+    expect(prompt).toContain('Respond in English.');
+    expect(prompt).not.toContain('OUTPUT LANGUAGE — MANDATORY');
+  });
+
+  it('buildSystemPrompt includes a mandatory non-English directive when a language is passed', () => {
+    const service = createService();
+    const prompt = service.buildSystemPrompt(undefined, undefined, null, false, false, undefined, undefined, 'es');
+
+    expect(prompt).toContain('OUTPUT LANGUAGE — MANDATORY');
+    expect(prompt).toContain('Spanish');
+    expect(prompt).toContain('es');
+  });
+
+  it('buildDualSpeakerPrompt includes the directive for the requested language', () => {
+    const service = createService();
+    const prompt = service.buildDualSpeakerPrompt(undefined, undefined, null, 'fr');
+
+    expect(prompt).toContain('French');
+  });
+});
+
+describe('ClaudeService.generateConversationTitle', () => {
+  function mockCreate(service: any, blocks: unknown[]) {
+    const create = jest.fn().mockResolvedValue({ content: blocks });
+    service.client = { messages: { create } };
+    return create;
+  }
+
+  it('includes the language directive in the system prompt and a 10s timeout option', async () => {
+    const service = createService() as any;
+    const create = mockCreate(service, [{ type: 'text', text: 'Un Résumé Rapide' }]);
+
+    const title = await service.generateConversationTitle('hola', 'respuesta', undefined, 'fr');
+
+    expect(title).toBe('Un Résumé Rapide');
+    const [params, options] = create.mock.calls[0];
+    expect(params.system).toContain('French');
+    expect(options).toEqual({ timeout: 10_000 });
+  });
+
+  it('throws instead of falling back to raw/untranslated user input when the model returns empty text', async () => {
+    const service = createService() as any;
+    mockCreate(service, [{ type: 'text', text: '   ' }]);
+
+    await expect(service.generateConversationTitle('some user prompt', 'ai response')).rejects.toThrow();
+  });
+
+  it('throws when the model returns a non-text block', async () => {
+    const service = createService() as any;
+    mockCreate(service, [{ type: 'tool_use' }]);
+
+    await expect(service.generateConversationTitle('some user prompt', 'ai response')).rejects.toThrow();
+  });
+});

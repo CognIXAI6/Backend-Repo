@@ -36,6 +36,7 @@ function createFakeAncillaryServices() {
   return {
     usersService: { findById: jest.fn().mockResolvedValue({ ai_memory: 'some memory' }) } as any,
     fieldsService: { findById: jest.fn().mockResolvedValue({ name: 'General Knowledge' }) } as any,
+    settingsService: { getEffectiveLanguage: jest.fn().mockResolvedValue('en') } as any,
     configService: { get: jest.fn((key: string) => (key === 'chat.maxAttempts' ? 3 : undefined)) } as any,
   };
 }
@@ -59,9 +60,9 @@ describe('ChatJobWorkerService.processJob', () => {
         return Promise.resolve();
       }),
     };
-    const { usersService, fieldsService, configService } = createFakeAncillaryServices();
+    const { usersService, fieldsService, settingsService, configService } = createFakeAncillaryServices();
 
-    const worker = new ChatJobWorkerService(knexLike, conversationService, claudeService, usersService, fieldsService, configService);
+    const worker = new ChatJobWorkerService(knexLike, conversationService, claudeService, usersService, fieldsService, settingsService, configService);
     await (worker as any).processJob('job-1');
 
     expect(conversationService.saveMessage).toHaveBeenCalledWith(
@@ -86,9 +87,9 @@ describe('ChatJobWorkerService.processJob', () => {
         return Promise.resolve();
       }),
     };
-    const { usersService, fieldsService, configService } = createFakeAncillaryServices();
+    const { usersService, fieldsService, settingsService, configService } = createFakeAncillaryServices();
 
-    const worker = new ChatJobWorkerService(knexLike, conversationService, claudeService, usersService, fieldsService, configService);
+    const worker = new ChatJobWorkerService(knexLike, conversationService, claudeService, usersService, fieldsService, settingsService, configService);
     await (worker as any).processJob('job-1');
 
     expect(conversationService.saveMessage).not.toHaveBeenCalled();
@@ -112,9 +113,9 @@ describe('ChatJobWorkerService.processJob', () => {
         return Promise.resolve();
       }),
     };
-    const { usersService, fieldsService, configService } = createFakeAncillaryServices();
+    const { usersService, fieldsService, settingsService, configService } = createFakeAncillaryServices();
 
-    const worker = new ChatJobWorkerService(knexLike, conversationService, claudeService, usersService, fieldsService, configService);
+    const worker = new ChatJobWorkerService(knexLike, conversationService, claudeService, usersService, fieldsService, settingsService, configService);
     await (worker as any).processJob('job-1');
 
     expect(aiJobsChain.update).toHaveBeenCalledWith(

@@ -35,6 +35,8 @@ import { ToolCallStreamFilter } from './utils/tool-call-stream-filter.util';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
 import { PlanEntitlements, PlanType } from '@/modules/entitlements/entitlements.types';
+import { SettingsService } from '@/modules/settings/settings.service';
+import { buildUnclearFallback, buildDocumentReadyFallback } from './constants/fallback-messages.constant';
 
 // ─── Mode types ───────────────────────────────────────────────────────────────
 
@@ -356,6 +358,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly pushNotificationService: PushNotificationService,
     private readonly entitlementsService: EntitlementsService,
     private readonly usageService: UsageService,
+    private readonly settingsService: SettingsService,
   ) {}
 
   private emitError(
@@ -1657,10 +1660,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         `Give the owner a brief, useful insight.${uncertainty}`;
 
       const msDocContext = await this.conversationService.getFullDocumentContext(session.conversationId, session.userId).catch(() => null);
+      const outputLanguage = session.isGuest ? 'en' : await this.settingsService.getEffectiveLanguage(session.userId);
       const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
         msDocContext,
+        outputLanguage,
       );
 
       // Gap 8: persist the user message and segments BEFORE starting the AI stream
@@ -1712,7 +1717,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           });
 
           this.claudeService
-            .generateConversationTitle(rawTranscript, fullText, session.fieldName)
+            .generateConversationTitle(rawTranscript, fullText, session.fieldName, outputLanguage)
             .then(async (title) => {
               const wasSet = await this.conversationService.setTitle(session.conversationId, title);
               if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
@@ -1777,10 +1782,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${otherPersonText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
 
       const dsDocContext = await this.conversationService.getFullDocumentContext(session.conversationId, session.userId).catch(() => null);
+      const outputLanguage = session.isGuest ? 'en' : await this.settingsService.getEffectiveLanguage(session.userId);
       const systemPrompt = this.claudeService.buildDualSpeakerPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
         dsDocContext,
+        outputLanguage,
       );
 
       client.emit('transcript:confirmed', {
@@ -1832,7 +1839,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           });
 
           this.claudeService
-            .generateConversationTitle(otherPersonText, fullText, session.fieldName)
+            .generateConversationTitle(otherPersonText, fullText, session.fieldName, outputLanguage)
             .then(async (title) => {
               const wasSet = await this.conversationService.setTitle(session.conversationId, title);
               if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
@@ -1995,6 +2002,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           return null;
         });
 
+      const outputLanguage = session.isGuest ? 'en' : await this.settingsService.getEffectiveLanguage(session.userId);
       const systemPrompt = this.claudeService.buildSystemPrompt(
         session.fieldName,
         session.cachedAiMemory ?? undefined,
@@ -2003,6 +2011,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.isGuest,
         documentUnavailableReason,
         session.entitlements?.allowedDocumentDepths,
+        outputLanguage,
       );
 
       // Load all images attached to this conversation — passed as image content
@@ -2059,14 +2068,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             // not evidence the request was unclear; document:ready already told the
             // client generation succeeded, so the chat bubble must say so too instead
             // of contradicting it with "I didn't quite catch that."
-            const UNCLEAR_FALLBACK =
-              `- I didn't quite catch that — could you rephrase?\n` +
-              `- Try asking something specific, like: "Explain [topic] step by step"\n` +
-              `- Or: "What are the key trends in ${session.fieldName ?? 'my industry'}?"`;
+            const UNCLEAR_FALLBACK = buildUnclearFallback(outputLanguage, session.fieldName ?? 'my industry');
 
             const DOCUMENT_READY_FALLBACK = generatedDocUrl
-              ? `- Your document "${generatedDocTitle ?? 'Untitled'}" is ready.\n` +
-                `- [Download it here](${generatedDocUrl})`
+              ? buildDocumentReadyFallback(outputLanguage, generatedDocTitle ?? 'Untitled', generatedDocUrl)
               : UNCLEAR_FALLBACK;
 
             const fallback = generatedDocId ? DOCUMENT_READY_FALLBACK : UNCLEAR_FALLBACK;
@@ -2090,7 +2095,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             });
 
             this.claudeService
-              .generateConversationTitle(userMessage, responseText, session.fieldName)
+              .generateConversationTitle(userMessage, responseText, session.fieldName, outputLanguage)
               .then(async (title) => {
                 const wasSet = await this.conversationService.setTitle(session.conversationId, title);
                 if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
