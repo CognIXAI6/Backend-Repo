@@ -3,7 +3,11 @@ import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
 import { UpdateProfileDto, UpdateAiPreferencesDto } from './dto/settings.dto';
-import { normalizeLanguageCode } from '@/common/constants/conversation-languages.constant';
+import {
+  normalizeLanguageCode,
+  SUPPORTED_CONVERSATION_LANGUAGES,
+  LANGUAGE_DISPLAY_NAMES,
+} from '@/common/constants/conversation-languages.constant';
 
 @Injectable()
 export class SettingsService {
@@ -91,6 +95,20 @@ export class SettingsService {
   }
 
   // ============ AI PREFERENCES ============
+
+  /**
+   * The authoritative list of languages the AI can generate conversation
+   * output in. Frontend language pickers (App Language included, now that
+   * it's synced 1:1 with this preference) should populate from this instead
+   * of hand-maintaining their own list — this registry is the single source
+   * of truth `UpdateAiPreferencesDto`'s validation is built from too.
+   */
+  getSupportedLanguages() {
+    return SUPPORTED_CONVERSATION_LANGUAGES.map((code) => ({
+      code,
+      name: LANGUAGE_DISPLAY_NAMES[code],
+    }));
+  }
 
   async getAiPreferences(userId: string) {
     let preferences = await this.knex('user_preferences')

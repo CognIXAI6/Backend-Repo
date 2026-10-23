@@ -21,6 +21,24 @@ function createFakeKnex(overrides: {
 
 const uploadServiceStub = {} as any;
 
+describe('SettingsService.getSupportedLanguages', () => {
+  it('returns every canonical code with a display name, sourced from the shared registry', () => {
+    const { knexLike } = createFakeKnex({});
+    const service = new SettingsService(knexLike, uploadServiceStub);
+
+    const languages = service.getSupportedLanguages();
+
+    expect(languages).toEqual(
+      expect.arrayContaining([
+        { code: 'en', name: 'English' },
+        { code: 'yo', name: 'Yoruba' },
+        { code: 'zh-Hans', name: 'Simplified Chinese' },
+      ]),
+    );
+    expect(languages).toHaveLength(9);
+  });
+});
+
 describe('SettingsService — AI preferences language handling', () => {
   describe('getAiPreferences', () => {
     it('normalizes a legacy/garbage stored language value to a canonical code', async () => {

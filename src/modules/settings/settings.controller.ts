@@ -62,6 +62,11 @@ export class SettingsController {
 
   // ============ AI PREFERENCES ============
 
+  @Get("languages")
+  getSupportedLanguages() {
+    return this.settingsService.getSupportedLanguages();
+  }
+
   @Get("ai-preferences")
   async getAiPreferences(@CurrentUser("id") userId: string) {
     return this.settingsService.getAiPreferences(userId);
