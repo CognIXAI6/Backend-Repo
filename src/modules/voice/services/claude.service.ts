@@ -906,9 +906,15 @@ No intro sentence. No headers. Just bullets.`;
   }
 
   /**
-   * Structured recap of a just-ended conversation — title, topic, and four
-   * fixed sections (Summary / Key Insights / Follow-up Actions / Suggested
-   * Questions) — for VoiceGateway's auto-generate-on-session-end feature.
+   * Structured recap of a just-ended conversation — title, topic, and three
+   * model-generated sections (Summary / Key Insights / Follow-up Actions) —
+   * for VoiceGateway's auto-generate-on-session-end feature. The caller
+   * splices in a fourth, code-built "Transcript" section (never trust the
+   * model to reproduce a transcript verbatim) and renames/moves
+   * "Follow-up Actions" to "Action Points / Next Steps" at the end, landing
+   * at exactly 4 sections — DocumentService caps "brief"-depth documents at
+   * 4 and silently drops the rest, so this count is load-bearing: adding a
+   * section here without removing one will truncate the action points.
    * Unlike the generate_document tool, this isn't triggered by the model
    * deciding to call a tool mid-turn; it's a single direct call made once
    * the conversation is over, strictly grounded in the transcript (no
@@ -930,13 +936,12 @@ No intro sentence. No headers. Just bullets.`;
       .slice(0, 12000); // bounds token cost on very long conversations
 
     const system = `You write a structured recap of a just-finished conversation with an AI assistant${fieldName ? ` specialising in ${fieldName}` : ''}. Output ONLY valid JSON, nothing else — no markdown fences, no commentary before or after:
-{"title": "<= 8 words, specific to what was actually discussed", "topic": "one sentence topic", "sections": [{"heading": "Summary", "content": "..."}, {"heading": "Key Insights", "content": "..."}, {"heading": "Follow-up Actions", "content": "..."}, {"heading": "Suggested Questions", "content": "..."}]}
+{"title": "<= 8 words, specific to what was actually discussed", "topic": "one sentence topic", "sections": [{"heading": "Summary", "content": "..."}, {"heading": "Key Insights", "content": "..."}, {"heading": "Follow-up Actions", "content": "..."}]}
 
 Rules:
 - Summary: 2-4 sentences covering what was actually discussed, in the order it was discussed (earliest topic first, most recent last) — never lead with the most recent or most salient point.
 - Key Insights: the non-obvious takeaways or conclusions reached, as "- " bullet lines within the content string, ordered by when each was raised in the conversation (earliest first). If the conversation was too short/shallow for real insights, write "Nothing notable surfaced." — never invent them.
-- Follow-up Actions: concrete next steps implied by the conversation, as "- " bullet lines, ordered by when they came up (earliest first). If none, write "No specific follow-up actions were identified."
-- Suggested Questions: 2-4 questions the user might want to ask next to go deeper, as "- " bullet lines, ordered to follow naturally from earliest to latest topic covered.
+- Follow-up Actions: concrete, actionable next steps implied by the conversation, as "- " bullet lines, ordered by when they came up (earliest first). If none, write "No specific follow-up actions were identified."
 - Base everything strictly on the transcript below. Never invent facts, names, or numbers not present in it.`;
 
     try {

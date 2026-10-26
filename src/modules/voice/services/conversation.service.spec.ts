@@ -58,6 +58,52 @@ describe('ConversationService.buildCleanupCandidatesQuery', () => {
   });
 });
 
+describe('ConversationService.setSummaryStatus', () => {
+  function createFakeUpdateChain() {
+    const chain: any = { where: jest.fn().mockReturnThis(), update: jest.fn().mockResolvedValue(1) };
+    return chain;
+  }
+
+  it('writes only summary_status when no skipReason/documentId is given', async () => {
+    const chain = createFakeUpdateChain();
+    const knexLike: any = jest.fn(() => chain);
+    const service = new ConversationService(knexLike, createFakeConfigService());
+
+    await service.setSummaryStatus('conv-1', 'pending');
+
+    expect(knexLike).toHaveBeenCalledWith('conversations');
+    expect(chain.where).toHaveBeenCalledWith('id', 'conv-1');
+    const update = chain.update.mock.calls[0][0];
+    expect(update.summary_status).toBe('pending');
+    expect(update).not.toHaveProperty('summary_skip_reason');
+    expect(update).not.toHaveProperty('summary_document_id');
+  });
+
+  it('writes skip_reason when skipping', async () => {
+    const chain = createFakeUpdateChain();
+    const knexLike: any = jest.fn(() => chain);
+    const service = new ConversationService(knexLike, createFakeConfigService());
+
+    await service.setSummaryStatus('conv-1', 'skipped', { skipReason: 'too_short' });
+
+    expect(chain.update.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ summary_status: 'skipped', summary_skip_reason: 'too_short' }),
+    );
+  });
+
+  it('writes the generated document id when ready', async () => {
+    const chain = createFakeUpdateChain();
+    const knexLike: any = jest.fn(() => chain);
+    const service = new ConversationService(knexLike, createFakeConfigService());
+
+    await service.setSummaryStatus('conv-1', 'ready', { documentId: 'doc-1' });
+
+    expect(chain.update.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ summary_status: 'ready', summary_document_id: 'doc-1' }),
+    );
+  });
+});
+
 describe('ConversationService.purgeEmptyConversations', () => {
   it('reads the grace period from config and scopes the query to the given user', async () => {
     const knexLike: any = jest.fn(() => createFakeQueryBuilder());

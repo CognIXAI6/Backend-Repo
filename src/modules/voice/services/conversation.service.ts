@@ -83,6 +83,8 @@ export interface TranscriptSegment {
   created_at: Date;
 }
 
+export type SummaryStatus = 'not_started' | 'pending' | 'ready' | 'failed' | 'skipped';
+
 export interface Conversation {
   id: string;
   user_id: string;
@@ -94,6 +96,9 @@ export interface Conversation {
   created_at: Date;
   updated_at: Date;
   deleted_at: Date | null;
+  summary_status: SummaryStatus;
+  summary_skip_reason: string | null;
+  summary_document_id: string | null;
 }
 
 export interface DocumentMeta {
@@ -444,6 +449,28 @@ export class ConversationService {
     return { ...conversation, messages, transcriptSegments };
   }
 
+  // ── Auto-summary status ─────────────────────────────────────────────────────
+
+  /**
+   * Persists where the auto-generated conversation summary stands, so a
+   * client can poll `GET /conversations/:id` for a real answer instead of
+   * guessing from a live socket event that routinely arrives after the
+   * client has already disconnected (see voice.gateway.ts's
+   * autoGenerateConversationSummary). No ownership check — called
+   * internally by the gateway, which already trusts the session.
+   */
+  async setSummaryStatus(
+    conversationId: string,
+    status: SummaryStatus,
+    opts: { skipReason?: string | null; documentId?: string | null } = {},
+  ): Promise<void> {
+    const update: Record<string, unknown> = { summary_status: status, updated_at: new Date() };
+    if ('skipReason' in opts) update.summary_skip_reason = opts.skipReason ?? null;
+    if ('documentId' in opts) update.summary_document_id = opts.documentId ?? null;
+
+    await this.knex('conversations').where('id', conversationId).update(update);
+  }
+
   // ── Get messages only ───────────────────────────────────────────────────────
 
   async getConversationMessages(conversationId: string, userId: string): Promise<ConversationMessage[]> {
@@ -513,6 +540,16 @@ export class ConversationService {
 
       return { ...(msg as Omit<ConversationMessage, 'document'>), document };
     });
+  }
+
+  /**
+   * Lightweight alternative to getConversationMessages for internal gateway
+   * use — skips the ownership re-check (trust established at session:start),
+   * same pattern as getRecentHistoryForAI. Returns full rows (speaker_label,
+   * transcript included), unlike getRecentHistoryForAI's role-only shape.
+   */
+  async getConversationMessagesInternal(conversationId: string): Promise<ConversationMessage[]> {
+    return this.fetchMessagesWithDocuments(conversationId);
   }
 
   // ── Get history array for Claude context ────────────────────────────────────

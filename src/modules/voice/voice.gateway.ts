@@ -1568,20 +1568,57 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * applies to conversations with enough actual content to summarize.
    */
   private async autoGenerateConversationSummary(client: Socket, session: ActiveSession): Promise<void> {
+    // Set 'pending' immediately so a client polling GET /conversations/:id
+    // right after session:end sees real state instead of 'not_started' while
+    // the gates below are still being evaluated — the live socket events
+    // further down frequently never arrive (client has usually already
+    // disconnected by the time any of this resolves), so this persisted
+    // status is the only delivery channel a client can actually rely on.
+    await this.conversationService
+      .setSummaryStatus(session.conversationId, 'pending')
+      .catch((err) => this.logger.warn(`Failed to set summary_status=pending for ${session.conversationId}:`, err));
+
     const entitlements = session.entitlements;
     if (!entitlements || entitlements.maxDocumentsPerMonth <= 0 || entitlements.allowedDocumentDepths.length === 0) {
-      return; // tier doesn't include document generation — stay silent, this is a bonus, not an explicit request
+      // tier doesn't include document generation — this is a bonus, not an explicit request
+      await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'tier_no_documents' });
+      return;
     }
 
     const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 80);
     const wordCount = history.reduce((sum, m) => sum + m.content.split(/\s+/).filter(Boolean).length, 0);
-    if (history.length < 2 || wordCount < 40) return; // too short to be worth a recap
+    if (history.length < 2 || wordCount < 40) {
+      await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'too_short' });
+      return; // too short to be worth a recap
+    }
 
     const docStatus = await this.usageService.getStatus(session.userId, 'documents', entitlements.maxDocumentsPerMonth);
-    if (!docStatus.canUse) return; // monthly document cap already hit — stay silent
+    if (!docStatus.canUse) {
+      await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'quota_exceeded' });
+      return; // monthly document cap already hit
+    }
+
+    const transcript = await this.buildVerbatimTranscript(session.conversationId, session);
 
     const summary = await this.claudeService.generateConversationSummaryDocument(history, session.fieldName);
-    if (!summary) return;
+    if (!summary) {
+      await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
+      return;
+    }
+
+    // Code-built from the stored transcript, not model output — guarantees
+    // the "word for word, who said what" section can't be paraphrased or
+    // hallucinated by the model. Spliced in right after Summary, Teams-style.
+    if (transcript) {
+      summary.sections.splice(1, 0, { heading: 'Transcript', content: transcript });
+    }
+    // "Action Points / Next Steps" always last, whatever the model named the
+    // equivalent section (it's asked for "Follow-up Actions").
+    const actionIdx = summary.sections.findIndex((s) => /follow-?up actions?/i.test(s.heading));
+    if (actionIdx !== -1) {
+      const [actionSection] = summary.sections.splice(actionIdx, 1);
+      summary.sections.push({ ...actionSection, heading: 'Action Points / Next Steps' });
+    }
 
     client.emit('document:generating', { title: summary.title, topic: summary.topic, auto: true });
 
@@ -1598,6 +1635,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
 
       await this.usageService.tryConsume(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
+      await this.conversationService.setSummaryStatus(session.conversationId, 'ready', { documentId: result.docId });
 
       client.emit('document:ready', {
         docId: result.docId,
@@ -1618,9 +1656,54 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       this.logger.log(`Auto-summary generated for conversation ${session.conversationId}: ${result.downloadUrl}`);
     } catch (err) {
+      await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
       client.emit('document:failed', { title: summary.title, reason: "We couldn't generate your conversation summary.", auto: true });
       throw err;
     }
+  }
+
+  /**
+   * Word-for-word transcript with real speaker names, Teams-recap style —
+   * built directly from the saved messages (never from a model) so it can't
+   * drift from what was actually said. Resolves 'owner'/'other' against the
+   * session's live display names; multi-speaker messages already carry real
+   * names bracketed per line (see buildMultiSpeakerSegmentDtos) and are
+   * reformatted to match the "Name: text" shape used throughout.
+   */
+  private async buildVerbatimTranscript(conversationId: string, session: ActiveSession): Promise<string> {
+    const messages = await this.conversationService.getConversationMessagesInternal(conversationId);
+    const lines: string[] = [];
+
+    for (const m of messages) {
+      if (m.role === 'assistant') {
+        if (m.content?.trim()) lines.push(`CognIX AI: ${m.content.trim()}`);
+        continue;
+      }
+
+      const text = (m.transcript ?? m.content ?? '').trim();
+      if (!text) continue;
+
+      if (m.speaker_label === 'multiple_speakers') {
+        // Already "[Name]: text" per line — reformat to drop the brackets.
+        for (const rawLine of text.split('\n')) {
+          const match = rawLine.match(/^\[(.+?)\]:\s*(.*)$/);
+          if (match) lines.push(`${match[1]}: ${match[2]}`);
+          else if (rawLine.trim()) lines.push(rawLine.trim());
+        }
+        continue;
+      }
+
+      const speakerName =
+        m.speaker_label === 'owner'
+          ? session.cachedOwnerName
+          : m.speaker_label === 'other'
+            ? (session.otherSpeakerName ?? 'Other Speaker')
+            : session.cachedOwnerName; // single-speaker/text mode — the one human in the conversation
+
+      lines.push(`${speakerName}: ${text}`);
+    }
+
+    return lines.join('\n');
   }
 
   // ─── Multi-speaker prompt processing (Gap 4) ─────────────────────────────────

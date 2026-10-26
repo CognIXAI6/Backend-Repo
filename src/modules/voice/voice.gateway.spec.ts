@@ -320,3 +320,178 @@ describe('VoiceGateway audio:stop finalize-and-drain', () => {
     expect(client.emit).toHaveBeenCalledWith('ai:skipped', { reason: 'empty_transcript' });
   });
 });
+
+describe('VoiceGateway auto-generated conversation summary', () => {
+  function createSummaryGateway() {
+    const conversationService = {
+      getRecentHistoryForAI: jest.fn(),
+      getConversationMessagesInternal: jest.fn().mockResolvedValue([]),
+      setSummaryStatus: jest.fn().mockResolvedValue(undefined),
+    };
+    const claudeService = { generateConversationSummaryDocument: jest.fn() };
+    const documentService = { generateAndUpload: jest.fn() };
+    const usageService = { getStatus: jest.fn().mockResolvedValue({ canUse: true }), tryConsume: jest.fn().mockResolvedValue(undefined) };
+    const pushNotificationService = { sendToUser: jest.fn().mockResolvedValue(undefined) };
+    const noop = {} as any;
+
+    const gateway = new VoiceGateway(
+      noop, claudeService as any, conversationService as any, noop, noop, noop, noop, noop, noop, noop,
+      noop, noop, noop, documentService as any, pushNotificationService as any, noop, usageService as any, noop,
+    ) as any;
+
+    return { gateway, conversationService, claudeService, documentService, usageService, pushNotificationService };
+  }
+
+  const entitlements = { maxDocumentsPerMonth: 5, allowedDocumentDepths: ['brief'] } as any;
+
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  describe('buildVerbatimTranscript', () => {
+    it('resolves owner/other labels to the session’s real names and keeps assistant turns attributed to CognIX AI', async () => {
+      const { gateway, conversationService } = createSummaryGateway();
+      conversationService.getConversationMessagesInternal.mockResolvedValue([
+        { role: 'user', speaker_label: 'owner', content: 'hello there', transcript: 'hello there' },
+        { role: 'user', speaker_label: 'other', content: 'hi back', transcript: 'hi back' },
+        { role: 'assistant', content: 'Nothing to flag.' },
+      ]);
+      const session = createFakeSession({ cachedOwnerName: 'Mr Tolu', otherSpeakerName: 'Dr Amaka' });
+
+      const transcript = await gateway.buildVerbatimTranscript('conv-1', session);
+
+      expect(transcript).toBe('Mr Tolu: hello there\nDr Amaka: hi back\nCognIX AI: Nothing to flag.');
+    });
+
+    it('reformats bracketed multi-speaker lines into "Name: text" without the brackets', async () => {
+      const { gateway, conversationService } = createSummaryGateway();
+      conversationService.getConversationMessagesInternal.mockResolvedValue([
+        { role: 'user', speaker_label: 'multiple_speakers', content: '[Dr Smith]: first point\n[Dr Jones]: second point', transcript: '[Dr Smith]: first point\n[Dr Jones]: second point' },
+      ]);
+      const session = createFakeSession();
+
+      const transcript = await gateway.buildVerbatimTranscript('conv-1', session);
+
+      expect(transcript).toBe('Dr Smith: first point\nDr Jones: second point');
+    });
+  });
+
+  describe('autoGenerateConversationSummary', () => {
+    it('marks skipped with a reason and makes no model/document calls when the tier has no document entitlement', async () => {
+      const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements: { maxDocumentsPerMonth: 0, allowedDocumentDepths: [] } });
+
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      expect(conversationService.setSummaryStatus).toHaveBeenCalledWith(session.conversationId, 'pending');
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'tier_no_documents' });
+      expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
+      expect(documentService.generateAndUpload).not.toHaveBeenCalled();
+    });
+
+    it('marks skipped as too_short for a thin conversation', async () => {
+      const { gateway, conversationService } = createSummaryGateway();
+      conversationService.getRecentHistoryForAI.mockResolvedValue([{ role: 'user', content: 'hi' }]);
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements });
+
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'too_short' });
+    });
+
+    it('marks skipped as quota_exceeded when the monthly document cap is hit', async () => {
+      const { gateway, conversationService, usageService } = createSummaryGateway();
+      conversationService.getRecentHistoryForAI.mockResolvedValue([
+        { role: 'user', content: 'a '.repeat(25) },
+        { role: 'assistant', content: 'b '.repeat(25) },
+      ]);
+      usageService.getStatus.mockResolvedValue({ canUse: false });
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements });
+
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'quota_exceeded' });
+    });
+
+    it('marks failed with generation_error when the model returns nothing usable', async () => {
+      const { gateway, conversationService, claudeService } = createSummaryGateway();
+      conversationService.getRecentHistoryForAI.mockResolvedValue([
+        { role: 'user', content: 'a '.repeat(25) },
+        { role: 'assistant', content: 'b '.repeat(25) },
+      ]);
+      claudeService.generateConversationSummaryDocument.mockResolvedValue(null);
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements });
+
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'failed', { skipReason: 'generation_error' });
+    });
+
+    it('splices a code-built Transcript section after Summary and moves Action Points / Next Steps to the end, landing at exactly 4 sections', async () => {
+      const { gateway, conversationService, claudeService, documentService, usageService } = createSummaryGateway();
+      conversationService.getRecentHistoryForAI.mockResolvedValue([
+        { role: 'user', content: 'a '.repeat(25) },
+        { role: 'assistant', content: 'b '.repeat(25) },
+      ]);
+      conversationService.getConversationMessagesInternal.mockResolvedValue([
+        { role: 'user', speaker_label: 'owner', content: 'hello', transcript: 'hello' },
+      ]);
+      claudeService.generateConversationSummaryDocument.mockResolvedValue({
+        title: 'Quick Sync',
+        topic: 'A quick sync',
+        sections: [
+          { heading: 'Summary', content: 'They synced.' },
+          { heading: 'Key Insights', content: '- Insight one' },
+          { heading: 'Follow-up Actions', content: '- Do the thing' },
+        ],
+      });
+      documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/doc-1' });
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements, cachedOwnerName: 'Mr Tolu' });
+
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      const uploadCall = documentService.generateAndUpload.mock.calls[0][0];
+      expect(uploadCall.sections.map((s: any) => s.heading)).toEqual([
+        'Summary',
+        'Transcript',
+        'Key Insights',
+        'Action Points / Next Steps',
+      ]);
+      expect(uploadCall.sections[1].content).toBe('Mr Tolu: hello');
+      expect(uploadCall.sections[3].content).toBe('- Do the thing');
+
+      expect(usageService.tryConsume).toHaveBeenCalledWith(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready', { documentId: 'doc-1' });
+      expect(client.emit).toHaveBeenCalledWith('document:ready', expect.objectContaining({ docId: 'doc-1', auto: true }));
+    });
+
+    it('marks failed and emits document:failed when the upload step throws, without losing the thrown error', async () => {
+      const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
+      conversationService.getRecentHistoryForAI.mockResolvedValue([
+        { role: 'user', content: 'a '.repeat(25) },
+        { role: 'assistant', content: 'b '.repeat(25) },
+      ]);
+      claudeService.generateConversationSummaryDocument.mockResolvedValue({
+        title: 'Quick Sync',
+        topic: 'A quick sync',
+        sections: [{ heading: 'Summary', content: 'They synced.' }],
+      });
+      documentService.generateAndUpload.mockRejectedValue(new Error('upload failed'));
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements });
+
+      await expect(gateway.autoGenerateConversationSummary(client, session)).rejects.toThrow('upload failed');
+
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'failed', { skipReason: 'generation_error' });
+      expect(client.emit).toHaveBeenCalledWith('document:failed', expect.objectContaining({ auto: true }));
+    });
+  });
+});
