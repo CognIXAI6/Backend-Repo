@@ -213,12 +213,24 @@ export class SpeakersService {
 
     // ── 1. Upload audio regardless of whether the voice service is available ─
     // Preserves the recording for re-enrollment later even if the embedding
-    // service is temporarily down.
-    const uploadResult = await this.uploadService.uploadFile(
-      audioFile,
-      UploadFolder.VOICE_SAMPLES,
-      'video',
-    );
+    // service is temporarily down. Still a genuine failure for the caller
+    // (nothing to enroll without it) — caught only to log which speaker/user
+    // it was for, since UploadService's own logging doesn't know that and a
+    // bare Cloudinary error ("Unsupported video format or file", etc.) is
+    // otherwise untraceable to this endpoint after the fact.
+    let uploadResult: Awaited<ReturnType<UploadService['uploadFile']>>;
+    try {
+      uploadResult = await this.uploadService.uploadFile(
+        audioFile,
+        UploadFolder.VOICE_SAMPLES,
+        'video',
+      );
+    } catch (err) {
+      this.logger.warn(
+        `enrollSpeakerVoice: audio upload failed for speaker ${speakerId} (user ${userId}): ${(err as Error).message}`,
+      );
+      throw err;
+    }
 
     const [voiceSample] = await this.knex('voice_samples')
       .insert({

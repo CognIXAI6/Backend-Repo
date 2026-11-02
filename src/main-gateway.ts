@@ -32,6 +32,12 @@ async function bootstrap() {
 
   app.useLogger(app.get(Logger));
 
+  // Lets VoiceGateway.beforeApplicationShutdown run on SIGTERM/SIGINT (every
+  // `pm2 reload`/`restart`/`stop`) before the socket server actually closes
+  // — without this, Nest never calls application-shutdown lifecycle hooks
+  // at all, and a restart just drops every live voice session silently.
+  app.enableShutdownHooks();
+
   // Kept even though this process's main job is Socket.IO, not REST: a few
   // shared modules' REST controllers (FieldsController, DocumentController,
   // etc.) still get registered here as an accepted side effect of reusing

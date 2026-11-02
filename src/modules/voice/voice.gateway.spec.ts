@@ -248,6 +248,40 @@ describe('VoiceGateway provider recovery', () => {
   });
 });
 
+describe('VoiceGateway beforeApplicationShutdown', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('broadcasts server:restarting to every connected client when sessions are active', async () => {
+    const { gateway } = createGateway();
+    gateway.server = { emit: jest.fn() };
+    gateway.sessions.set('sock-1', createFakeSession());
+    gateway.sessions.set('sock-2', createFakeSession());
+
+    const start = Date.now();
+    await gateway.beforeApplicationShutdown('SIGTERM');
+    const elapsedMs = Date.now() - start;
+
+    expect(gateway.server.emit).toHaveBeenCalledWith(
+      'server:restarting',
+      expect.objectContaining({ message: expect.any(String) }),
+    );
+    expect(elapsedMs).toBeGreaterThanOrEqual(450); // the grace sleep actually ran
+  });
+
+  it('does nothing when there are no active sessions', async () => {
+    const { gateway } = createGateway();
+    gateway.server = { emit: jest.fn() };
+
+    await gateway.beforeApplicationShutdown('SIGTERM');
+
+    expect(gateway.server.emit).not.toHaveBeenCalled();
+  });
+});
+
 describe('VoiceGateway audio:stop finalize-and-drain', () => {
   beforeEach(() => {
     jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);

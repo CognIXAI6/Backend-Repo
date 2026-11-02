@@ -56,6 +56,11 @@ module.exports = {
       max_restarts: 10,
       restart_delay: 3000,
       max_memory_restart: '1G',
+      // Default (1600ms) doesn't leave enough room for
+      // VoiceGateway.beforeApplicationShutdown to broadcast
+      // 'server:restarting' to connected clients and let it actually leave
+      // the process before PM2 SIGKILLs it on reload/restart/stop.
+      kill_timeout: 5000,
       watch: false,
       out_file: 'logs/gateway-out.log',
       error_file: 'logs/gateway-error.log',

@@ -111,7 +111,19 @@ export class DocumentService {
       ? await this.buildPdf(title, enrichedSections)
       : await this.buildDocx(title, enrichedSections);
 
-    const downloadUrl = await this.uploadToCloudinary(buffer, title, format);
+    // uploadToCloudinary has no timeout of its own (the cloudinary SDK
+    // doesn't set one), so a stalled upload — Cloudinary outage, a dropped
+    // connection that never fires an error or a close — previously left
+    // this whole call hanging indefinitely: no success, no thrown error,
+    // forever. That's exactly what left auto-summary generation (and any
+    // user-requested document) stuck on "generating" with nothing after it.
+    // Bounding it here guarantees generateAndUpload always settles one way
+    // or the other.
+    const downloadUrl = await this.withTimeout(
+      this.uploadToCloudinary(buffer, title, format),
+      30_000,
+      'Document upload timed out — the storage provider did not respond in time.',
+    );
 
     const [row] = await this.knex('generated_documents')
       .insert({
@@ -130,6 +142,14 @@ export class DocumentService {
     this.logger.log(`Document saved: id=${docId}, url=${downloadUrl}`);
 
     return { docId, downloadUrl };
+  }
+
+  private withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    let timer: NodeJS.Timeout;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   }
 
   private enrichSectionsWithResearch(

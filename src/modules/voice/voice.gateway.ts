@@ -8,7 +8,7 @@ import {
   OnGatewayConnection,
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
-import { Logger } from '@nestjs/common';
+import { Logger, BeforeApplicationShutdown } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
@@ -236,7 +236,7 @@ interface ActiveSession {
   pingTimeout: 60_000,
   pingInterval: 25_000,
 })
-export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
+export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, BeforeApplicationShutdown {
   @WebSocketServer()
   server: Server;
 
@@ -463,6 +463,39 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   afterInit(): void {
     this.logger.log('🎙️  VoiceGateway live at ws://…/voice');
+  }
+
+  /**
+   * This process runs single-instance, fork-mode under PM2 (see
+   * ecosystem.config.js — session state lives in `sessions`, this process's
+   * memory, with no cross-instance sharing set up) by deliberate design, so
+   * a deploy's `pm2 reload`/`restart` can't be true zero-downtime the way
+   * cluster mode is for the stateless REST API: there's no second instance
+   * to hand live connections off to. Before, that meant every connected
+   * socket just vanished mid-session with no signal at all — indistinguishable
+   * from a random network drop, which is what left the mic UI "rolling"
+   * with nothing behind it after a restart.
+   *
+   * This can't make the restart itself zero-downtime, but it can make it
+   * recognizable: broadcast a distinct event so a client that's listening
+   * for it can show "reconnecting" and stop the mic, instead of hanging.
+   * Nest calls this (and awaits it, since it's async) on SIGTERM/SIGINT
+   * — i.e. every `pm2 reload`/`restart`/`stop` — before the underlying
+   * HTTP/WS server actually closes; app.enableShutdownHooks() in
+   * main-gateway.ts is what wires that up. The brief sleep gives the
+   * emit a moment to actually leave the process before the socket server
+   * closes (paired with a bumped `kill_timeout` in ecosystem.config.js).
+   */
+  async beforeApplicationShutdown(signal?: string): Promise<void> {
+    if (this.sessions.size === 0) return;
+
+    this.logger.warn(
+      `beforeApplicationShutdown(${signal}) — notifying ${this.sessions.size} active voice session(s) before restart`,
+    );
+    this.server.emit('server:restarting', {
+      message: 'The server is restarting for a brief update. Please reconnect in a few seconds.',
+    });
+    await sleep(500);
   }
 
   handleConnection(client: Socket): void {
