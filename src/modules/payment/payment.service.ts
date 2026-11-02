@@ -857,9 +857,32 @@ export class PaymentService {
       `syncSubscription: sub=${subscription.id}, customer=${customerId}, status=${subscription.status}`,
     );
 
-    const user = await this.knex('users').where('stripe_customer_id', customerId).first();
+    let user = await this.knex('users').where('stripe_customer_id', customerId).first();
+
+    // Self-heal: stripe_customer_id lookup can miss — e.g. a subscription
+    // created outside our own createCheckoutSession flow (Payment Link,
+    // Dashboard, or any path that never called getOrCreateStripeCustomer)
+    // never got the ID written to the user's row at all. The subscription's
+    // own metadata carries userId regardless (copied there at checkout
+    // creation, see subscription_data.metadata above) — fall back to it
+    // rather than silently dropping a real, successful payment. Previously
+    // this returned here with just a warning: a webhook that delivered 200
+    // OK could still leave subscriptions/users completely unwritten.
     if (!user) {
-      this.logger.warn(`syncSubscription: no user found for Stripe customer ${customerId} — cannot activate`);
+      const metadataUserId = subscription.metadata?.userId;
+      if (metadataUserId) {
+        user = await this.knex('users').where('id', metadataUserId).first();
+        if (user) {
+          this.logger.warn(
+            `syncSubscription: no user for Stripe customer ${customerId}, recovered via subscription.metadata.userId=${metadataUserId} — backfilling stripe_customer_id`,
+          );
+          await this.knex('users').where('id', user.id).update({ stripe_customer_id: customerId, updated_at: new Date() });
+        }
+      }
+    }
+
+    if (!user) {
+      this.logger.warn(`syncSubscription: no user found for Stripe customer ${customerId} (and no usable metadata.userId) — cannot activate`);
       return;
     }
 

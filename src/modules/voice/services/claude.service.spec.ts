@@ -152,6 +152,32 @@ describe('ClaudeService.streamResponse — generate_document truncated by max_to
   });
 });
 
+describe('ClaudeService — field relevance guidance', () => {
+  it('treats General Knowledge as maximally broad and never tells it to decline for being "too general"', () => {
+    const service = createService();
+    const prompt = service.buildSystemPrompt('General Knowledge');
+
+    expect(prompt).toContain('maximally broad');
+    expect(prompt).not.toContain("switch your field to 'General Knowledge'");
+  });
+
+  it('for every other field, the decline message suggests switching to General Knowledge instead of a dead end', () => {
+    const service = createService();
+    const prompt = service.buildSystemPrompt('Law');
+
+    expect(prompt).not.toContain("I'm focused on helping you professionally. Try asking something related to your work or industry.");
+    expect(prompt).toContain("switch your field to 'General Knowledge'");
+    expect(prompt).toContain("outside Law's professional scope");
+  });
+
+  it('has no field-relevance section at all when no field is set', () => {
+    const service = createService();
+    const prompt = service.buildSystemPrompt();
+
+    expect(prompt).not.toContain('Field relevance guidance');
+  });
+});
+
 describe('ClaudeService — output language directive', () => {
   it('buildSystemPrompt defaults to English and omits the mandatory directive', () => {
     const service = createService();

@@ -623,6 +623,13 @@ If a search returns no results, say so in one short bullet and answer from your 
       ? `\n\n## What you remember about this user from past sessions\n${aiMemory}\n\nUse this context naturally — address the user by name if known, and build on what you already know about them.`
       : `\n\n## Memory\nNo memory loaded yet for this user. If they share personal information (name, profession, goals), acknowledge it warmly and confirm CognIX will remember it for future sessions.`;
 
+    const isGeneralKnowledgeField = this.matchesField(fieldName?.toLowerCase() ?? '', ['general knowledge', 'general', 'generalist']);
+    const declineInstruction = isGeneralKnowledgeField
+      ? `Only decline a request if it is unsafe or inappropriate — never for being too general; general-interest questions are exactly what this field is for. In the rare case you do decline, respond with:
+"I can't help with that one. Try asking something else."`
+      : `Only decline a request if it is clearly recreational or personal with zero professional relevance (e.g. movie recommendations, sports gossip, personal relationships). In that case respond with:
+"That's outside ${fieldName}'s professional scope. For general topics like this, switch your field to 'General Knowledge' in Settings — or ask something related to your work or industry."`;
+
     const fieldContext = fieldName
       ? `\n\nThe user is a professional in the field of: ${fieldName}.
 Tailor your responses to be relevant to their professional context.
@@ -631,8 +638,7 @@ Tailor your responses to be relevant to their professional context.
 Your primary focus is helping this user with topics relevant to "${fieldName}" and adjacent professional areas.
 ${this.getFieldBreadthNote(fieldName)}
 
-Only decline a request if it is clearly recreational or personal with zero professional relevance (e.g. movie recommendations, sports gossip, personal relationships). In that case respond with:
-"I'm focused on helping you professionally. Try asking something related to your work or industry."
+${declineInstruction}
 
 When in doubt — answer. A Business professional asking about engineering, construction, law, or finance is almost certainly asking in a professional context. Adjacency to their field is not a reason to decline.
 
@@ -648,6 +654,10 @@ ${this.getFieldLinkGuide(fieldName)}`
 
   private getFieldBreadthNote(fieldName: string): string {
     const field = fieldName.toLowerCase();
+
+    if (this.matchesField(field, ['general knowledge', 'general', 'generalist'])) {
+      return 'This is the general-purpose, no-specific-profession field — it has no narrower domain to stay adjacent to, so treat it as maximally broad. Trivia, science, how things work, current events, culture, how-to questions, and everyday curiosity are all squarely in scope, not just "adjacent." Only decline something unsafe or inappropriate — never decline a question here for being "too general" or "not professional enough," since general-interest questions are exactly what this field is for.';
+    }
 
     if (this.matchesField(field, ['business', 'entrepreneur', 'startup', 'executive', 'management', 'ceo', 'coo', 'cfo'])) {
       return 'Business is a broad field. Topics like engineering, construction, finance, law, HR, supply chain, real estate, technology, and any industry vertical are ALL within scope — a business professional operates across all of them.';
