@@ -406,6 +406,29 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     client.emit('entitlement:blocked', { reason, message, ...extra });
   }
 
+  // Deliberately NOT routed through emitEntitlementBlocked / 'entitlement:blocked':
+  // that event's existing client handler treats it as a voice/session block and
+  // stops capture. A blocked web search is not a failure of the turn — the AI
+  // still answers (from training knowledge, per the tool_result it's given) —
+  // so it gets its own event and must never be confused with a real block.
+  private emitFeatureUnavailable(
+    client: Socket,
+    payload: {
+      feature: 'web_search';
+      reason: 'quota_exhausted' | 'plan_excluded';
+      message: string;
+      used?: number;
+      limit?: number | null;
+      conversationId: string;
+      turnId: string;
+    },
+  ): void {
+    this.logger.log(
+      `[${client.id}] feature:unavailable — feature=${payload.feature} reason=${payload.reason} turnId=${payload.turnId}`,
+    );
+    client.emit('feature:unavailable', payload);
+  }
+
   /**
    * Read-only check (does not consume) run at every entry point that's
    * about to call processPrompt for an authenticated turn. The actual
@@ -2139,6 +2162,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // Free tier's web search cap (10/mo) — paid tiers carry
       // maxWebSearchesPerMonth: null (unlimited/fair-use) and skip the check.
       let webSearchAllowed = true;
+      let webSearchUsed = 0;
+      let webSearchLimit: number | null = null;
       if (session.entitlements && session.entitlements.maxWebSearchesPerMonth !== null) {
         const searchStatus = await this.usageService.getStatus(
           session.userId,
@@ -2146,7 +2171,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           session.entitlements.maxWebSearchesPerMonth,
         );
         webSearchAllowed = searchStatus.canUse;
+        webSearchUsed = searchStatus.used;
+        webSearchLimit = searchStatus.limit;
       }
+      // A plan with zero allowance ever (limit 0) is excluded from the
+      // feature outright; a plan with some allowance that's run dry this
+      // month is a temporary cap — the client shows a different message
+      // for each, so the two are never collapsed into one reason.
+      const webSearchBlockReason: 'quota_exhausted' | 'plan_excluded' | undefined = webSearchAllowed
+        ? undefined
+        : webSearchLimit === 0
+          ? 'plan_excluded'
+          : 'quota_exhausted';
 
       // Load document context: conversation attachments + field resources (Resources tab).
       const documentContext = await this.conversationService
@@ -2193,6 +2229,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // Stable job ID emitted in document:generating so the client can correlate
       // document:ready / document:failed events back to the originating request.
       const docJobId = documentGenerationEnabled ? randomUUID() : '';
+      // Correlates a feature:unavailable event (e.g. a blocked web search)
+      // back to this specific turn — there's no assistant message id yet at
+      // the point the event fires, since it can happen mid-stream before
+      // the response is saved.
+      const turnId = randomUUID();
 
       let firstToken = true;
       const toolCallFilter = new ToolCallStreamFilter();
@@ -2364,13 +2405,33 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                 }
               }
             : undefined,
+
+          onWebSearchBlocked: (info) => {
+            this.emitFeatureUnavailable(client, {
+              feature: 'web_search',
+              reason: info.reason,
+              message:
+                info.reason === 'plan_excluded'
+                  ? 'Upgrade your account to use this feature.'
+                  : `You've used all ${webSearchLimit} web searches included in your plan this month. Upgrade for more.`,
+              used: webSearchUsed,
+              limit: webSearchLimit,
+              conversationId: session.conversationId,
+              turnId,
+            });
+          },
         },
         {
-          // Enable web search for text requests, and for voice turns that
+          // Offer web search for text requests, and for voice turns that
           // look document-adjacent (so a voice-triggered document still
           // gets research-enriched) — voice search stays off by default
-          // for response latency otherwise.
-          enableWebSearch: webSearchAllowed && (inputType === 'text' || documentIntentHint),
+          // for response latency otherwise. Offered independently of quota:
+          // the tool stays registered even when blocked, so Claude's own
+          // tool-use judgment — not a keyword guess — is what determines
+          // whether a search was actually needed this turn; see
+          // webSearchBlockReason for how a needed-but-blocked call is handled.
+          enableWebSearch: inputType === 'text' || documentIntentHint,
+          webSearchBlockReason,
           enableDocumentGeneration: documentGenerationEnabled,
           // Include every image attached to this conversation on every call.
           images: visionImages.length > 0 ? visionImages : undefined,

@@ -85,6 +85,103 @@ describe('ClaudeService.streamResponse — empty web search results', () => {
   });
 });
 
+describe('ClaudeService.streamResponse — blocked web search', () => {
+  function streamWithOneWebSearchCall() {
+    const firstStreamEvents = [
+      { type: 'message_start', message: { usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', content_block: { type: 'tool_use', id: 'tool-1', name: 'web_search' } },
+      { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{"query":"today\'s exchange rate"}' } },
+      { type: 'message_delta', usage: { output_tokens: 5 } },
+    ];
+    const firstFinalMessage = {
+      stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: 'tool-1', name: 'web_search', input: { query: "today's exchange rate" } }],
+    };
+    const followUpEvents = [
+      { type: 'content_block_delta', delta: { type: 'text_delta', text: '- Answering from training knowledge.' } },
+      { type: 'message_delta', usage: { output_tokens: 3 } },
+    ];
+    return jest
+      .fn()
+      .mockReturnValueOnce(createFakeStream(firstStreamEvents, firstFinalMessage))
+      .mockReturnValueOnce(createFakeStream(followUpEvents, {}));
+  }
+
+  it('intercepts an actual tool-use call instead of hitting Tavily, and fires onWebSearchBlocked once', async () => {
+    const service = createService() as any;
+    const streamMock = streamWithOneWebSearchCall();
+    const tavilySearch = jest.fn();
+
+    service.client = { messages: { stream: streamMock } };
+    service.tavilyClient = { search: tavilySearch };
+    service.model = 'test-model';
+
+    const onWebSearchBlocked = jest.fn();
+    const callbacks = { onToken: jest.fn(), onDone: jest.fn(), onError: jest.fn(), onWebSearchBlocked };
+
+    await service.streamResponse("what's today's exchange rate", [], 'system prompt', callbacks, {
+      enableWebSearch: true,
+      webSearchBlockReason: 'quota_exhausted',
+    });
+
+    expect(tavilySearch).not.toHaveBeenCalled();
+    expect(onWebSearchBlocked).toHaveBeenCalledTimes(1);
+    expect(onWebSearchBlocked).toHaveBeenCalledWith({ query: "today's exchange rate", reason: 'quota_exhausted' });
+
+    const followUpCallArgs = streamMock.mock.calls[1][0];
+    const toolResultMessage = followUpCallArgs.messages.find((m: any) => m.role === 'user' && Array.isArray(m.content));
+    expect(toolResultMessage.content[0].content).toContain('Live web search is not available');
+
+    // onDone's webSearchCalls count must not include the blocked call — it
+    // never ran, so it must never be metered against the user's quota.
+    expect(callbacks.onDone).toHaveBeenCalledWith(expect.any(String), expect.any(Number), expect.any(Number), 0);
+  });
+
+  it('never calls onWebSearchBlocked for a turn where Claude never asks to search', async () => {
+    const service = createService() as any;
+    const streamMock = jest.fn().mockReturnValueOnce(
+      createFakeStream(
+        [{ type: 'content_block_delta', delta: { type: 'text_delta', text: '- Plain answer, no search needed.' } }],
+        { stop_reason: 'end_turn', content: [] },
+      ),
+    );
+    service.client = { messages: { stream: streamMock } };
+    service.tavilyClient = { search: jest.fn() };
+    service.model = 'test-model';
+
+    const onWebSearchBlocked = jest.fn();
+    const callbacks = { onToken: jest.fn(), onDone: jest.fn(), onError: jest.fn(), onWebSearchBlocked };
+
+    await service.streamResponse('hello', [], 'system prompt', callbacks, {
+      enableWebSearch: true,
+      webSearchBlockReason: 'quota_exhausted',
+    });
+
+    expect(onWebSearchBlocked).not.toHaveBeenCalled();
+  });
+
+  it('runs the real search normally when no block reason is set, even with a quota-capable tier', async () => {
+    const service = createService() as any;
+    const streamMock = streamWithOneWebSearchCall();
+    const tavilySearch = jest.fn().mockResolvedValue({ results: [{ title: 'T', content: 'C', url: 'https://x' }] });
+
+    service.client = { messages: { stream: streamMock } };
+    service.tavilyClient = { search: tavilySearch };
+    service.model = 'test-model';
+
+    const onWebSearchBlocked = jest.fn();
+    const callbacks = { onToken: jest.fn(), onDone: jest.fn(), onError: jest.fn(), onWebSearchBlocked };
+
+    await service.streamResponse("what's today's exchange rate", [], 'system prompt', callbacks, {
+      enableWebSearch: true,
+    });
+
+    expect(tavilySearch).toHaveBeenCalledTimes(1);
+    expect(onWebSearchBlocked).not.toHaveBeenCalled();
+    expect(callbacks.onDone).toHaveBeenCalledWith(expect.any(String), expect.any(Number), expect.any(Number), 1);
+  });
+});
+
 describe('ClaudeService.streamResponse — generate_document truncated by max_tokens', () => {
   it('reports a clear failure instead of silently dropping the whole turn', async () => {
     const service = createService() as any;

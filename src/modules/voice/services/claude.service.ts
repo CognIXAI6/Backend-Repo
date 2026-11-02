@@ -24,6 +24,14 @@ export interface ClaudeStreamCallbacks {
   onError: (error: Error) => void;
   /** Called when Claude requests document generation. Must return the download URL. */
   onDocumentRequest?: (req: DocumentRequest) => Promise<{ downloadUrl: string; docId: string }>;
+  /**
+   * Called when Claude actually attempted a web search this turn (a real
+   * tool-use call, not a keyword guess) but it was intercepted because
+   * `webSearchBlockReason` was set — never fired for a search that ran.
+   * Lets the caller tell the client a live search was needed and skipped,
+   * without touching onDone/onError or the turn's success/failure state.
+   */
+  onWebSearchBlocked?: (info: { query: string; reason: 'quota_exhausted' | 'plan_excluded' }) => void;
 }
 
 export interface ConversationTurn {
@@ -172,6 +180,18 @@ export class ClaudeService implements OnModuleInit {
       maxTokens?: number;
       /** Images attached to the conversation, included on every call. */
       images?: ConversationImage[];
+      /**
+       * Set when web search is offered (enableWebSearch: true) but this
+       * user/turn can't actually use it right now — plan exclusion or
+       * exhausted monthly quota. The tool stays registered so Claude's own
+       * judgment decides whether a search was actually needed (never a
+       * keyword guess on the message); if Claude does call it, the call is
+       * intercepted instead of hitting Tavily, Claude is told to answer
+       * from training knowledge, and onWebSearchBlocked fires once per
+       * attempted call. Ordinary turns that never call the tool produce no
+       * signal at all.
+       */
+      webSearchBlockReason?: 'quota_exhausted' | 'plan_excluded';
     } = {},
   ): Promise<void> {
     // Sanitize history: if content is somehow an array (defensive against DB edge cases),
@@ -351,7 +371,10 @@ export class ClaudeService implements OnModuleInit {
         const docGenCalls = collectedToolCalls.filter(
           (tc) => tc.name === 'generate_document' && callbacks.onDocumentRequest,
         );
-        totalWebSearchCalls += webSearchCalls.length;
+        // A blocked search never hits Tavily and never counts toward the
+        // caller's monthly web-search usage — only a search that actually
+        // ran should be metered.
+        totalWebSearchCalls += options.webSearchBlockReason ? 0 : webSearchCalls.length;
 
         if (webSearchCalls.length === 0 && docGenCalls.length === 0) {
           // No tool use this round — fullText is the real answer. Done.
@@ -378,6 +401,22 @@ export class ClaudeService implements OnModuleInit {
           webSearchCalls.map(async (tc) => {
             let query = userMessage;
             try { query = (JSON.parse(tc.inputJson) as { query: string }).query; } catch {}
+
+            // Claude actually asked to search — this IS the "search was
+            // needed for this turn" signal the caller wants, straight from
+            // the model's own tool-use judgment rather than a keyword guess
+            // on the user's message. Intercept instead of hitting Tavily.
+            if (options.webSearchBlockReason) {
+              this.logger.log(`  → web search blocked (${options.webSearchBlockReason}): "${query}"`);
+              searchResultsMap.set(
+                tc.id,
+                'Live web search is not available on this account right now (plan limit). ' +
+                  'Answer using your training knowledge only, and briefly note that live/current ' +
+                  'results were not used for this reply.',
+              );
+              callbacks.onWebSearchBlocked?.({ query, reason: options.webSearchBlockReason });
+              return;
+            }
 
             this.logger.log(`  → searching: "${query}"`);
 

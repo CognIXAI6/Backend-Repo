@@ -355,6 +355,110 @@ describe('VoiceGateway audio:stop finalize-and-drain', () => {
   });
 });
 
+describe('VoiceGateway processPrompt — blocked web search signal', () => {
+  function createProcessPromptGateway(opts: { webSearchStatus: { canUse: boolean; used: number; limit: number | null } }) {
+    const conversationService = {
+      getRecentHistoryForAI: jest.fn().mockResolvedValue([]),
+      saveMessage: jest.fn().mockResolvedValue(undefined),
+      getFullDocumentContext: jest.fn().mockResolvedValue(null),
+      getConversationImagesForAI: jest.fn().mockResolvedValue([]),
+      setTitle: jest.fn().mockResolvedValue(false),
+    };
+    const usageService = {
+      getStatus: jest.fn((_userId: string, kind: string) =>
+        kind === 'web_searches' ? Promise.resolve(opts.webSearchStatus) : Promise.resolve({ canUse: true, used: 0, limit: 10 }),
+      ),
+      tryConsume: jest.fn().mockResolvedValue(undefined),
+    };
+    const settingsService = { getEffectiveLanguage: jest.fn().mockResolvedValue('en') };
+    const claudeService = {
+      buildSystemPrompt: jest.fn().mockReturnValue('system prompt'),
+      generateConversationTitle: jest.fn().mockResolvedValue('Title'),
+      streamResponse: jest.fn(),
+    };
+    const noop = {} as any;
+
+    const gateway = new VoiceGateway(
+      noop, claudeService as any, conversationService as any, noop, noop, noop, noop, noop, noop, noop,
+      noop, noop, noop, noop, noop, noop, usageService as any, settingsService as any,
+    ) as any;
+
+    return { gateway, claudeService, usageService, conversationService };
+  }
+
+  const entitlements = { maxWebSearchesPerMonth: 10, maxMessagesPerMonth: 500 } as any;
+
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('emits feature:unavailable when Claude actually attempts a search this turn and quota is exhausted', async () => {
+    const { gateway, claudeService } = createProcessPromptGateway({
+      webSearchStatus: { canUse: false, used: 10, limit: 10 },
+    });
+    claudeService.streamResponse.mockImplementation(async (_msg: string, _hist: unknown, _sys: string, callbacks: any) => {
+      callbacks.onWebSearchBlocked({ query: 'current exchange rate', reason: 'quota_exhausted' });
+      await callbacks.onDone('Here is my best answer without live search.', 10, 5, 0);
+    });
+    const client = createFakeClient('sock-1');
+    const session = createFakeSession({ entitlements });
+
+    await gateway.processPrompt(client, session, "what's today's exchange rate", 'text');
+
+    expect(client.emit).toHaveBeenCalledWith(
+      'feature:unavailable',
+      expect.objectContaining({
+        feature: 'web_search',
+        reason: 'quota_exhausted',
+        used: 10,
+        limit: 10,
+        conversationId: session.conversationId,
+        turnId: expect.any(String),
+      }),
+    );
+    // The streamResponse call itself must still offer the tool (so Claude can
+    // decide), not silently drop it — only execution is intercepted.
+    const optsArg = claudeService.streamResponse.mock.calls[0][4];
+    expect(optsArg.enableWebSearch).toBe(true);
+    expect(optsArg.webSearchBlockReason).toBe('quota_exhausted');
+  });
+
+  it('does not emit feature:unavailable for an ordinary turn that never attempts a search, even with quota exhausted', async () => {
+    const { gateway, claudeService } = createProcessPromptGateway({
+      webSearchStatus: { canUse: false, used: 10, limit: 10 },
+    });
+    claudeService.streamResponse.mockImplementation(async (_msg: string, _hist: unknown, _sys: string, callbacks: any) => {
+      // Claude never calls onWebSearchBlocked — this turn didn't need a search.
+      await callbacks.onDone('Hello! How can I help today?', 5, 5, 0);
+    });
+    const client = createFakeClient('sock-2');
+    const session = createFakeSession({ entitlements });
+
+    await gateway.processPrompt(client, session, 'hello', 'text');
+
+    expect(client.emit).not.toHaveBeenCalledWith('feature:unavailable', expect.anything());
+  });
+
+  it('does not emit feature:unavailable when quota allows the search to run normally', async () => {
+    const { gateway, claudeService } = createProcessPromptGateway({
+      webSearchStatus: { canUse: true, used: 2, limit: 10 },
+    });
+    claudeService.streamResponse.mockImplementation(async (_msg: string, _hist: unknown, _sys: string, callbacks: any) => {
+      await callbacks.onDone('Here is the current rate.', 10, 5, 1);
+    });
+    const client = createFakeClient('sock-3');
+    const session = createFakeSession({ entitlements });
+
+    await gateway.processPrompt(client, session, "what's today's exchange rate", 'text');
+
+    expect(client.emit).not.toHaveBeenCalledWith('feature:unavailable', expect.anything());
+    const optsArg = claudeService.streamResponse.mock.calls[0][4];
+    expect(optsArg.webSearchBlockReason).toBeUndefined();
+  });
+});
+
 describe('VoiceGateway auto-generated conversation summary', () => {
   function createSummaryGateway() {
     const conversationService = {
