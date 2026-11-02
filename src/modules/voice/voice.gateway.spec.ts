@@ -494,4 +494,60 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       expect(client.emit).toHaveBeenCalledWith('document:failed', expect.objectContaining({ auto: true }));
     });
   });
+
+  describe('handleDisconnect — same auto-summary treatment as an explicit session:end', () => {
+    it('generates the auto-summary on a raw disconnect when session:end was never emitted', async () => {
+      const { gateway, conversationService } = createSummaryGateway();
+      const client = createFakeClient('sock-1');
+      // No entitlements -> autoGenerateConversationSummary takes the cheap
+      // tier_no_documents skip path; the point of this test is that it runs
+      // at all on a bare disconnect, not the full generation flow (already
+      // covered above).
+      const session = createFakeSession();
+      gateway.sessions.set(client.id, session);
+
+      await gateway.handleDisconnect(client);
+      // handleDisconnect fires the summary fire-and-forget rather than
+      // awaiting it (same as handleSessionEnd) — flush the microtask queue
+      // so it has a chance to run before asserting on it.
+      await new Promise((r) => setImmediate(r));
+
+      expect(conversationService.setSummaryStatus).toHaveBeenCalledWith(session.conversationId, 'pending');
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'tier_no_documents' });
+      expect(gateway.sessions.has(client.id)).toBe(false);
+    });
+
+    it('does not double-generate when session:end already ran for this socket', async () => {
+      const { gateway, conversationService } = createSummaryGateway();
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession();
+      gateway.sessions.set(client.id, session);
+
+      await gateway.handleSessionEnd(client); // runs cleanupSession, removes from map
+      await new Promise((r) => setImmediate(r)); // let its own fire-and-forget settle first
+      conversationService.setSummaryStatus.mockClear();
+
+      await gateway.handleDisconnect(client); // session already gone — must be a no-op
+      await new Promise((r) => setImmediate(r));
+
+      expect(conversationService.setSummaryStatus).not.toHaveBeenCalled();
+    });
+
+    it('flushes pending multi-speaker turns before cleanupSession clears their buffers', async () => {
+      const { gateway } = createSummaryGateway();
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({
+        isMultiSpeaker: true,
+        pendingMultiSpeakerTurns: [{ speakerId: 's1', text: 'hello' }],
+      });
+      gateway.sessions.set(client.id, session);
+
+      const flushSpy = jest.spyOn(gateway, 'flushMultiSpeakerTurns').mockResolvedValue(true);
+
+      await gateway.handleDisconnect(client);
+
+      expect(flushSpy).toHaveBeenCalledWith(client, session, { reason: 'session_end', minWords: 1 });
+      expect(gateway.sessions.has(client.id)).toBe(false);
+    });
+  });
 });

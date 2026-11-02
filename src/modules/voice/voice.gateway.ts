@@ -482,8 +482,32 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
   }
 
-  handleDisconnect(client: Socket): void {
+  // A "stop" that reaches us as a raw socket drop (app closed, network
+  // loss, or a client that tears down the connection instead of emitting
+  // session:end first) must still get the same auto-summary treatment as
+  // an explicit session:end — otherwise the conversation stop silently lost
+  // its moment to generate anything. Read the session out of the map BEFORE
+  // cleanupSession deletes it; if session:end already ran for this socket
+  // (the normal "stop button" path), the session is already gone here and
+  // this whole block is a no-op — never a double-generate.
+  async handleDisconnect(client: Socket): Promise<void> {
     this.logger.log(`Client disconnected: ${client.id}`);
+    const session = this.sessions.get(client.id);
+
+    // Same ordering requirement as handleSessionEnd: flush before
+    // cleanupSession clears the buffers it reads.
+    if (session?.isMultiSpeaker && session.pendingMultiSpeakerTurns.length > 0) {
+      await this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 }).catch(
+        (err) => this.logger.error('disconnect flush failed:', err),
+      );
+    }
+
+    if (session && !session.isGuest) {
+      this.finalizeSessionOnExit(client, session).catch((err) =>
+        this.logger.error(`Auto-summary on disconnect failed for conversation ${session.conversationId}:`, err),
+      );
+    }
+
     this.cleanupSession(client.id);
   }
 
@@ -620,12 +644,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         ({ tier, entitlements } = await this.entitlementsService.getUserEntitlements(userId));
 
         if (!entitlements.allowedVoiceModes.includes(mode)) {
+          // Checked here, before the Deepgram connect below, so a blocked
+          // user gets this immediately instead of the mic UI sitting open
+          // waiting on a "ready" event that will never arrive.
           this.emitEntitlementBlocked(
             client,
             'mode_not_permitted',
-            mode === 'multiple_speaker'
-              ? 'Group meeting mode (3+ speakers) is available on the Xpress plan. Please upgrade to continue.'
-              : 'Dual-speaker conversations require a paid plan. Please upgrade to continue.',
+            'Upgrade your account to use this feature.',
             { mode, tier },
           );
           return;
@@ -1533,7 +1558,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const session = this.sessions.get(client.id);
 
     // Flush any pending multi-speaker turns before tearing down so they are
-    // not silently discarded when the user stops recording.
+    // not silently discarded when the user stops recording. Must be awaited
+    // here, before cleanupSession below clears the buffers it reads.
     if (session?.isMultiSpeaker && session.pendingMultiSpeakerTurns.length > 0) {
       await this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 }).catch(
         (err) => this.logger.error('session:end flush failed:', err),
@@ -1541,21 +1567,33 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     if (session && !session.isGuest) {
-      this.saveSessionMemory(session).catch((err) =>
-        this.logger.error('Memory save failed:', err),
-      );
       // Fire-and-forget: the client disconnects its socket immediately after
       // emitting session:end (doesn't wait for any ack), so this routinely
       // finishes after the live connection is already gone — delivery is via
       // the conversation's document list + push notification, same as any
       // document generated mid-conversation after the user has moved on.
-      this.autoGenerateConversationSummary(client, session).catch((err) =>
+      this.finalizeSessionOnExit(client, session).catch((err) =>
         this.logger.error(`Auto-summary failed for conversation ${session.conversationId}:`, err),
       );
     }
 
     this.cleanupSession(client.id);
     client.emit('session:ended');
+  }
+
+  /**
+   * Shared non-blocking tail of a session's lifecycle: persists AI memory
+   * and generates the auto-summary document. Called from both an explicit
+   * session:end and a raw socket disconnect (see handleDisconnect) so a
+   * "stop" that never emits session:end — app killed, network drop, a
+   * client that just closes the socket instead of signalling first — still
+   * gets the same auto-summary treatment. Does NOT include the
+   * multi-speaker flush: that must be awaited by the caller before
+   * cleanupSession clears the buffers it depends on, so it can't live here.
+   */
+  private async finalizeSessionOnExit(client: Socket, session: ActiveSession): Promise<void> {
+    this.saveSessionMemory(session).catch((err) => this.logger.error('Memory save failed:', err));
+    await this.autoGenerateConversationSummary(client, session);
   }
 
   /**
@@ -2047,7 +2085,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       if (documentGenerationEnabled && session.entitlements) {
         if (session.entitlements.maxDocumentsPerMonth <= 0) {
           documentGenerationEnabled = false;
-          documentUnavailableReason = 'Document generation is available on paid plans. Please upgrade to continue.';
+          documentUnavailableReason = 'Upgrade your account to use this feature.';
         } else {
           documentUsageLimit = session.entitlements.maxDocumentsPerMonth;
           const docStatus = await this.usageService.getStatus(session.userId, 'documents', documentUsageLimit);
