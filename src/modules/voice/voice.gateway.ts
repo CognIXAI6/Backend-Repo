@@ -32,6 +32,7 @@ import { ProviderSessionState, ProviderCloseInfo } from './interfaces/provider-s
 import { ProviderDisruptionReason } from './interfaces/voice-events.types';
 import { computeBackoffDelayMs, sleep, PROVIDER_RECOVERY_MAX_ATTEMPTS } from './utils/backoff.util';
 import { ToolCallStreamFilter } from './utils/tool-call-stream-filter.util';
+import { wrapPcm16AsWav } from './utils/pcm-wav.util';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
 import { PlanEntitlements, PlanType } from '@/modules/entitlements/entitlements.types';
@@ -2447,6 +2448,24 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── Single-speaker owner voice profile ──────────────────────────────────────
 
+  /**
+   * Native mobile clients stream raw linear16 PCM with no container at all
+   * (see providerConnectOptions.audioFormat) — unlike web's MediaRecorder
+   * output, which already carries a real WebM/Opus header. Deepgram is fine
+   * with the raw stream (it's told the encoding explicitly over the
+   * connection), but anything built from that same captured buffer and
+   * handed to Cloudinary needs a real container first, or Cloudinary's
+   * format auto-detection rejects it outright — consistently, not
+   * occasionally, since raw PCM never has recognizable file-format bytes.
+   * No-op for web/container sessions, where audioFormat is undefined and
+   * the buffer already has a valid header from the first chunk.
+   */
+  private prepareAudioForUpload(session: ActiveSession, audioData: Buffer): Buffer {
+    const format = session.providerConnectOptions.audioFormat;
+    if (format?.encoding !== 'linear16') return audioData;
+    return wrapPcm16AsWav(audioData, format.sampleRate ?? 16000, format.channels ?? 1);
+  }
+
   private async buildSingleSpeakerVoiceProfile(client: Socket, session: ActiveSession): Promise<void> {
     this.logger.log(
       `[${client.id}] Building owner voice profile from single-speaker session (${session.audioBufferBytes} bytes, ${session.singleSpeakerSpeechSeconds.toFixed(1)} s speech)`,
@@ -2458,7 +2477,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     try {
       const uploadResult = await this.uploadService.uploadBuffer(
-        audioData,
+        this.prepareAudioForUpload(session, audioData),
         UploadFolder.VOICE_SAMPLES,
         `voice-profile-${session.userId}`,
         'video',
@@ -2504,7 +2523,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     try {
       const uploadResult = await this.uploadService.uploadBuffer(
-        audioData,
+        this.prepareAudioForUpload(session, audioData),
         UploadFolder.VOICE_SAMPLES,
         `voice-cal-${client.id}`,
         'video',
@@ -2607,7 +2626,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let audioUrl: string;
     try {
       const uploadResult = await this.uploadService.uploadBuffer(
-        audioData,
+        this.prepareAudioForUpload(session, audioData),
         UploadFolder.VOICE_SAMPLES,
         `spk-id-${client.id}-${deepgramSpeakerId}`,
         'video',
@@ -2797,7 +2816,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let audioUrl: string;
     try {
       const uploadResult = await this.uploadService.uploadBuffer(
-        audioData, UploadFolder.VOICE_SAMPLES, `multi-spk-id-${client.id}-${deepgramSpeakerId}`, 'video',
+        this.prepareAudioForUpload(session, audioData), UploadFolder.VOICE_SAMPLES, `multi-spk-id-${client.id}-${deepgramSpeakerId}`, 'video',
       );
       audioUrl = uploadResult.secure_url;
     } catch (err) {

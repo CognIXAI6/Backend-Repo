@@ -248,6 +248,46 @@ describe('VoiceGateway provider recovery', () => {
   });
 });
 
+describe('VoiceGateway.prepareAudioForUpload — mobile raw PCM vs web container audio', () => {
+  it('wraps raw linear16 PCM in a WAV header for native mobile sessions', () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession({
+      providerConnectOptions: { diarize: false, utteranceEndMs: 1500, meetingMode: false, audioFormat: { encoding: 'linear16', sampleRate: 16000, channels: 1 } },
+    });
+    const pcm = Buffer.from([9, 9, 9, 9]);
+
+    const result = gateway.prepareAudioForUpload(session, pcm);
+
+    expect(result.length).toBe(44 + pcm.length);
+    expect(result.toString('ascii', 0, 4)).toBe('RIFF'); // actually WAV-wrapped, not passed through raw
+    expect(result.subarray(44)).toEqual(pcm);
+  });
+
+  it('leaves web/container audio (already has a real header) untouched', () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession({
+      providerConnectOptions: { diarize: false, utteranceEndMs: 1500, meetingMode: false, audioFormat: undefined },
+    });
+    const webmChunk = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]); // EBML/WebM magic bytes
+
+    const result = gateway.prepareAudioForUpload(session, webmChunk);
+
+    expect(result).toBe(webmChunk); // same reference — no copy, no wrapping
+  });
+
+  it('defaults to 16kHz mono when the format hint omits sampleRate/channels', () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession({
+      providerConnectOptions: { diarize: false, utteranceEndMs: 1500, meetingMode: false, audioFormat: { encoding: 'linear16' } },
+    });
+
+    const result = gateway.prepareAudioForUpload(session, Buffer.from([1, 2]));
+
+    expect(result.readUInt32LE(24)).toBe(16000); // sample rate
+    expect(result.readUInt16LE(22)).toBe(1); // channels
+  });
+});
+
 describe('VoiceGateway beforeApplicationShutdown', () => {
   beforeEach(() => {
     jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
