@@ -3,11 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import { Resend } from 'resend';
 import * as nodemailer from 'nodemailer';
 
+export interface EmailAttachment {
+  filename: string;
+  content: Buffer;
+}
+
 interface EmailOptions {
   to: string;
   subject: string;
   html: string;
   text?: string;
+  attachments?: EmailAttachment[];
 }
 
 @Injectable()
@@ -47,13 +53,14 @@ async sendEmail(options: EmailOptions): Promise<void> {
         to: options.to,
         subject: options.subject,
         html: options.html,
+        attachments: options.attachments,
       });
-      
+
       if (error) {
         this.logger.error(`Resend API error:`, error);
         throw new Error(`Resend failed: ${error.message}`);
       }
-      
+
       this.logger.log(`Email sent via Resend. ID: ${data?.id}`);
     } else if (this.transporter) {
       const info = await this.transporter.sendMail({
@@ -62,6 +69,7 @@ async sendEmail(options: EmailOptions): Promise<void> {
           subject: options.subject,
           html: options.html,
           text: options.text,
+          attachments: options.attachments,
         });
       this.logger.log(`Email sent via Nodemailer. MessageId: ${info.messageId}`);
     } else {
@@ -336,6 +344,52 @@ async sendEmail(options: EmailOptions): Promise<void> {
           <p style="color:#666;font-size:12px;margin-top:20px;">Sent automatically by CognIX API — ${new Date().toISOString()}</p>
         </div>
       `,
+    });
+  }
+
+  /**
+   * Sent the moment an automatic conversation-summary document finishes
+   * generating — for users who close the app/tab before the live
+   * document:ready event would ever reach them. PDF attachment, not the
+   * stored .docx: mobile mail apps (iOS Mail, Gmail on Android) preview PDF
+   * inline via the OS's native renderer, where .docx commonly falls back to
+   * "download and open in Word" instead. Doesn't touch the in-app copy —
+   * that stays .docx, this is purely what's attached to the email.
+   */
+  async sendConversationSummaryEmail(
+    email: string,
+    conversationTitle: string,
+    attachment: EmailAttachment,
+  ): Promise<void> {
+    const frontendUrl = this.configService.get('app.frontendUrl');
+
+    await this.sendEmail({
+      to: email,
+      subject: `Your summary is here for ${conversationTitle}`,
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+            .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+            .button { display: inline-block; padding: 12px 24px; background-color: #2563eb; color: white; text-decoration: none; border-radius: 8px; }
+            .footer { margin-top: 30px; font-size: 12px; color: #666; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>Your summary is ready</h1>
+            <p>The summary for <strong>${conversationTitle}</strong> has been generated and is attached to this email as a PDF.</p>
+            ${frontendUrl ? `<p><a href="${frontendUrl}" class="button">Open in CognIX AI</a></p>` : ''}
+            <div class="footer">
+              <p>This is an automatic notification from CognIX AI.</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `,
+      attachments: [attachment],
     });
   }
 

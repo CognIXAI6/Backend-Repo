@@ -1769,12 +1769,44 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         })
         .catch((err) => this.logger.warn(`Push notification failed for auto-summary ${result.docId}:`, err));
 
+      // Fire-and-forget, same as the push notification above: for a user
+      // who's already closed the app, this is the one delivery channel that
+      // doesn't depend on a live connection or a notification permission.
+      this.sendSummaryReadyEmail(session, summary).catch((err) =>
+        this.logger.warn(`Summary-ready email failed for conversation ${session.conversationId}:`, err),
+      );
+
       this.logger.log(`Auto-summary generated for conversation ${session.conversationId}: ${result.downloadUrl}`);
     } catch (err) {
       await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
       client.emit('document:failed', { title: summary.title, reason: "We couldn't generate your conversation summary.", auto: true });
       throw err;
     }
+  }
+
+  /**
+   * PDF attachment, not the stored .docx — see EmailService.sendConversationSummaryEmail
+   * for why. Generated fresh from the same sections already used for the
+   * stored document, not derived from it, so no extra upload/round-trip is
+   * needed just to get bytes to attach.
+   */
+  private async sendSummaryReadyEmail(
+    session: ActiveSession,
+    summary: { title: string; sections: Array<{ heading: string; content: string }> },
+  ): Promise<void> {
+    if (session.isGuest) return;
+
+    const user = await this.usersService.findById(session.userId);
+    if (!user?.email) return;
+
+    const conversationTitle = (await this.conversationService.getConversationTitle(session.conversationId)) ?? summary.title;
+    const pdfBuffer = await this.documentService.buildSummaryPdfBuffer(summary.title, summary.sections);
+    const filename = `${summary.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'conversation-summary'}.pdf`;
+
+    await this.emailService.sendConversationSummaryEmail(user.email, conversationTitle, {
+      filename,
+      content: pdfBuffer,
+    });
   }
 
   /**

@@ -320,6 +320,17 @@ export class ConversationService {
   }
 
   /**
+   * The conversation's own title — e.g. for the summary-ready email's
+   * "{{Conversation Name}}", which should read like the sidebar entry the
+   * user actually clicked into, not whatever title the generated document
+   * itself picked (the two commonly differ in wording).
+   */
+  async getConversationTitle(conversationId: string): Promise<string | null> {
+    const row = await this.knex('conversations').where('id', conversationId).first('title');
+    return row?.title ?? null;
+  }
+
+  /**
    * Sets an AI-generated title on the conversation.
    * Only updates when the title is still NULL — never overwrites a user-set or
    * previously generated title. Returns whether the update actually happened

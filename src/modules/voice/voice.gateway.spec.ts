@@ -506,19 +506,25 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       getConversationMessagesInternal: jest.fn().mockResolvedValue([]),
       setSummaryStatus: jest.fn().mockResolvedValue(undefined),
       saveMessage: jest.fn().mockResolvedValue({ id: 'msg-1' }),
+      getConversationTitle: jest.fn().mockResolvedValue('My Conversation'),
     };
     const claudeService = { generateConversationSummaryDocument: jest.fn() };
-    const documentService = { generateAndUpload: jest.fn() };
+    const documentService = {
+      generateAndUpload: jest.fn(),
+      buildSummaryPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf-bytes')),
+    };
     const usageService = { getStatus: jest.fn().mockResolvedValue({ canUse: true }), tryConsume: jest.fn().mockResolvedValue(undefined) };
     const pushNotificationService = { sendToUser: jest.fn().mockResolvedValue(undefined) };
+    const usersService = { findById: jest.fn().mockResolvedValue({ id: 'user-1', email: 'owner@example.com' }) };
+    const emailService = { sendConversationSummaryEmail: jest.fn().mockResolvedValue(undefined) };
     const noop = {} as any;
 
     const gateway = new VoiceGateway(
-      noop, claudeService as any, conversationService as any, noop, noop, noop, noop, noop, noop, noop,
+      noop, claudeService as any, conversationService as any, noop, noop, noop, usersService as any, noop, emailService as any, noop,
       noop, noop, noop, documentService as any, pushNotificationService as any, noop, usageService as any, noop,
     ) as any;
 
-    return { gateway, conversationService, claudeService, documentService, usageService, pushNotificationService };
+    return { gateway, conversationService, claudeService, documentService, usageService, pushNotificationService, usersService, emailService };
   }
 
   const entitlements = { maxDocumentsPerMonth: 5, allowedDocumentDepths: ['brief'] } as any;
@@ -712,6 +718,97 @@ describe('VoiceGateway auto-generated conversation summary', () => {
           documentId: 'doc-1',
         }),
       );
+    });
+
+    describe('summary-ready email', () => {
+      function mockSuccessfulGeneration(claudeService: any, documentService: any) {
+        claudeService.generateConversationSummaryDocument.mockResolvedValue({
+          title: 'Quick Sync',
+          topic: 'A quick sync',
+          sections: [{ heading: 'Summary', content: 'They synced.' }],
+        });
+        documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/doc-1' });
+      }
+
+      it('emails the user a PDF attachment of the summary once it is ready', async () => {
+        const { gateway, conversationService, claudeService, documentService, usersService, emailService } = createSummaryGateway();
+        conversationService.getRecentHistoryForAI.mockResolvedValue([
+          { role: 'user', content: 'a '.repeat(25) },
+          { role: 'assistant', content: 'b '.repeat(25) },
+        ]);
+        mockSuccessfulGeneration(claudeService, documentService);
+        const client = createFakeClient('sock-1');
+        const session = createFakeSession({ entitlements, userId: 'user-1' });
+
+        await gateway.autoGenerateConversationSummary(client, session);
+        await new Promise((r) => setImmediate(r)); // fire-and-forget email step
+
+        expect(usersService.findById).toHaveBeenCalledWith('user-1');
+        expect(documentService.buildSummaryPdfBuffer).toHaveBeenCalledWith(
+          'Quick Sync',
+          expect.arrayContaining([expect.objectContaining({ heading: 'Summary' })]),
+        );
+        expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledWith(
+          'owner@example.com',
+          'My Conversation', // the conversation's own title, not the document's
+          expect.objectContaining({ filename: expect.stringContaining('.pdf'), content: Buffer.from('pdf-bytes') }),
+        );
+      });
+
+      it('falls back to the document title when the conversation has no title of its own', async () => {
+        const { gateway, conversationService, claudeService, documentService, emailService } = createSummaryGateway();
+        conversationService.getConversationTitle.mockResolvedValue(null);
+        conversationService.getRecentHistoryForAI.mockResolvedValue([
+          { role: 'user', content: 'a '.repeat(25) },
+          { role: 'assistant', content: 'b '.repeat(25) },
+        ]);
+        mockSuccessfulGeneration(claudeService, documentService);
+        const client = createFakeClient('sock-1');
+        const session = createFakeSession({ entitlements, userId: 'user-1' });
+
+        await gateway.autoGenerateConversationSummary(client, session);
+        await new Promise((r) => setImmediate(r));
+
+        expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledWith(
+          'owner@example.com',
+          'Quick Sync',
+          expect.anything(),
+        );
+      });
+
+      it('does not email a guest session', async () => {
+        const { gateway, conversationService, claudeService, documentService, usersService, emailService } = createSummaryGateway();
+        conversationService.getRecentHistoryForAI.mockResolvedValue([
+          { role: 'user', content: 'a '.repeat(25) },
+          { role: 'assistant', content: 'b '.repeat(25) },
+        ]);
+        mockSuccessfulGeneration(claudeService, documentService);
+        const client = createFakeClient('sock-1');
+        const session = createFakeSession({ entitlements, isGuest: true });
+
+        await gateway.autoGenerateConversationSummary(client, session);
+        await new Promise((r) => setImmediate(r));
+
+        expect(usersService.findById).not.toHaveBeenCalled();
+        expect(emailService.sendConversationSummaryEmail).not.toHaveBeenCalled();
+      });
+
+      it('does not fail the document generation when the email step throws', async () => {
+        const { gateway, conversationService, claudeService, documentService, emailService } = createSummaryGateway();
+        conversationService.getRecentHistoryForAI.mockResolvedValue([
+          { role: 'user', content: 'a '.repeat(25) },
+          { role: 'assistant', content: 'b '.repeat(25) },
+        ]);
+        mockSuccessfulGeneration(claudeService, documentService);
+        emailService.sendConversationSummaryEmail.mockRejectedValue(new Error('SMTP down'));
+        const client = createFakeClient('sock-1');
+        const session = createFakeSession({ entitlements, userId: 'user-1' });
+
+        await expect(gateway.autoGenerateConversationSummary(client, session)).resolves.toBeUndefined();
+        await new Promise((r) => setImmediate(r));
+
+        expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready', { documentId: 'doc-1' });
+      });
     });
 
     it('marks failed and emits document:failed when the upload step throws, without losing the thrown error', async () => {

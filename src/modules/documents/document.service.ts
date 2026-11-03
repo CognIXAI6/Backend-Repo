@@ -144,6 +144,17 @@ export class DocumentService {
     return { docId, downloadUrl };
   }
 
+  /**
+   * Builds a branded PDF buffer (same logo/watermark as a stored PDF
+   * document) without uploading it or writing a generated_documents row —
+   * for callers that need the bytes themselves, e.g. attaching a
+   * conversation summary directly to an email. The section-depth cap
+   * doesn't apply here; the caller already owns that decision.
+   */
+  async buildSummaryPdfBuffer(title: string, sections: DocumentSection[]): Promise<Buffer> {
+    return this.buildPdf(title, sections);
+  }
+
   private withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
     let timer: NodeJS.Timeout;
     const timeout = new Promise<never>((_, reject) => {
