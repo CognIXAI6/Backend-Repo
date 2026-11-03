@@ -955,15 +955,19 @@ No intro sentence. No headers. Just bullets.`;
   }
 
   /**
-   * Structured recap of a just-ended conversation — title, topic, and three
-   * model-generated sections (Summary / Key Insights / Follow-up Actions) —
-   * for VoiceGateway's auto-generate-on-session-end feature. The caller
-   * splices in a fourth, code-built "Transcript" section (never trust the
-   * model to reproduce a transcript verbatim) and renames/moves
-   * "Follow-up Actions" to "Action Points / Next Steps" at the end, landing
-   * at exactly 4 sections — DocumentService caps "brief"-depth documents at
-   * 4 and silently drops the rest, so this count is load-bearing: adding a
-   * section here without removing one will truncate the action points.
+   * Structured recap of a just-ended conversation — title, topic, and up to
+   * three model-generated sections (Summary / Key Insights / Follow-up
+   * Actions) — for VoiceGateway's auto-generate-on-session-end feature.
+   * "Summary" always exists; "Key Insights" and "Follow-up Actions" are
+   * genuinely optional — the model omits either one outright rather than
+   * padding it with a "nothing to report" placeholder, so a short or purely
+   * informational conversation correctly produces just a Summary and
+   * nothing else. The caller splices in one more, code-built "Transcript"
+   * section (never trust the model to reproduce a transcript verbatim) and
+   * renames/moves "Follow-up Actions" to "Action Points / Next Steps" at
+   * the end when present — landing at 2-4 sections total. DocumentService
+   * caps "brief"-depth documents at 4, so even the maximum case (all three
+   * model sections plus Transcript) still fits without truncation.
    * Unlike the generate_document tool, this isn't triggered by the model
    * deciding to call a tool mid-turn; it's a single direct call made once
    * the conversation is over, strictly grounded in the transcript (no
@@ -988,9 +992,10 @@ No intro sentence. No headers. Just bullets.`;
 {"title": "<= 8 words, specific to what was actually discussed", "topic": "one sentence topic", "sections": [{"heading": "Summary", "content": "..."}, {"heading": "Key Insights", "content": "..."}, {"heading": "Follow-up Actions", "content": "..."}]}
 
 Rules:
-- Summary: 2-4 sentences covering what was actually discussed, in the order it was discussed (earliest topic first, most recent last) — never lead with the most recent or most salient point.
-- Key Insights: the non-obvious takeaways or conclusions reached, as "- " bullet lines within the content string, ordered by when each was raised in the conversation (earliest first). If the conversation was too short/shallow for real insights, write "Nothing notable surfaced." — never invent them.
-- Follow-up Actions: concrete, actionable next steps implied by the conversation, as "- " bullet lines, ordered by when they came up (earliest first). If none, write "No specific follow-up actions were identified."
+- "Summary" is REQUIRED and must always be the first section, even for a very short or trivial conversation — 2-4 sentences covering what was actually discussed, in the order it was discussed (earliest topic first, most recent last) — never lead with the most recent or most salient point. A short conversation still gets a short, honest summary; never refuse or leave it blank.
+- "Key Insights" is OPTIONAL — include it ONLY when there are genuine non-obvious takeaways or conclusions reached, as "- " bullet lines within the content string, ordered by when each was raised (earliest first). If the conversation was too short/shallow for real insights, OMIT this section from the "sections" array entirely — do not include it with a placeholder like "Nothing notable surfaced."
+- "Follow-up Actions" is OPTIONAL — include it ONLY when there are concrete, actionable next steps genuinely implied by the conversation, as "- " bullet lines, ordered by when they came up (earliest first). If none, OMIT this section from the "sections" array entirely — do not include it with a placeholder like "No specific follow-up actions were identified."
+- A short or purely informational conversation (a quick question and answer, small talk, a single lookup) is expected to produce ONLY a "Summary" section — that is a correct, complete result, not a failure.
 - Base everything strictly on the transcript below. Never invent facts, names, or numbers not present in it.`;
 
     try {

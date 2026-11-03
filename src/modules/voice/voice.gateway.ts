@@ -1681,11 +1681,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 80);
-    const wordCount = history.reduce((sum, m) => sum + m.content.split(/\s+/).filter(Boolean).length, 0);
-    if (history.length < 2 || wordCount < 40) {
+    if (history.length === 0) {
       await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'too_short' });
-      return; // too short to be worth a recap
+      return; // nothing was said — genuinely nothing to summarize
     }
+    // Deliberately no minimum word count beyond that: a short conversation
+    // still gets a real summary, just a short, honest one — generateConversationSummaryDocument
+    // writes "Summary" unconditionally and only includes Key Insights/Follow-up
+    // Actions when the conversation actually earned them, so a brief exchange
+    // correctly lands as a plain recap instead of being skipped outright.
 
     const docStatus = await this.usageService.getStatus(session.userId, 'documents', entitlements.maxDocumentsPerMonth);
     if (!docStatus.canUse) {
