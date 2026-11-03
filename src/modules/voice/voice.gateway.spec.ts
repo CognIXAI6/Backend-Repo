@@ -505,6 +505,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       getRecentHistoryForAI: jest.fn(),
       getConversationMessagesInternal: jest.fn().mockResolvedValue([]),
       setSummaryStatus: jest.fn().mockResolvedValue(undefined),
+      saveMessage: jest.fn().mockResolvedValue({ id: 'msg-1' }),
     };
     const claudeService = { generateConversationSummaryDocument: jest.fn() };
     const documentService = { generateAndUpload: jest.fn() };
@@ -571,15 +572,62 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       expect(documentService.generateAndUpload).not.toHaveBeenCalled();
     });
 
-    it('marks skipped as too_short for a thin conversation', async () => {
+    it('marks skipped as too_short only when genuinely nothing was said', async () => {
       const { gateway, conversationService } = createSummaryGateway();
-      conversationService.getRecentHistoryForAI.mockResolvedValue([{ role: 'user', content: 'hi' }]);
+      conversationService.getRecentHistoryForAI.mockResolvedValue([]);
       const client = createFakeClient('sock-1');
       const session = createFakeSession({ entitlements });
 
       await gateway.autoGenerateConversationSummary(client, session);
 
       expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'too_short' });
+    });
+
+    it('still generates a real document for a short conversation instead of skipping it', async () => {
+      const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
+      // A single short exchange — previously blocked by a < 40-word floor.
+      // Every conversation with any content at all should produce something.
+      conversationService.getRecentHistoryForAI.mockResolvedValue([{ role: 'user', content: 'hi' }]);
+      claudeService.generateConversationSummaryDocument.mockResolvedValue({
+        title: 'Quick Hello',
+        topic: 'A brief greeting',
+        sections: [{ heading: 'Summary', content: 'The user said hello.' }],
+      });
+      documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-2', downloadUrl: 'https://example.com/doc-2' });
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements });
+
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      expect(conversationService.setSummaryStatus).not.toHaveBeenCalledWith(session.conversationId, 'skipped', expect.anything());
+      expect(documentService.generateAndUpload).toHaveBeenCalled();
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready', { documentId: 'doc-2' });
+    });
+
+    it('omits Action Points entirely when the model omits Follow-up Actions, instead of a placeholder section', async () => {
+      const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
+      conversationService.getRecentHistoryForAI.mockResolvedValue([
+        { role: 'user', content: "what's the capital of France?" },
+        { role: 'assistant', content: 'Paris.' },
+      ]);
+      // No "Key Insights" or "Follow-up Actions" — a purely informational
+      // exchange with nothing actionable or non-obvious to report.
+      claudeService.generateConversationSummaryDocument.mockResolvedValue({
+        title: 'Capital of France',
+        topic: 'A quick factual question',
+        sections: [{ heading: 'Summary', content: 'The user asked for the capital of France; the AI answered Paris.' }],
+      });
+      documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-3', downloadUrl: 'https://example.com/doc-3' });
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements, cachedOwnerName: 'Mr Tolu' });
+
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      const uploadCall = documentService.generateAndUpload.mock.calls[0][0];
+      const headings = uploadCall.sections.map((s: any) => s.heading);
+      expect(headings).not.toContain('Action Points / Next Steps');
+      expect(headings).not.toContain('Key Insights');
+      expect(headings[0]).toBe('Summary');
     });
 
     it('marks skipped as quota_exceeded when the monthly document cap is hit', async () => {
@@ -649,6 +697,21 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       expect(usageService.tryConsume).toHaveBeenCalledWith(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
       expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready', { documentId: 'doc-1' });
       expect(client.emit).toHaveBeenCalledWith('document:ready', expect.objectContaining({ docId: 'doc-1', auto: true }));
+
+      // Regression coverage for a real bug: the auto-summary's "ready"
+      // announcement was previously only ever emitted live — never saved as
+      // a conversation_messages row — so a client reopening the conversation
+      // later had no trace of the document ever existing, even though the
+      // document itself (and conversations.summary_document_id) survived
+      // intact. It must be a real, persisted message with document_id set,
+      // exactly like the manual "generate a document" chat flow already does.
+      expect(conversationService.saveMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId: session.conversationId,
+          role: 'assistant',
+          documentId: 'doc-1',
+        }),
+      );
     });
 
     it('marks failed and emits document:failed when the upload step throws, without losing the thrown error', async () => {

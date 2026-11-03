@@ -1681,11 +1681,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 80);
-    const wordCount = history.reduce((sum, m) => sum + m.content.split(/\s+/).filter(Boolean).length, 0);
-    if (history.length < 2 || wordCount < 40) {
+    if (history.length === 0) {
       await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'too_short' });
-      return; // too short to be worth a recap
+      return; // nothing was said — genuinely nothing to summarize
     }
+    // Deliberately no minimum word count beyond that: a short conversation
+    // still gets a real summary, just a short, honest one — generateConversationSummaryDocument
+    // writes "Summary" unconditionally and only includes Key Insights/Follow-up
+    // Actions when the conversation actually earned them, so a brief exchange
+    // correctly lands as a plain recap instead of being skipped outright.
 
     const docStatus = await this.usageService.getStatus(session.userId, 'documents', entitlements.maxDocumentsPerMonth);
     if (!docStatus.canUse) {
@@ -1731,6 +1735,22 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       await this.usageService.tryConsume(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
       await this.conversationService.setSummaryStatus(session.conversationId, 'ready', { documentId: result.docId });
+
+      // Persisted, not just live-emitted — the manual "generate a document"
+      // chat flow already does this (see processPrompt's onDone), and this
+      // path was the one gap: without a real conversation_messages row
+      // carrying document_id, the document:ready event was the ONLY place
+      // this ever appeared. A client that wasn't connected at that exact
+      // moment, or that simply reopens the conversation later, had no way
+      // to discover it again — the document itself was never lost (still in
+      // generated_documents, still linked via conversations.summary_document_id),
+      // just unreachable from the conversation history a user actually looks at.
+      await this.conversationService.saveMessage({
+        conversationId: session.conversationId,
+        role: 'assistant',
+        content: `${summary.title} is ready.`,
+        documentId: result.docId,
+      });
 
       client.emit('document:ready', {
         docId: result.docId,
