@@ -89,6 +89,8 @@ interface ActiveSession {
   userId: string;
   conversationId: string;
   fieldName?: string;
+  /** Last time fieldName was re-read from the user's primary field (ms epoch). */
+  fieldCheckedAt?: number;
   isGuest: boolean;
   /** Only set for guest sessions */
   guestSessionId?: string;
@@ -1935,6 +1937,30 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── Multi-speaker prompt processing (Gap 4) ─────────────────────────────────
 
+  /**
+   * The session captures the field once, at session:start. A user who then
+   * switches field (the app persists it as their primary field) kept getting
+   * replies — and "off-topic" refusals — for the OLD field until the socket
+   * session happened to restart. Re-read the primary field before each AI
+   * turn (throttled) so a switch takes effect on the very next prompt.
+   */
+  private async refreshSessionField(session: ActiveSession): Promise<void> {
+    if (session.isGuest) return;
+    const now = Date.now();
+    if (session.fieldCheckedAt && now - session.fieldCheckedAt < 3_000) return;
+    session.fieldCheckedAt = now;
+    try {
+      const primary = await this.fieldsService.getUserPrimaryField(session.userId);
+      const name = primary?.name;
+      if (name && name !== session.fieldName) {
+        this.logger.log(`Session field changed for user ${session.userId}: "${session.fieldName}" -> "${name}"`);
+        session.fieldName = name;
+      }
+    } catch (err) {
+      this.logger.warn(`refreshSessionField failed (keeping "${session.fieldName}"):`, err);
+    }
+  }
+
   private async processMultiSpeakerPrompt(
     client: Socket,
     session: ActiveSession,
@@ -1943,6 +1969,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
+
+    await this.refreshSessionField(session);
 
     try {
       // Gap 9: exclude the current turns from the history context so they only
@@ -2080,6 +2108,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     const speakerName = session.otherSpeakerName ?? 'Guest Speaker';
     const ownerName = session.cachedOwnerName;
+
+    await this.refreshSessionField(session);
 
     try {
       const recentHistory = session.dualSpeakerHistory.slice(-40);
@@ -2229,6 +2259,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
+
+    await this.refreshSessionField(session);
 
     try {
       const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 40);

@@ -15,14 +15,14 @@ export class PushNotificationController {
     @Body('token') token: string,
     @Body('platform') platform?: 'web' | 'android' | 'ios',
   ) {
-    const userId = (req.user as { userId: string }).userId;
+    const userId = (req.user as { id: string }).id;
     await this.pushService.registerToken(userId, token, platform ?? 'web');
   }
 
   @Delete('unregister')
   @HttpCode(HttpStatus.NO_CONTENT)
   async removeToken(@Req() req: Request, @Body('token') token: string) {
-    const userId = (req.user as { userId: string }).userId;
+    const userId = (req.user as { id: string }).id;
     await this.pushService.removeToken(userId, token);
   }
 }

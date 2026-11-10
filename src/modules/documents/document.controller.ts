@@ -25,7 +25,7 @@ export class DocumentController {
     @Query('limit') limit?: string,
     @Query('q') q?: string,
   ) {
-    const userId = (req.user as { userId: string }).userId;
+    const userId = (req.user as { id: string }).id;
     return this.documentService.getUserDocuments(
       userId,
       page ? parseInt(page, 10) : 1,
@@ -36,14 +36,14 @@ export class DocumentController {
 
   @Get(':id')
   async getDocument(@Req() req: Request, @Param('id') id: string) {
-    const userId = (req.user as { userId: string }).userId;
+    const userId = (req.user as { id: string }).id;
     return this.documentService.getDocumentById(id, userId);
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   async deleteDocument(@Req() req: Request, @Param('id') id: string) {
-    const userId = (req.user as { userId: string }).userId;
+    const userId = (req.user as { id: string }).id;
     await this.documentService.deleteDocument(id, userId);
   }
 }

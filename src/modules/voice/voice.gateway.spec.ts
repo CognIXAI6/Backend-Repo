@@ -545,6 +545,31 @@ describe('VoiceGateway auto-generated conversation summary', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
+  describe('refreshSessionField', () => {
+    it('picks up a field switch made after session:start, so the next turn uses the new field', async () => {
+      const { gateway } = createSummaryGateway();
+      gateway.fieldsService = { getUserPrimaryField: jest.fn().mockResolvedValue({ name: 'Law' }) };
+      const session = createFakeSession({ fieldName: 'Healthcare' }) as any;
+
+      await gateway.refreshSessionField(session);
+
+      expect(session.fieldName).toBe('Law');
+    });
+
+    it('keeps the current field when the lookup fails or the user is a guest', async () => {
+      const { gateway } = createSummaryGateway();
+      gateway.fieldsService = { getUserPrimaryField: jest.fn().mockRejectedValue(new Error('db down')) };
+      const session = createFakeSession({ fieldName: 'Healthcare' }) as any;
+      await gateway.refreshSessionField(session);
+      expect(session.fieldName).toBe('Healthcare');
+
+      gateway.fieldsService = { getUserPrimaryField: jest.fn().mockResolvedValue({ name: 'Law' }) };
+      const guest = createFakeSession({ fieldName: 'General', isGuest: true }) as any;
+      await gateway.refreshSessionField(guest);
+      expect(guest.fieldName).toBe('General');
+    });
+  });
+
   describe('buildVerbatimTranscript', () => {
     it('resolves owner/other labels to the session’s real names and keeps assistant turns attributed to CognIX AI', async () => {
       const { gateway, conversationService } = createSummaryGateway();
