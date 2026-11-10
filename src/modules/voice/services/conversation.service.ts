@@ -101,6 +101,17 @@ export interface Conversation {
   summary_document_id: string | null;
 }
 
+export interface ConversationSummaryPart {
+  id: string;
+  conversation_id: string;
+  title: string;
+  topic: string | null;
+  sections: Array<{ heading: string; content: string }>;
+  covers_from: Date;
+  covers_to: Date;
+  created_at: Date;
+}
+
 export interface DocumentMeta {
   id: string;
   title: string;
@@ -470,6 +481,81 @@ export class ConversationService {
    * autoGenerateConversationSummary). No ownership check — called
    * internally by the gateway, which already trusts the session.
    */
+  /**
+   * Atomically claims the right to generate an auto-summary for a conversation.
+   * Returns false when another run already holds it ('pending' and fresh) or
+   * the existing 'ready' summary already covers every message — so a socket
+   * drop/reconnect/stop cycle can't produce one summary (and one email) per
+   * cycle. A 'ready' summary is only superseded when real messages (not the
+   * "summary is ready" document message) were saved after the last summarised
+   * part; a 'pending' claim older than the stale window is treated as a
+   * crashed run and may be re-claimed.
+   */
+  async claimSummaryGeneration(conversationId: string, staleAfterMs = 10 * 60 * 1000): Promise<boolean> {
+    const staleBefore = new Date(Date.now() - staleAfterMs);
+    const result = await this.knex.raw(
+      `UPDATE conversations
+          SET summary_status = 'pending', updated_at = NOW()
+        WHERE id = ?
+          AND (
+            summary_status IN ('not_started', 'failed', 'skipped')
+            OR (summary_status = 'pending' AND updated_at < ?)
+            OR (summary_status = 'ready' AND EXISTS (
+                  SELECT 1 FROM conversation_messages m
+                   WHERE m.conversation_id = conversations.id
+                     AND m.document_id IS NULL
+                     AND m.created_at > COALESCE(
+                           (SELECT MAX(p.covers_to) FROM conversation_summary_parts p
+                             WHERE p.conversation_id = conversations.id),
+                           '-infinity'::timestamptz)))
+          )`,
+      [conversationId, staleBefore],
+    );
+    return (result?.rowCount ?? 0) > 0;
+  }
+
+  /**
+   * Messages added since the last summarised part (all of them if none yet),
+   * oldest first. The cutoff is resolved inside SQL so microsecond timestamps
+   * are compared exactly; the "X is ready" document messages are excluded.
+   */
+  async getUnsummarizedMessages(conversationId: string): Promise<ConversationMessage[]> {
+    const result = await this.knex.raw(
+      `SELECT m.* FROM conversation_messages m
+        WHERE m.conversation_id = ?
+          AND m.document_id IS NULL
+          AND m.created_at > COALESCE(
+                (SELECT MAX(p.covers_to) FROM conversation_summary_parts p WHERE p.conversation_id = ?),
+                '-infinity'::timestamptz)
+        ORDER BY m.created_at ASC`,
+      [conversationId, conversationId],
+    );
+    return (result?.rows ?? []) as ConversationMessage[];
+  }
+
+  async getSummaryParts(conversationId: string): Promise<ConversationSummaryPart[]> {
+    return this.knex('conversation_summary_parts')
+      .where('conversation_id', conversationId)
+      .orderBy('covers_from', 'asc')
+      .select('*');
+  }
+
+  /** Records a summarised stretch; covers_from/to are copied from the messages' own timestamps. */
+  async addSummaryPart(
+    conversationId: string,
+    part: { title: string; topic: string | null; sections: Array<{ heading: string; content: string }> },
+    firstMessageId: string,
+    lastMessageId: string,
+  ): Promise<void> {
+    await this.knex.raw(
+      `INSERT INTO conversation_summary_parts (conversation_id, title, topic, sections, covers_from, covers_to)
+       VALUES (?, ?, ?, ?::jsonb,
+               (SELECT created_at FROM conversation_messages WHERE id = ?),
+               (SELECT created_at FROM conversation_messages WHERE id = ?))`,
+      [conversationId, part.title, part.topic, JSON.stringify(part.sections), firstMessageId, lastMessageId],
+    );
+  }
+
   async setSummaryStatus(
     conversationId: string,
     status: SummaryStatus,

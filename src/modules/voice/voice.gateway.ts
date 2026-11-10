@@ -17,7 +17,7 @@ import { randomUUID } from 'crypto';
 
 import { DeepgramLiveAudioFormat, DeepgramService, TranscriptWord } from './services/deepgram.service';
 import { ClaudeService, ConversationImage as ClaudeConversationImage } from './services/claude.service';
-import { ConversationService, ConversationMode, SaveTranscriptSegmentDto, ConversationParticipant, UpsertParticipantDto, ConversationImage as DbConversationImage } from './services/conversation.service';
+import { ConversationService, ConversationMode, SaveTranscriptSegmentDto, ConversationParticipant, ConversationMessage, UpsertParticipantDto, ConversationImage as DbConversationImage } from './services/conversation.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { VoiceVerificationService, SpeakerIdentificationResult } from './services/voice-verification.service';
 import { UploadService, UploadFolder } from '@/modules/upload/upload.service';
@@ -33,6 +33,7 @@ import { ProviderDisruptionReason } from './interfaces/voice-events.types';
 import { computeBackoffDelayMs, sleep, PROVIDER_RECOVERY_MAX_ATTEMPTS } from './utils/backoff.util';
 import { ToolCallStreamFilter } from './utils/tool-call-stream-filter.util';
 import { wrapPcm16AsWav } from './utils/pcm-wav.util';
+import { buildCombinedSummary } from './utils/combined-summary.util';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
 import { PlanEntitlements, PlanType } from '@/modules/entitlements/entitlements.types';
@@ -259,6 +260,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly RETRY_IDENTIFICATION_EXTRA_S = 6;
   /** Milliseconds of inactivity before a session is auto-closed (30 min). */
   private readonly SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+  /**
+   * Grace period before a raw socket drop triggers the auto-summary. A phone
+   * lock / network blip is followed by a reconnect with the same
+   * conversationId; summarising immediately sent one summary email per drop.
+   * An explicit session:end still summarises immediately.
+   */
+  private readonly DISCONNECT_SUMMARY_GRACE_MS = 90_000;
+  /** conversationId → pending deferred summary (cancelled if the client resumes). */
+  private readonly pendingDisconnectSummaries = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
    * Bounds for the audio replay buffer accumulated while providerState ===
@@ -560,12 +570,29 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     if (session && !session.isGuest) {
-      this.finalizeSessionOnExit(client, session).catch((err) =>
-        this.logger.error(`Auto-summary on disconnect failed for conversation ${session.conversationId}:`, err),
-      );
+      this.scheduleDisconnectSummary(client, session);
     }
 
     this.cleanupSession(client.id);
+  }
+
+  private scheduleDisconnectSummary(client: Socket, session: ActiveSession): void {
+    const { conversationId } = session;
+    this.cancelPendingDisconnectSummary(conversationId);
+    const timer = setTimeout(() => {
+      this.pendingDisconnectSummaries.delete(conversationId);
+      this.finalizeSessionOnExit(client, session).catch((err) =>
+        this.logger.error(`Auto-summary on disconnect failed for conversation ${conversationId}:`, err),
+      );
+    }, this.DISCONNECT_SUMMARY_GRACE_MS);
+    this.pendingDisconnectSummaries.set(conversationId, timer);
+  }
+
+  private cancelPendingDisconnectSummary(conversationId: string): void {
+    const timer = this.pendingDisconnectSummaries.get(conversationId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.pendingDisconnectSummaries.delete(conversationId);
   }
 
   // ─── session:start ──────────────────────────────────────────────────────────
@@ -777,6 +804,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           .filter((e) => e.voiceSpeakerId)
           .map((e) => [e.voiceSpeakerId!, e]),
       );
+
+      // Client resumed this conversation after a drop — the deferred
+      // disconnect summary no longer applies; the real end will summarise.
+      this.cancelPendingDisconnectSummary(conversationId);
 
       const session: ActiveSession = {
         userId,
@@ -1624,6 +1655,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     if (session && !session.isGuest) {
+      this.cancelPendingDisconnectSummary(session.conversationId);
       // Fire-and-forget: the client disconnects its socket immediately after
       // emitting session:end (doesn't wait for any ack), so this routinely
       // finishes after the live connection is already gone — delivery is via
@@ -1669,9 +1701,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // further down frequently never arrive (client has usually already
     // disconnected by the time any of this resolves), so this persisted
     // status is the only delivery channel a client can actually rely on.
-    await this.conversationService
-      .setSummaryStatus(session.conversationId, 'pending')
-      .catch((err) => this.logger.warn(`Failed to set summary_status=pending for ${session.conversationId}:`, err));
+    // The claim also sets summary_status='pending'. It's atomic, so overlapping
+    // triggers (drop + reconnect + stop) collapse into one summary and one email.
+    const claimed = await this.conversationService
+      .claimSummaryGeneration(session.conversationId)
+      .catch((err) => {
+        this.logger.warn(`Failed to claim summary for ${session.conversationId}:`, err);
+        return false;
+      });
+    if (!claimed) {
+      this.logger.log(`Auto-summary skipped for ${session.conversationId}: already pending or up to date`);
+      return;
+    }
 
     const entitlements = session.entitlements;
     if (!entitlements || entitlements.maxDocumentsPerMonth <= 0 || entitlements.allowedDocumentDepths.length === 0) {
@@ -1680,9 +1721,23 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 80);
+    // Only what was said since the last summarised part — a resumed
+    // conversation gets a new part appended to the earlier ones instead of a
+    // from-scratch re-summary of everything.
+    const newMessages = await this.conversationService.getUnsummarizedMessages(session.conversationId);
+    const history = newMessages
+      .filter((m) => (m.content ?? '').trim())
+      .slice(-80)
+      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
     if (history.length === 0) {
-      await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'too_short' });
+      // Nothing new to summarise. If an earlier part exists, the conversation's
+      // summary is still current — restore 'ready' rather than 'skipped'.
+      const priorParts = await this.conversationService.getSummaryParts(session.conversationId);
+      if (priorParts.length > 0) {
+        await this.conversationService.setSummaryStatus(session.conversationId, 'ready');
+      } else {
+        await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'too_short' });
+      }
       return; // nothing was said — genuinely nothing to summarize
     }
     // Deliberately no minimum word count beyond that: a short conversation
@@ -1697,7 +1752,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return; // monthly document cap already hit
     }
 
-    const transcript = await this.buildVerbatimTranscript(session.conversationId, session);
+    const transcript = this.buildVerbatimTranscript(newMessages, session);
 
     const summary = await this.claudeService.generateConversationSummaryDocument(history, session.fieldName);
     if (!summary) {
@@ -1719,19 +1774,45 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       summary.sections.push({ ...actionSection, heading: 'Action Points / Next Steps' });
     }
 
-    client.emit('document:generating', { title: summary.title, topic: summary.topic, auto: true });
+    let combined: { title: string; topic: string; sections: Array<{ heading: string; content: string }> };
+    try {
+      const priorParts = await this.conversationService.getSummaryParts(session.conversationId);
+      const conversationTitle = await this.conversationService.getConversationTitle(session.conversationId);
+      combined = buildCombinedSummary(
+        [
+          ...priorParts,
+          { title: summary.title, topic: summary.topic, sections: summary.sections, covers_from: new Date(newMessages[0].created_at) },
+        ],
+        conversationTitle,
+      );
+    } catch (err) {
+      await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
+      throw err;
+    }
+
+    client.emit('document:generating', { title: combined.title, topic: combined.topic, auto: true });
 
     try {
       const result = await this.documentService.generateAndUpload({
         userId: session.userId,
         conversationId: session.conversationId,
-        title: summary.title,
-        topic: summary.topic,
-        sections: summary.sections,
+        title: combined.title,
+        topic: combined.topic,
+        sections: combined.sections,
         depth: 'brief',
         format: 'docx',
         allowedDepths: entitlements.allowedDocumentDepths,
+        skipSectionLimit: true,
       });
+
+      // Recorded only after the document exists, so a failed upload leaves
+      // this stretch unsummarised for the next attempt instead of "covered".
+      await this.conversationService.addSummaryPart(
+        session.conversationId,
+        { title: summary.title, topic: summary.topic, sections: summary.sections },
+        newMessages[0].id,
+        newMessages[newMessages.length - 1].id,
+      );
 
       await this.usageService.tryConsume(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
       await this.conversationService.setSummaryStatus(session.conversationId, 'ready', { documentId: result.docId });
@@ -1748,14 +1829,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       await this.conversationService.saveMessage({
         conversationId: session.conversationId,
         role: 'assistant',
-        content: `${summary.title} is ready.`,
+        content: `${combined.title} is ready.`,
         documentId: result.docId,
       });
 
       client.emit('document:ready', {
         docId: result.docId,
-        title: summary.title,
-        topic: summary.topic,
+        title: combined.title,
+        topic: combined.topic,
         format: 'docx',
         downloadUrl: result.downloadUrl,
         auto: true,
@@ -1764,7 +1845,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       this.pushNotificationService
         .sendToUser(session.userId, {
           title: 'Your conversation summary is ready',
-          body: summary.title,
+          body: combined.title,
           data: { docId: result.docId, downloadUrl: result.downloadUrl },
         })
         .catch((err) => this.logger.warn(`Push notification failed for auto-summary ${result.docId}:`, err));
@@ -1772,14 +1853,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // Fire-and-forget, same as the push notification above: for a user
       // who's already closed the app, this is the one delivery channel that
       // doesn't depend on a live connection or a notification permission.
-      this.sendSummaryReadyEmail(session, summary).catch((err) =>
+      this.sendSummaryReadyEmail(session, combined).catch((err) =>
         this.logger.warn(`Summary-ready email failed for conversation ${session.conversationId}:`, err),
       );
 
       this.logger.log(`Auto-summary generated for conversation ${session.conversationId}: ${result.downloadUrl}`);
     } catch (err) {
       await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
-      client.emit('document:failed', { title: summary.title, reason: "We couldn't generate your conversation summary.", auto: true });
+      client.emit('document:failed', { title: combined.title, reason: "We couldn't generate your conversation summary.", auto: true });
       throw err;
     }
   }
@@ -1817,8 +1898,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * names bracketed per line (see buildMultiSpeakerSegmentDtos) and are
    * reformatted to match the "Name: text" shape used throughout.
    */
-  private async buildVerbatimTranscript(conversationId: string, session: ActiveSession): Promise<string> {
-    const messages = await this.conversationService.getConversationMessagesInternal(conversationId);
+  private buildVerbatimTranscript(messages: ConversationMessage[], session: ActiveSession): string {
     const lines: string[] = [];
 
     for (const m of messages) {

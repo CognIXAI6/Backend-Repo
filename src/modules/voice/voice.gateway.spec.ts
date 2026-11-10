@@ -500,11 +500,20 @@ describe('VoiceGateway processPrompt — blocked web search signal', () => {
 });
 
 describe('VoiceGateway auto-generated conversation summary', () => {
+  // Turns -> the unsummarised-message rows the gateway now reads.
+  function withHistory(conversationService: any, turns: Array<Record<string, unknown>>) {
+    conversationService.getUnsummarizedMessages.mockResolvedValue(
+      turns.map((t, i) => ({ id: `m${i}`, created_at: new Date(Date.UTC(2026, 10, 10, 9, i)), ...t })),
+    );
+  }
+
   function createSummaryGateway() {
     const conversationService = {
-      getRecentHistoryForAI: jest.fn(),
-      getConversationMessagesInternal: jest.fn().mockResolvedValue([]),
+      getUnsummarizedMessages: jest.fn().mockResolvedValue([]),
+      getSummaryParts: jest.fn().mockResolvedValue([]),
+      addSummaryPart: jest.fn().mockResolvedValue(undefined),
       setSummaryStatus: jest.fn().mockResolvedValue(undefined),
+      claimSummaryGeneration: jest.fn().mockResolvedValue(true),
       saveMessage: jest.fn().mockResolvedValue({ id: 'msg-1' }),
       getConversationTitle: jest.fn().mockResolvedValue('My Conversation'),
     };
@@ -539,26 +548,26 @@ describe('VoiceGateway auto-generated conversation summary', () => {
   describe('buildVerbatimTranscript', () => {
     it('resolves owner/other labels to the session’s real names and keeps assistant turns attributed to CognIX AI', async () => {
       const { gateway, conversationService } = createSummaryGateway();
-      conversationService.getConversationMessagesInternal.mockResolvedValue([
+      const messages = ([
         { role: 'user', speaker_label: 'owner', content: 'hello there', transcript: 'hello there' },
         { role: 'user', speaker_label: 'other', content: 'hi back', transcript: 'hi back' },
         { role: 'assistant', content: 'Nothing to flag.' },
       ]);
       const session = createFakeSession({ cachedOwnerName: 'Mr Tolu', otherSpeakerName: 'Dr Amaka' });
 
-      const transcript = await gateway.buildVerbatimTranscript('conv-1', session);
+      const transcript = gateway.buildVerbatimTranscript(messages, session);
 
       expect(transcript).toBe('Mr Tolu: hello there\nDr Amaka: hi back\nCognIX AI: Nothing to flag.');
     });
 
     it('reformats bracketed multi-speaker lines into "Name: text" without the brackets', async () => {
       const { gateway, conversationService } = createSummaryGateway();
-      conversationService.getConversationMessagesInternal.mockResolvedValue([
+      const messages = ([
         { role: 'user', speaker_label: 'multiple_speakers', content: '[Dr Smith]: first point\n[Dr Jones]: second point', transcript: '[Dr Smith]: first point\n[Dr Jones]: second point' },
       ]);
       const session = createFakeSession();
 
-      const transcript = await gateway.buildVerbatimTranscript('conv-1', session);
+      const transcript = gateway.buildVerbatimTranscript(messages, session);
 
       expect(transcript).toBe('Dr Smith: first point\nDr Jones: second point');
     });
@@ -572,7 +581,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       await gateway.autoGenerateConversationSummary(client, session);
 
-      expect(conversationService.setSummaryStatus).toHaveBeenCalledWith(session.conversationId, 'pending');
+      expect(conversationService.claimSummaryGeneration).toHaveBeenCalledWith(session.conversationId);
       expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'tier_no_documents' });
       expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
       expect(documentService.generateAndUpload).not.toHaveBeenCalled();
@@ -580,7 +589,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
     it('marks skipped as too_short only when genuinely nothing was said', async () => {
       const { gateway, conversationService } = createSummaryGateway();
-      conversationService.getRecentHistoryForAI.mockResolvedValue([]);
+      withHistory(conversationService, []);
       const client = createFakeClient('sock-1');
       const session = createFakeSession({ entitlements });
 
@@ -593,7 +602,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
       // A single short exchange — previously blocked by a < 40-word floor.
       // Every conversation with any content at all should produce something.
-      conversationService.getRecentHistoryForAI.mockResolvedValue([{ role: 'user', content: 'hi' }]);
+      withHistory(conversationService, [{ role: 'user', content: 'hi' }]);
       claudeService.generateConversationSummaryDocument.mockResolvedValue({
         title: 'Quick Hello',
         topic: 'A brief greeting',
@@ -612,7 +621,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
     it('omits Action Points entirely when the model omits Follow-up Actions, instead of a placeholder section', async () => {
       const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
-      conversationService.getRecentHistoryForAI.mockResolvedValue([
+      withHistory(conversationService, [
         { role: 'user', content: "what's the capital of France?" },
         { role: 'assistant', content: 'Paris.' },
       ]);
@@ -638,7 +647,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
     it('marks skipped as quota_exceeded when the monthly document cap is hit', async () => {
       const { gateway, conversationService, usageService } = createSummaryGateway();
-      conversationService.getRecentHistoryForAI.mockResolvedValue([
+      withHistory(conversationService, [
         { role: 'user', content: 'a '.repeat(25) },
         { role: 'assistant', content: 'b '.repeat(25) },
       ]);
@@ -653,7 +662,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
     it('marks failed with generation_error when the model returns nothing usable', async () => {
       const { gateway, conversationService, claudeService } = createSummaryGateway();
-      conversationService.getRecentHistoryForAI.mockResolvedValue([
+      withHistory(conversationService, [
         { role: 'user', content: 'a '.repeat(25) },
         { role: 'assistant', content: 'b '.repeat(25) },
       ]);
@@ -668,12 +677,9 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
     it('splices a code-built Transcript section after Summary and moves Action Points / Next Steps to the end, landing at exactly 4 sections', async () => {
       const { gateway, conversationService, claudeService, documentService, usageService } = createSummaryGateway();
-      conversationService.getRecentHistoryForAI.mockResolvedValue([
-        { role: 'user', content: 'a '.repeat(25) },
-        { role: 'assistant', content: 'b '.repeat(25) },
-      ]);
-      conversationService.getConversationMessagesInternal.mockResolvedValue([
+      withHistory(conversationService, [
         { role: 'user', speaker_label: 'owner', content: 'hello', transcript: 'hello' },
+        { role: 'assistant', content: '   ', speaker_label: null },
       ]);
       claudeService.generateConversationSummaryDocument.mockResolvedValue({
         title: 'Quick Sync',
@@ -720,6 +726,67 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       );
     });
 
+    describe('resumed conversations (multi-part summary)', () => {
+      const entitlementsLocal = { maxDocumentsPerMonth: 10, allowedDocumentDepths: ['brief'] };
+
+      it('appends a new dated part to earlier parts instead of re-summarising from scratch', async () => {
+        const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
+        conversationService.getSummaryParts.mockResolvedValue([
+          {
+            title: 'Budget Review',
+            topic: 'Q3 budget',
+            sections: [{ heading: 'Summary', content: 'Reviewed Q3.' }],
+            covers_from: new Date(Date.UTC(2026, 10, 3, 9)),
+          },
+        ]);
+        withHistory(conversationService, [{ role: 'user', content: 'now Q4 planning' }]);
+        claudeService.generateConversationSummaryDocument.mockResolvedValue({
+          title: 'Q4 Planning',
+          topic: 'Planning Q4',
+          sections: [{ heading: 'Summary', content: 'Planned Q4.' }],
+        });
+        documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-9', downloadUrl: 'https://example.com/doc-9' });
+        const client = createFakeClient('sock-1');
+        const session = createFakeSession({ entitlements: entitlementsLocal });
+
+        await gateway.autoGenerateConversationSummary(client, session);
+
+        // Model only sees the new messages.
+        expect(claudeService.generateConversationSummaryDocument.mock.calls[0][0]).toEqual([
+          { role: 'user', content: 'now Q4 planning' },
+        ]);
+        const upload = documentService.generateAndUpload.mock.calls[0][0];
+        expect(upload.skipSectionLimit).toBe(true);
+        expect(upload.title).toBe('My Conversation — 2 sessions');
+        expect(upload.sections.map((x: any) => x.heading)).toEqual([
+          'Session 1 · 3 Nov 2026 — Budget Review',
+          'Summary',
+          'Session 2 · 10 Nov 2026 — Q4 Planning',
+          'Summary',
+          'Transcript',
+        ]);
+        expect(conversationService.addSummaryPart).toHaveBeenCalledWith(
+          session.conversationId,
+          expect.objectContaining({ title: 'Q4 Planning' }),
+          'm0',
+          'm0',
+        );
+      });
+
+      it('restores ready (not skipped) when a resumed conversation has nothing new', async () => {
+        const { gateway, conversationService, claudeService } = createSummaryGateway();
+        conversationService.getSummaryParts.mockResolvedValue([{ title: 'Earlier' }]);
+        conversationService.getUnsummarizedMessages.mockResolvedValue([]);
+        const client = createFakeClient('sock-1');
+        const session = createFakeSession({ entitlements: entitlementsLocal });
+
+        await gateway.autoGenerateConversationSummary(client, session);
+
+        expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready');
+        expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
+      });
+    });
+
     describe('summary-ready email', () => {
       function mockSuccessfulGeneration(claudeService: any, documentService: any) {
         claudeService.generateConversationSummaryDocument.mockResolvedValue({
@@ -732,7 +799,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       it('emails the user a PDF attachment of the summary once it is ready', async () => {
         const { gateway, conversationService, claudeService, documentService, usersService, emailService } = createSummaryGateway();
-        conversationService.getRecentHistoryForAI.mockResolvedValue([
+        withHistory(conversationService, [
           { role: 'user', content: 'a '.repeat(25) },
           { role: 'assistant', content: 'b '.repeat(25) },
         ]);
@@ -758,7 +825,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       it('falls back to the document title when the conversation has no title of its own', async () => {
         const { gateway, conversationService, claudeService, documentService, emailService } = createSummaryGateway();
         conversationService.getConversationTitle.mockResolvedValue(null);
-        conversationService.getRecentHistoryForAI.mockResolvedValue([
+        withHistory(conversationService, [
           { role: 'user', content: 'a '.repeat(25) },
           { role: 'assistant', content: 'b '.repeat(25) },
         ]);
@@ -778,7 +845,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       it('does not email a guest session', async () => {
         const { gateway, conversationService, claudeService, documentService, usersService, emailService } = createSummaryGateway();
-        conversationService.getRecentHistoryForAI.mockResolvedValue([
+        withHistory(conversationService, [
           { role: 'user', content: 'a '.repeat(25) },
           { role: 'assistant', content: 'b '.repeat(25) },
         ]);
@@ -795,7 +862,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       it('does not fail the document generation when the email step throws', async () => {
         const { gateway, conversationService, claudeService, documentService, emailService } = createSummaryGateway();
-        conversationService.getRecentHistoryForAI.mockResolvedValue([
+        withHistory(conversationService, [
           { role: 'user', content: 'a '.repeat(25) },
           { role: 'assistant', content: 'b '.repeat(25) },
         ]);
@@ -813,7 +880,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
     it('marks failed and emits document:failed when the upload step throws, without losing the thrown error', async () => {
       const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
-      conversationService.getRecentHistoryForAI.mockResolvedValue([
+      withHistory(conversationService, [
         { role: 'user', content: 'a '.repeat(25) },
         { role: 'assistant', content: 'b '.repeat(25) },
       ]);
@@ -844,15 +911,53 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       const session = createFakeSession();
       gateway.sessions.set(client.id, session);
 
-      await gateway.handleDisconnect(client);
-      // handleDisconnect fires the summary fire-and-forget rather than
-      // awaiting it (same as handleSessionEnd) — flush the microtask queue
-      // so it has a chance to run before asserting on it.
-      await new Promise((r) => setImmediate(r));
+      jest.useFakeTimers();
+      try {
+        await gateway.handleDisconnect(client);
+        // Deferred: a drop must not summarise immediately (phone lock / blip).
+        await jest.advanceTimersByTimeAsync(89_000);
+        expect(conversationService.claimSummaryGeneration).not.toHaveBeenCalled();
 
-      expect(conversationService.setSummaryStatus).toHaveBeenCalledWith(session.conversationId, 'pending');
+        await jest.advanceTimersByTimeAsync(2_000);
+        jest.useRealTimers();
+        await new Promise((r) => setImmediate(r));
+      } finally {
+        jest.useRealTimers();
+      }
+
+      expect(conversationService.claimSummaryGeneration).toHaveBeenCalledWith(session.conversationId);
       expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'tier_no_documents' });
       expect(gateway.sessions.has(client.id)).toBe(false);
+    });
+
+    it('cancels the deferred summary when the client resumes the conversation', async () => {
+      const { gateway, conversationService } = createSummaryGateway();
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession();
+      gateway.sessions.set(client.id, session);
+
+      jest.useFakeTimers();
+      try {
+        await gateway.handleDisconnect(client);
+        gateway.cancelPendingDisconnectSummary(session.conversationId); // what session:start does
+        await jest.advanceTimersByTimeAsync(120_000);
+      } finally {
+        jest.useRealTimers();
+      }
+
+      expect(conversationService.claimSummaryGeneration).not.toHaveBeenCalled();
+    });
+
+    it('skips generation (no email) when the summary is already pending or up to date', async () => {
+      const { gateway, conversationService, claudeService } = createSummaryGateway();
+      conversationService.claimSummaryGeneration.mockResolvedValue(false);
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession();
+
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      expect(conversationService.setSummaryStatus).not.toHaveBeenCalled();
+      expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
     });
 
     it('does not double-generate when session:end already ran for this socket', async () => {
