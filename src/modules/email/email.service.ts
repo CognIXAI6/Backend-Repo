@@ -59,7 +59,12 @@ async sendEmail(options: EmailOptions): Promise<void> {
 
       if (error) {
         this.logger.error(`Resend API error: ${describeError(error)}`);
-        throw new Error(`Resend failed: ${error.message}`);
+        // Carry the provider's status/code on the error so callers can classify it
+        // without parsing (or storing) provider text.
+        throw Object.assign(new Error(`Resend failed: ${error.message}`), {
+          statusCode: (error as { statusCode?: number }).statusCode,
+          code: (error as { name?: string }).name,
+        });
       }
 
       this.logger.log(`Email sent via Resend. ID: ${data?.id}`);

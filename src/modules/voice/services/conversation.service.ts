@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Knex } from 'knex';
 import { fetchTimingDetail, fetchTimingSummaries } from './recording-timing.service';
+import { SummaryEmailReason, SummaryEmailStatus, deriveSummaryEmail } from '../utils/summary-email-status.util';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -417,7 +418,7 @@ export class ConversationService {
 
     // Additive: list-safe timing aggregate + independent message-date bounds.
     const summaries = await fetchTimingSummaries(this.knex, data);
-    const withTiming = data.map((conv) => ({ ...conv, ...(summaries.get(conv.id) ?? {}) }));
+    const withTiming = data.map((conv) => ({ ...conv, ...(summaries.get(conv.id) ?? {}), summaryEmail: deriveSummaryEmail(conv as any) }));
 
     return { data: withTiming, total, page, lastPage: Math.ceil(total / limit) };
   }
@@ -469,7 +470,7 @@ export class ConversationService {
   async getConversation(
     conversationId: string,
     userId: string,
-  ): Promise<Conversation & { messages: ConversationMessage[]; transcriptSegments: TranscriptSegment[]; timing: Record<string, unknown>; messageDateBounds: Record<string, unknown> }> {
+  ): Promise<Conversation & { messages: ConversationMessage[]; transcriptSegments: TranscriptSegment[]; timing: Record<string, unknown>; messageDateBounds: Record<string, unknown>; summaryEmail: ReturnType<typeof deriveSummaryEmail> }> {
     const conversation = await this.knex('conversations')
       .where({ id: conversationId, user_id: userId })
       .whereNull('deleted_at')
@@ -487,7 +488,7 @@ export class ConversationService {
 
     const { timing, messageDateBounds } = await fetchTimingDetail(this.knex, conversation);
 
-    return { ...conversation, messages, transcriptSegments, timing, messageDateBounds };
+    return { ...conversation, messages, transcriptSegments, timing, messageDateBounds, summaryEmail: deriveSummaryEmail(conversation) };
   }
 
   // ── Auto-summary status ─────────────────────────────────────────────────────
@@ -573,6 +574,33 @@ export class ConversationService {
                (SELECT created_at FROM conversation_messages WHERE id = ?))`,
       [conversationId, part.title, part.topic, JSON.stringify(part.sections), firstMessageId, lastMessageId],
     );
+  }
+
+  /**
+   * Records the coarse outcome of the summary email (see summary-email-status.util.ts).
+   * `pending` (or an immediate `skipped`) opens a new attempt for a summary document; a final
+   * accepted/failed status only applies if that attempt is still the current one, so a slow older attempt can't overwrite a newer
+   * one. Never stores a recipient, provider response or content. Callers: the gateway,
+   * which has already established the session's ownership of the conversation.
+   */
+  async setSummaryEmailStatus(
+    conversationId: string,
+    outcome: { status: SummaryEmailStatus; reason?: SummaryEmailReason | null; documentId: string | null },
+  ): Promise<boolean> {
+    const update = {
+      summary_email_status: outcome.status,
+      summary_email_reason: outcome.reason ?? null,
+      summary_email_updated_at: new Date(),
+      summary_email_document_id: outcome.documentId,
+    };
+    const q = this.knex('conversations').where('id', conversationId);
+    if (outcome.status === 'accepted_by_provider' || outcome.status === 'failed') {
+      q.andWhere((b) => {
+        b.whereNull('summary_email_document_id');
+        if (outcome.documentId) b.orWhere('summary_email_document_id', outcome.documentId);
+      });
+    }
+    return (await q.update(update)) > 0;
   }
 
   async setSummaryStatus(

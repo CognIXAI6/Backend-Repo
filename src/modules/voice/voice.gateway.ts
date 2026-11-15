@@ -38,6 +38,7 @@ import { EntitlementsService } from '@/modules/entitlements/entitlements.service
 import { UsageService } from '@/modules/entitlements/usage.service';
 import { RecordingTimingService } from './services/recording-timing.service';
 import { countWords, describeError } from '@/common/utils/log-safe.util';
+import { SummaryEmailReason, classifyEmailError } from './utils/summary-email-status.util';
 import {
   AudioLossReason,
   SessionCorrelation,
@@ -2402,7 +2403,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // Fire-and-forget, same as the push notification above: for a user
       // who's already closed the app, this is the one delivery channel that
       // doesn't depend on a live connection or a notification permission.
-      this.sendSummaryReadyEmail(session, combined).catch((err) =>
+      this.sendSummaryReadyEmail(session, combined, result.docId).catch((err) =>
         this.logger.warn(`Summary-ready email failed for conversation ${session.conversationId}: ${describeError(err)}`),
       );
 
@@ -2423,20 +2424,50 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private async sendSummaryReadyEmail(
     session: ActiveSession,
     summary: { title: string; sections: Array<{ heading: string; content: string }> },
+    documentId: string,
   ): Promise<void> {
     if (session.isGuest) return;
 
-    const user = await this.usersService.findById(session.userId);
-    if (!user?.email) return;
+    // Records the coarse outcome only (status + reason code). A failure to record it must
+    // never affect the email or the summary's readiness, so it is swallowed (and logged coarsely).
+    const record = async (status: 'pending' | 'accepted_by_provider' | 'failed' | 'skipped', reason: SummaryEmailReason | null = null) => {
+      try {
+        await this.conversationService.setSummaryEmailStatus(session.conversationId, { status, reason, documentId });
+      } catch (err) {
+        this.logger.warn(`Could not record summary email outcome (trace=${session.traceId}): ${describeError(err)}`);
+      }
+    };
 
-    const conversationTitle = (await this.conversationService.getConversationTitle(session.conversationId)) ?? summary.title;
-    const pdfBuffer = await this.documentService.buildSummaryPdfBuffer(summary.title, summary.sections);
-    const filename = `${summary.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'conversation-summary'}.pdf`;
+    let email: string | undefined;
+    try {
+      email = (await this.usersService.findById(session.userId))?.email ?? undefined;
+    } catch (err) {
+      await record('failed', 'unknown_error');
+      throw err;
+    }
+    if (!email) {
+      await record('skipped', 'no_recipient');
+      return;
+    }
 
-    await this.emailService.sendConversationSummaryEmail(user.email, conversationTitle, {
-      filename,
-      content: pdfBuffer,
-    });
+    await record('pending');
+    let stage: 'attachment' | 'send' = 'attachment';
+    try {
+      const conversationTitle = (await this.conversationService.getConversationTitle(session.conversationId)) ?? summary.title;
+      const pdfBuffer = await this.documentService.buildSummaryPdfBuffer(summary.title, summary.sections);
+      const filename = `${summary.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'conversation-summary'}.pdf`;
+
+      stage = 'send';
+      await this.emailService.sendConversationSummaryEmail(email, conversationTitle, {
+        filename,
+        content: pdfBuffer,
+      });
+      // Accepted by the provider for delivery — not confirmation it reached an inbox.
+      await record('accepted_by_provider');
+    } catch (err) {
+      await record('failed', stage === 'attachment' ? 'attachment_failed' : classifyEmailError(err));
+      throw err;
+    }
   }
 
   /**

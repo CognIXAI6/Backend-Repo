@@ -524,6 +524,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       addSummaryPart: jest.fn().mockResolvedValue(undefined),
       setSummaryStatus: jest.fn().mockResolvedValue(undefined),
       claimSummaryGeneration: jest.fn().mockResolvedValue(true),
+      setSummaryEmailStatus: jest.fn().mockResolvedValue(true),
       saveMessage: jest.fn().mockResolvedValue({ id: 'msg-1' }),
       getConversationTitle: jest.fn().mockResolvedValue('My Conversation'),
     };
@@ -554,6 +555,80 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
   });
   afterEach(() => jest.restoreAllMocks());
+
+  describe('summary email outcome (coarse status only)', () => {
+    const ADDRESS = 'owner.sentinel@example.com';
+    const summary = { title: 'Budget Review', sections: [{ heading: 'Summary', content: 'PRIVATE-SUMMARY-CONTENT' }] };
+    const calls = (cs: any) => cs.setSummaryEmailStatus.mock.calls.map((c: any[]) => [c[1].status, c[1].reason ?? null]);
+
+    it('accepted by the provider: pending is recorded first, then accepted_by_provider — and nothing identifying is stored', async () => {
+      const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
+      usersService.findById.mockResolvedValue({ id: 'u', email: ADDRESS });
+      await gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1');
+      expect(calls(conversationService)).toEqual([['pending', null], ['accepted_by_provider', null]]);
+      expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledTimes(1);
+      const stored = JSON.stringify(conversationService.setSummaryEmailStatus.mock.calls);
+      expect(stored).not.toContain(ADDRESS);
+      expect(stored).not.toContain('PRIVATE-SUMMARY-CONTENT');
+      expect(conversationService.setSummaryEmailStatus.mock.calls[0][1].documentId).toBe('doc-1');
+    });
+
+    it.each([
+      [{ statusCode: 422, message: 'Invalid recipient owner.sentinel@example.com' }, 'provider_rejected'],
+      [{ statusCode: 429 }, 'provider_unavailable'],
+      [{ statusCode: 503 }, 'provider_unavailable'],
+      [{ code: 'ETIMEDOUT' }, 'provider_unavailable'],
+      [{ message: 'No email transport configured' }, 'transport_not_configured'],
+      [{ message: 'boom' }, 'unknown_error'],
+    ])('a failed send %j is recorded as failed/%s and rethrown for the caller to log', async (failure, reason) => {
+      const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
+      usersService.findById.mockResolvedValue({ id: 'u', email: ADDRESS });
+      emailService.sendConversationSummaryEmail.mockRejectedValue(Object.assign(new Error((failure as any).message ?? 'x'), failure));
+      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1')).rejects.toThrow();
+      expect(calls(conversationService)).toEqual([['pending', null], ['failed', reason]]);
+      expect(JSON.stringify(conversationService.setSummaryEmailStatus.mock.calls)).not.toContain(ADDRESS);
+    });
+
+    it('a PDF attachment failure is recorded as attachment_failed and no email is attempted', async () => {
+      const { gateway, conversationService, emailService, documentService, usersService } = createSummaryGateway();
+      usersService.findById.mockResolvedValue({ id: 'u', email: ADDRESS });
+      documentService.buildSummaryPdfBuffer.mockRejectedValue(new Error('pdf engine crashed'));
+      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1')).rejects.toThrow();
+      expect(calls(conversationService)).toEqual([['pending', null], ['failed', 'attachment_failed']]);
+      expect(emailService.sendConversationSummaryEmail).not.toHaveBeenCalled();
+    });
+
+    it('an account with no email address is skipped/no_recipient (no pending, nothing sent)', async () => {
+      const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
+      usersService.findById.mockResolvedValue({ id: 'u', email: null });
+      await gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1');
+      expect(calls(conversationService)).toEqual([['skipped', 'no_recipient']]);
+      expect(emailService.sendConversationSummaryEmail).not.toHaveBeenCalled();
+    });
+
+    it('a guest session records nothing', async () => {
+      const { gateway, conversationService, emailService } = createSummaryGateway();
+      await gateway.sendSummaryReadyEmail(createFakeSession({ isGuest: true }), summary, 'doc-1');
+      expect(conversationService.setSummaryEmailStatus).not.toHaveBeenCalled();
+      expect(emailService.sendConversationSummaryEmail).not.toHaveBeenCalled();
+    });
+
+    it('failing to record the outcome never blocks or fails the email, and never touches summary readiness', async () => {
+      const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
+      usersService.findById.mockResolvedValue({ id: 'u', email: ADDRESS });
+      conversationService.setSummaryEmailStatus.mockRejectedValue(new Error('column "summary_email_status" does not exist')); // code deployed before the migration
+      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1')).resolves.toBeUndefined();
+      expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledTimes(1);
+      expect(conversationService.setSummaryStatus).not.toHaveBeenCalled();
+    });
+
+    it('a user lookup failure is recorded as failed/unknown_error', async () => {
+      const { gateway, conversationService, usersService } = createSummaryGateway();
+      usersService.findById.mockRejectedValue(new Error('db down'));
+      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1')).rejects.toThrow();
+      expect(calls(conversationService)).toEqual([['failed', 'unknown_error']]);
+    });
+  });
 
   describe('Stop while a summary is already being generated (outage longer than the 90s grace)', () => {
     const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((r) => { resolve = r; }); return { promise, resolve }; };
