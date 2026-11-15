@@ -76,6 +76,7 @@ function createFakeSession(overrides: Record<string, unknown> = {}) {
     recoveryAudioBuffer: [] as Array<{ chunk: Buffer; enqueuedAt: number }>,
     recoveryAudioBufferBytes: 0,
     recoveryBufferOverflowStartedAt: null as number | null,
+    recoveryDroppedBytes: 0,
     ...overrides,
   };
 }
@@ -2506,5 +2507,154 @@ describe('VoiceGateway lifecycle correlation and terminal reasons', () => {
       expect(blob).not.toMatch(/Tolu Secret|@example\.com|Bearer |eyJ/);
     }
     expect(lines).toContain('traceId=trace-priv');
+  });
+});
+
+
+describe('VoiceGateway provider delivery outcomes (sent, retained, or explicitly lost)', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
+
+  const eventsOf = (client: any, name: string) => client.emit.mock.calls.filter((c: any[]) => c[0] === name).map((c: any[]) => c[1]);
+  const lifecycle = (event: string) => (Logger.prototype.log as jest.Mock).mock.calls.map((c) => String(c[0])).filter((l) => l.includes(`event=${event} `));
+  const conn = (sendAudio: jest.Mock = jest.fn().mockReturnValue(true)) => ({ emitter: new EventEmitter(), sendAudio, sendFinalize: jest.fn(), close: jest.fn() });
+  const bytesOf = (...n: number[]) => n.map((v) => Buffer.alloc(100, v));
+
+  const recovering = (over: Record<string, unknown> = {}) => {
+    const t = createGateway();
+    const client = createFakeClient('sock-o');
+    const session: any = createFakeSession({ providerState: 'recovering', traceId: 'trace-o', ...over });
+    t.gateway.sessions.set(client.id, session);
+    return { ...t, client, session };
+  };
+
+  it('failure during replay: the first replacement is discarded with the buffer intact, the retry replays everything in order, and recovery is reported once', async () => {
+    const { gateway, deepgramService, client, session } = recovering();
+    for (const c of bytesOf(1, 2, 3, 4)) gateway.bufferAudioForRecovery(session, c);
+
+    let n = 0;
+    const flaky = conn(jest.fn(() => (++n < 3 ? true : false))); // accepts 2 chunks, then refuses
+    const good = conn();
+    deepgramService.createLiveSession.mockResolvedValueOnce(flaky).mockResolvedValueOnce(good);
+
+    await gateway.recoverProviderSession(client, Object.assign(session, { providerState: 'active' }), 0, 'deepgram_closed', null);
+
+    expect(flaky.close).toHaveBeenCalledTimes(1);
+    expect(good.sendAudio.mock.calls.map((c: any[]) => c[0][0])).toEqual([1, 2, 3, 4]); // all four, in order, on the connection that was kept
+    expect(session.sendAudio).toBe(good.sendAudio);
+    expect(session.recoveryAudioBuffer).toEqual([]);
+    expect(session.providerState).toBe('active');
+    expect(session.providerEpoch).toBe(1); // only the kept connection advanced the epoch
+    expect(eventsOf(client, 'session:recovering')).toHaveLength(1);
+    expect(eventsOf(client, 'session:recovered')).toHaveLength(1);
+    expect(eventsOf(client, 'session:degraded')).toHaveLength(0);
+    expect(lifecycle('replay_failed')).toHaveLength(1);
+  });
+
+  it('replay refused on every attempt: one terminal degraded with an explicit loss (bytes and reason), never a silent "recovered"', async () => {
+    const { gateway, deepgramService, client, session } = recovering();
+    for (const c of bytesOf(1, 2, 3)) gateway.bufferAudioForRecovery(session, c);
+    const conns = [conn(jest.fn().mockReturnValue(false)), conn(jest.fn().mockReturnValue(false)), conn(jest.fn().mockReturnValue(false))];
+    conns.forEach((c) => deepgramService.createLiveSession.mockResolvedValueOnce(c));
+
+    await gateway.recoverProviderSession(client, Object.assign(session, { providerState: 'active' }), 0, 'transport_failure', null);
+
+    expect(conns.every((c) => c.close.mock.calls.length === 1)).toBe(true);
+    expect(eventsOf(client, 'session:recovered')).toHaveLength(0);
+    const [degraded] = eventsOf(client, 'session:degraded');
+    expect(degraded).toMatchObject({ reason: 'provider_recovery_exhausted', lossReason: 'replay_failed', lostAudioBytes: 300, correlation: { traceId: 'trace-o' } });
+    expect(gateway.sessions.has(client.id)).toBe(false);
+  }, 10_000);
+
+  it('recovery-buffer byte cap: retained chunks are replayed in order, dropped bytes are counted and reported as a loss', async () => {
+    const { gateway, deepgramService, client, session } = recovering();
+    const chunks = [1, 2, 3, 4, 5, 6].map((v) => Buffer.alloc(100_000, v)); // cap is 320k → 3 fit
+    for (const c of chunks) gateway.handleAudioChunk(client, { chunk: c, sequence: chunks.indexOf(c), recordingId: 'r' });
+    expect(session.recoveryAudioBuffer.map((e: any) => e.chunk[0])).toEqual([1, 2, 3]);
+    expect(session.recoveryDroppedBytes).toBe(300_000);
+    // every chunk was acknowledged as "server took responsibility"; the three that could not be kept are reported as lost below
+    expect(eventsOf(client, 'audio:ack')).toHaveLength(6);
+
+    const next = conn();
+    deepgramService.createLiveSession.mockResolvedValue(next);
+    await gateway.recoverProviderSession(client, Object.assign(session, { providerState: 'active' }), 0, 'deepgram_closed', null);
+
+    expect(next.sendAudio.mock.calls.map((c: any[]) => c[0][0])).toEqual([1, 2, 3]);
+    expect(eventsOf(client, 'session:recovered')[0]).toMatchObject({ audioGapDetected: true, lossReason: 'recovery_buffer_bound', droppedAudioBytes: 300_000 });
+    expect(session.recoveryDroppedBytes).toBe(0);
+  });
+
+  it('recovery-buffer age limit: the oldest chunk is evicted, counted as lost, and only fresher audio is replayed', async () => {
+    jest.useFakeTimers();
+    const { gateway, deepgramService, client, session } = recovering();
+    gateway.bufferAudioForRecovery(session, Buffer.alloc(100, 1));
+    jest.advanceTimersByTime(11_000); // older than the 10s window
+    gateway.bufferAudioForRecovery(session, Buffer.alloc(100, 2));
+    expect(session.recoveryDroppedBytes).toBe(100);
+
+    const next = conn();
+    deepgramService.createLiveSession.mockResolvedValue(next);
+    await gateway.recoverProviderSession(client, Object.assign(session, { providerState: 'active' }), 0, 'deepgram_closed', null);
+    expect(next.sendAudio.mock.calls.map((c: any[]) => c[0][0])).toEqual([2]);
+  });
+
+  it('provider socket not OPEN with no close/error callback: the chunk is retained, recovery starts once, and the chunk is replayed on the new connection', async () => {
+    const { gateway, deepgramService, client, session } = recovering({ providerState: 'active' });
+    session.sendAudio = jest.fn().mockReturnValue(false); // what the adapter returns for CONNECTING/CLOSING/CLOSED
+    const replacement = conn();
+    deepgramService.createLiveSession.mockResolvedValue(replacement);
+
+    gateway.handleAudioChunk(client, { chunk: Buffer.from([7, 7]), sequence: 0, recordingId: 'r' });
+    gateway.handleAudioChunk(client, { chunk: Buffer.from([8, 8]), sequence: 1, recordingId: 'r' }); // arrives mid-recovery: buffered too
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    expect(deepgramService.createLiveSession).toHaveBeenCalledTimes(1);
+    expect(replacement.sendAudio.mock.calls.map((c: any[]) => Array.from(c[0]))).toEqual([[7, 7], [8, 8]]);
+    expect(session.providerState).toBe('active');
+  });
+
+  it('two consecutive disruptions, duplicate error/close/keepalive signals in each epoch, and a refused replay: exactly one recovery per disruption', async () => {
+    const { gateway, deepgramService, client, session } = recovering({ providerState: 'active' });
+    const first = new EventEmitter();
+    session.deepgramEmitter = first;
+    gateway.attachDeepgramListeners(client, session, first);
+    const second = conn();
+    const third = conn();
+    deepgramService.createLiveSession.mockResolvedValueOnce(second).mockResolvedValueOnce(third);
+
+    // epoch 0 → duplicate signals from one dying connection
+    // (the real adapter guards 'error' emits once listeners are removed, so the duplicates that follow are
+    // the keepalive and close signals)
+    first.emit('error', new Error('x'));
+    first.emit('transportFailure', { source: 'sendKeepAlive', error: new Error('provider socket not open (readyState=3)') });
+    first.emit('close', { code: 1006 });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(deepgramService.createLiveSession).toHaveBeenCalledTimes(1);
+    expect(session.providerEpoch).toBe(1);
+
+    // epoch 1 → the replacement dies too, again with duplicates; the late epoch-0 signal is ignored
+    second.emitter.emit('transportFailure', { source: 'sendMedia', error: new Error('y') });
+    second.emitter.emit('close', { code: 1006 });
+    first.emit('close', { code: 1006 });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(deepgramService.createLiveSession).toHaveBeenCalledTimes(2);
+    expect(session.providerEpoch).toBe(2);
+    expect(session.sendAudio).toBe(third.sendAudio);
+    expect(eventsOf(client, 'session:recovering')).toHaveLength(2);
+    expect(eventsOf(client, 'session:recovered')).toHaveLength(2);
+    expect(eventsOf(client, 'session:degraded')).toHaveLength(0);
+  });
+
+  it('audio:stop does not sit out the whole drain timeout when the Finalize could not be delivered', async () => {
+    jest.useFakeTimers();
+    const { gateway } = createGateway();
+    const session: any = createFakeSession();
+    session.sendFinalize = jest.fn().mockReturnValue(false);
+    let settled = false;
+    gateway.finalizeAndDrain(session, 4_000).then(() => { settled = true; });
+    await Promise.resolve(); await Promise.resolve();
+    expect(settled).toBe(true); // resolved without advancing the timers
   });
 });

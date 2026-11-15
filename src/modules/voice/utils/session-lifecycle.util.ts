@@ -18,7 +18,7 @@ export type SessionTerminalReason =
 export type ProviderDisruptionCause = 'provider_closed' | 'provider_error' | 'provider_transport_failure';
 
 /** Why audio may be missing (non-terminal). */
-export type AudioLossReason = 'sequence_gap' | 'recovery_buffer_bound';
+export type AudioLossReason = 'sequence_gap' | 'recovery_buffer_bound' | 'replay_failed';
 
 export function providerDisruptionCause(reason: ProviderDisruptionReason): ProviderDisruptionCause {
   switch (reason) {

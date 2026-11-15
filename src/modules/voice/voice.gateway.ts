@@ -135,7 +135,7 @@ interface ActiveSession {
   deepgramEmitter: EventEmitter;
   /** Returns false when the provider socket could not accept the chunk (not OPEN / send threw). */
   sendAudio: (chunk: Buffer) => boolean | void;
-  sendFinalize: () => void;
+  sendFinalize: () => boolean | void;
   closeDeepgram: () => void;
   accumulatedTranscript: string;
   /**
@@ -266,6 +266,8 @@ interface ActiveSession {
   recoveryAudioBufferBytes: number;
   /** Wall-clock timestamp when overflow-driven dropping started this recovery cycle; null when not currently dropping. */
   recoveryBufferOverflowStartedAt: number | null;
+  /** Bytes of audio dropped from the recovery buffer (byte cap / age) during the current outage — reported, never silent. */
+  recoveryDroppedBytes: number;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
@@ -980,6 +982,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         recoveryAudioBuffer: [],
         recoveryAudioBufferBytes: 0,
         recoveryBufferOverflowStartedAt: null,
+        recoveryDroppedBytes: 0,
       };
 
       this.attachDeepgramListeners(client, session, emitter);
@@ -1360,7 +1363,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const timer = setTimeout(cleanup, timeoutMs);
       session.deepgramEmitter.on('finalized', onFinalized);
       try {
-        session.sendFinalize();
+        if (session.sendFinalize() === false) {
+          // The provider socket is not open: no Finalize will ever be acknowledged, so
+          // don't sit out the whole drain timeout waiting for it.
+          this.logger.warn(`Finalize not delivered (provider socket not open) trace=${session.traceId}`);
+          cleanup();
+        }
       } catch (err) {
         this.logger.warn(`sendFinalize threw: ${(err as Error).message}`);
         cleanup();
@@ -4399,6 +4407,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           return;
         }
 
+        // Replay the buffered audio through the NEW connection first. If the provider
+        // refuses a chunk this connection is useless: discard it (its emitter has no
+        // listeners, so nothing it produced is lost), keep the whole buffer intact, and
+        // let the next attempt replay from the start — never a "recovered" session that
+        // silently lost the replay.
+        const replay = this.flushRecoveryBuffer(session, sendAudio);
+        if (replay.failed) {
+          try { close(); } catch (_) {}
+          this.logLifecycle(session, 'replay_failed', { attempt, bufferedBytes: session.recoveryAudioBufferBytes, replayedBytes: replay.flushedBytes });
+          throw new Error('provider refused replay of buffered audio');
+        }
+
         session.deepgramEmitter = emitter;
         session.sendAudio = sendAudio;
         session.sendFinalize = sendFinalize;
@@ -4407,7 +4427,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         this.resetSpeakerStateForNewEpoch(session);
         this.attachDeepgramListeners(client, session, emitter);
 
-        const { droppedDurationMs } = this.flushRecoveryBuffer(session);
+        const droppedDurationMs = replay.droppedDurationMs;
 
         // Back to 'active' so a *later* disruption of the new connection is
         // recoverable too (a stale event from the replaced connection is still
@@ -4420,11 +4440,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           `(epoch=${session.providerEpoch}, droppedDurationMs=${droppedDurationMs})`,
         );
 
-        this.logLifecycle(session, 'provider_recovered', { recoveryId, attempt, droppedDurationMs });
+        this.logLifecycle(session, 'provider_recovered', { recoveryId, attempt, droppedDurationMs, replayedBytes: replay.flushedBytes, droppedBytes: replay.droppedBytes });
         client.emit('session:recovered', {
           recoveryId,
           correlation: this.correlation(session),
-          ...(droppedDurationMs > 0 ? { lossReason: 'recovery_buffer_bound' satisfies AudioLossReason } : {}),
+          ...(droppedDurationMs > 0 ? { lossReason: 'recovery_buffer_bound' satisfies AudioLossReason, droppedAudioBytes: replay.droppedBytes } : {}),
           providerEpoch: session.providerEpoch,
           audioGapDetected: droppedDurationMs > 0,
           droppedDurationMs,
@@ -4459,11 +4479,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       },
     });
 
-    this.logLifecycle(session, 'session_terminal', { reason: 'provider_recovery_exhausted' satisfies SessionTerminalReason, cause: providerDisruptionCause(reason), incidentId });
+    const lostAudioBytes = (session.recoveryAudioBufferBytes ?? 0) + (session.recoveryDroppedBytes ?? 0);
+    this.logLifecycle(session, 'session_terminal', { reason: 'provider_recovery_exhausted' satisfies SessionTerminalReason, cause: providerDisruptionCause(reason), incidentId, lostAudioBytes });
     client.emit('session:degraded', {
       recoveryId,
       reason: 'provider_recovery_exhausted' satisfies SessionTerminalReason,
       cause: providerDisruptionCause(reason),
+      // Audio that was buffered or dropped during the outage and never reached a provider.
+      ...(lostAudioBytes > 0 ? { lossReason: (session.recoveryDroppedBytes ?? 0) > 0 ? 'recovery_buffer_bound' : 'replay_failed' satisfies AudioLossReason, lostAudioBytes } : {}),
       correlation: this.correlation(session),
       category: 'provider_recovery_failed',
       recoverable: false,
@@ -4484,6 +4507,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     ) {
       const dropped = session.recoveryAudioBuffer.shift()!;
       session.recoveryAudioBufferBytes -= dropped.chunk.length;
+      session.recoveryDroppedBytes = (session.recoveryDroppedBytes ?? 0) + dropped.chunk.length;
       this.noteBoundHit(session, 'recoveryBufferAgeEvict');
     }
 
@@ -4493,6 +4517,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       if (session.recoveryBufferOverflowStartedAt === null) {
         session.recoveryBufferOverflowStartedAt = now;
       }
+      session.recoveryDroppedBytes = (session.recoveryDroppedBytes ?? 0) + buffer.length;
       this.noteBoundHit(session, 'recoveryBufferByteOverflow');
       return;
     }
@@ -4502,23 +4527,35 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     this.sampleSessionMetrics(session);
   }
 
-  /** Replays the bounded recovery buffer to the newly-reconnected provider and clears it. */
-  private flushRecoveryBuffer(session: ActiveSession): { flushedBytes: number; droppedDurationMs: number } {
+  /**
+   * Replays the bounded recovery buffer, in order, through `send` (the NEW provider
+   * connection's sender; defaults to the session's current one). Returns an explicit
+   * outcome: on `failed` the provider refused a chunk, nothing is cleared, and the
+   * caller must treat the replay as not having happened (retry or report loss).
+   */
+  private flushRecoveryBuffer(
+    session: ActiveSession,
+    send: (chunk: Buffer) => boolean | void = session.sendAudio,
+  ): { flushedBytes: number; droppedDurationMs: number; droppedBytes: number; failed: boolean } {
     let flushedBytes = 0;
     for (const { chunk } of session.recoveryAudioBuffer) {
-      session.sendAudio(chunk);
+      if (send(chunk) === false) {
+        return { flushedBytes, droppedDurationMs: 0, droppedBytes: session.recoveryDroppedBytes ?? 0, failed: true };
+      }
       flushedBytes += chunk.length;
     }
 
     const droppedDurationMs = session.recoveryBufferOverflowStartedAt !== null
       ? Date.now() - session.recoveryBufferOverflowStartedAt
       : 0;
+    const droppedBytes = session.recoveryDroppedBytes ?? 0;
 
     session.recoveryAudioBuffer = [];
     session.recoveryAudioBufferBytes = 0;
     session.recoveryBufferOverflowStartedAt = null;
+    session.recoveryDroppedBytes = 0;
 
-    return { flushedBytes, droppedDurationMs };
+    return { flushedBytes, droppedDurationMs, droppedBytes, failed: false };
   }
 
   private cleanupSession(socketId: string): void {

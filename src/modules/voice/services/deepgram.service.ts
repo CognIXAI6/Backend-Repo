@@ -88,7 +88,7 @@ export class DeepgramService implements OnModuleInit {
   async createLiveSession(sessionId: string, options?: { diarize?: boolean; utteranceEndMs?: number; meetingMode?: boolean; audioFormat?: DeepgramLiveAudioFormat; connectionTimeoutMs?: number }): Promise<{
     emitter: EventEmitter;
     sendAudio: (chunk: Buffer) => boolean;
-    sendFinalize: () => void;
+    sendFinalize: () => boolean;
     close: () => void;
   }> {
     const emitter = new EventEmitter();
@@ -275,6 +275,16 @@ export class DeepgramService implements OnModuleInit {
         if (socket.readyState === 1) {
           socket.sendKeepAlive({ type: 'KeepAlive' });
           lastKeepAliveAt = Date.now();
+        } else if (socket.readyState === 2 || socket.readyState === 3) {
+          // CLOSING / CLOSED with no 'close' or 'error' event delivered: the
+          // provider is gone but nothing told us. Report it (once) so the gateway
+          // starts recovery instead of idling on a dead socket until the next audio chunk.
+          if (keepAliveTimer) clearInterval(keepAliveTimer);
+          this.logger.warn(`[${sessionId}] KeepAlive skipped — provider socket not open (readyState=${socket.readyState})`);
+          emitter.emit('transportFailure', {
+            source: 'sendKeepAlive',
+            error: new Error(`provider socket not open (readyState=${socket.readyState})`),
+          });
         }
       } catch (err) {
         this.logger.warn(`[${sessionId}] sendKeepAlive failed: ${(err as Error).message}`);
@@ -310,15 +320,18 @@ export class DeepgramService implements OnModuleInit {
     // Never throws; a Results message with from_finalize:true isn't
     // guaranteed if nothing was buffered, so the caller must still apply its
     // own bounded timeout rather than waiting on this indefinitely.
-    const sendFinalize = (): void => {
+    /** Returns true only if the Finalize message was actually handed to the provider socket. */
+    const sendFinalize = (): boolean => {
       try {
         if (socket.readyState === 1) {
           socket.sendFinalize({ type: 'Finalize' });
-        } else {
-          this.logger.warn(`[${sessionId}] sendFinalize skipped — readyState=${socket.readyState}`);
+          return true;
         }
+        this.logger.warn(`[${sessionId}] sendFinalize skipped — readyState=${socket.readyState}`);
+        return false;
       } catch (err) {
         this.logger.warn(`[${sessionId}] sendFinalize failed: ${(err as Error).message}`);
+        return false;
       }
     };
 
