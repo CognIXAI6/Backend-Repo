@@ -4,6 +4,7 @@ import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getMessaging, MulticastMessage } from 'firebase-admin/messaging';
+import { describeError } from '@/common/utils/log-safe.util';
 
 export interface PushPayload {
   title: string;
@@ -74,7 +75,7 @@ export class PushNotificationService implements OnModuleInit {
     try {
       const response = await getMessaging().sendEachForMulticast(message);
       this.logger.log(
-        `Push sent to user ${userId}: ${response.successCount} succeeded, ${response.failureCount} failed`,
+        `Push sent: ${response.successCount} succeeded, ${response.failureCount} failed`,
       );
 
       // Remove stale tokens (invalid / unregistered) to keep the table clean.
@@ -87,10 +88,10 @@ export class PushNotificationService implements OnModuleInit {
           .where({ user_id: userId })
           .whereIn('token', staleTokens)
           .delete();
-        this.logger.log(`Removed ${staleTokens.length} stale push token(s) for user ${userId}`);
+        this.logger.log(`Removed ${staleTokens.length} stale push token(s)`);
       }
     } catch (err) {
-      this.logger.error(`Push delivery failed for user ${userId}:`, err);
+      this.logger.error(`Push delivery failed: ${describeError(err)}`);
     }
   }
 }

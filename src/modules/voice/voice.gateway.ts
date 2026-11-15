@@ -37,6 +37,7 @@ import { buildCombinedSummary } from './utils/combined-summary.util';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
 import { RecordingTimingService } from './services/recording-timing.service';
+import { countWords, describeError } from '@/common/utils/log-safe.util';
 import {
   AudioLossReason,
   SessionCorrelation,
@@ -530,7 +531,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           'Anthropic API balance too low',
           `Context: ${context}\nError: ${msg}\nTime: ${new Date().toISOString()}`,
         )
-        .catch((e) => this.logger.error('Failed to send admin alert email:', e));
+        .catch((e) => this.logger.error(`Failed to send admin alert email: ${describeError(e)}`));
     }
 
     const clientMessage = isRateLimit
@@ -751,7 +752,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         try {
           await this.conversationService.assertOwnership(conversationId, userId);
         } catch {
-          this.logger.warn(`session:start: conversationId ${conversationId} not owned by ${userId} — creating new`);
+          this.logger.warn(`session:start: conversation ${conversationId} not owned by caller — creating new`);
           conversationId = undefined;
         }
       }
@@ -865,7 +866,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         if (emptyConv) {
           conversationId = emptyConv.id;
-          this.logger.log(`session:start: reusing empty conversation ${conversationId} for user ${userId}`);
+          this.logger.log(`session:start: reusing empty conversation ${conversationId}`);
         } else {
           const conv = await this.conversationService.createConversation(
             userId,
@@ -997,7 +998,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         restoredParticipants = await this.conversationService
           .getConversationParticipants(conversationId)
           .catch((err) => {
-            this.logger.warn(`[${client.id}] Failed to load conversation participants: ${(err as Error).message}`);
+            this.logger.warn(`[${client.id}] Failed to load conversation participants: ${describeError(err)}`);
             return [];
           });
 
@@ -1009,7 +1010,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           role: 'owner',
           voiceSpeakerId: cachedVoiceSpeakerId ?? undefined,
         }).catch((err) =>
-          this.logger.warn(`[${client.id}] Failed to upsert owner participant: ${(err as Error).message}`),
+          this.logger.warn(`[${client.id}] Failed to upsert owner participant: ${describeError(err)}`),
         );
 
         // Pre-populate resolvedSpeakers from prior voice-ID confirmations so
@@ -1019,10 +1020,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             // We can't map to a Deepgram speaker ID yet (provider hasn't assigned
             // clusters), but we pre-load the roster so identifyMultiSpeaker()
             // can match quickly.  The actual mapping happens in identifyMultiSpeaker.
-            this.logger.debug(
-              `[${client.id}] Restored participant "${p.display_name}" ` +
-              `(voiceId=${p.voice_speaker_id}) for conv ${conversationId}`,
-            );
+            this.logger.debug(`[${client.id}] Restored a voice-confirmed participant for conv ${conversationId}`);
           }
         }
       }
@@ -1038,7 +1036,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             speakerId: entry.speakerId,
             voiceSpeakerId: entry.voiceSpeakerId ?? undefined,
           }).catch((err) =>
-            this.logger.warn(`[${client.id}] Failed to upsert roster participant: ${(err as Error).message}`),
+            this.logger.warn(`[${client.id}] Failed to upsert roster participant: ${describeError(err)}`),
           );
         }
       }
@@ -1046,7 +1044,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const rosterCount = speakerRoster.length;
       this.logLifecycle(session, 'session_start', { mode, isGuest });
       this.logger.log(
-        `Session started — user: ${userId} (${isGuest ? 'guest' : 'auth'}), ` +
+        `Session started — ${isGuest ? 'guest' : 'auth'}, trace: ${session.traceId}, ` +
         `conv: ${conversationId}, mode: ${mode}, roster: ${rosterCount}, ` +
         `audioSource: ${session.audioSource}, restored: ${restoredParticipants.length}`,
       );
@@ -1370,7 +1368,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           cleanup();
         }
       } catch (err) {
-        this.logger.warn(`sendFinalize threw: ${(err as Error).message}`);
+        this.logger.warn(`sendFinalize threw: ${describeError(err)}`);
         cleanup();
       }
     });
@@ -1456,7 +1454,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     const quality = this.isTranscriptMeaningful(transcript, avgConfidence);
     if (!quality.pass) {
-      this.logger.log(`Transcript filtered [${quality.reason}]: "${transcript}" (conf=${avgConfidence.toFixed(2)})`);
+      this.logger.log(`Transcript filtered [${quality.reason}]: words=${countWords(transcript)} (conf=${avgConfidence.toFixed(2)})`);
       client.emit('ai:skipped', { reason: quality.reason, transcript });
       return;
     }
@@ -1584,7 +1582,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.otherSpeakerName = name;
     }
 
-    this.logger.log(`[${client.id}] Speaker named: ${payload.speaker}="${name}"`);
+    this.logger.log(`[${client.id}] Speaker named: role=${payload.speaker}`);
 
     client.emit('speaker:named', {
       speaker: payload.speaker,
@@ -1673,7 +1671,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
 
       this.logger.log(
-        `[${client.id}] Voice ID calibration — verified=${result.verified}, similarity=${result.similarityScore.toFixed(3)}, ownerSpeakerId=${confirmedOwnerSpeakerId}`,
+        `[${client.id}] Voice ID calibration — verified=${result.verified}, ownerSpeakerId=${confirmedOwnerSpeakerId}`,
       );
 
       client.emit('voice_id:result', {
@@ -1747,7 +1745,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         providerEpoch: correctionEpoch,
       });
     } catch (err) {
-      this.logger.warn(`[${client.id}] correctTranscriptSpeaker DB error: ${(err as Error).message}`);
+      this.logger.warn(`[${client.id}] correctTranscriptSpeaker DB error: ${describeError(err)}`);
       this.emitError(client, 'SPEAKER_CORRECTION_FAILED', (err as Error).message, {
         clientMessage: 'Could not save the speaker correction. Please try again.',
         severity: 'warn',
@@ -1769,7 +1767,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     this.logger.log(
-      `[${client.id}] Speaker corrected: deepgramId=${payload.deepgramSpeakerId}, speaker="${speaker.name}", applyTo=${payload.applyTo ?? 'session_speaker'}`,
+      `[${client.id}] Speaker corrected: deepgramId=${payload.deepgramSpeakerId}, applyTo=${payload.applyTo ?? 'session_speaker'}`,
     );
 
     client.emit('transcript:speaker_corrected', {
@@ -1825,7 +1823,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         providerEpoch: renameEpoch,
       });
     } catch (err) {
-      this.logger.warn(`[${client.id}] renameAnonymousSpeaker DB error: ${(err as Error).message}`);
+      this.logger.warn(`[${client.id}] renameAnonymousSpeaker DB error: ${describeError(err)}`);
       this.emitError(client, 'GUEST_RENAME_FAILED', (err as Error).message, {
         clientMessage: 'Could not save the guest name. Please try again.',
         severity: 'warn',
@@ -1845,7 +1843,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.anonymousSpeakerLabels.set(payload.deepgramSpeakerId, name);
     }
 
-    this.logger.log(`[${client.id}] Guest renamed: deepgramId=${payload.deepgramSpeakerId} → "${name}"`);
+    this.logger.log(`[${client.id}] Guest renamed: deepgramId=${payload.deepgramSpeakerId}`);
 
     // Persist the manual rename as a durable conversation participant so the
     // name survives a provider reconnect and appears in the next session:ready.
@@ -1857,7 +1855,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         role: 'participant',
         voiceConfirmed: false,
       }).catch((err) =>
-        this.logger.warn(`[${client.id}] Failed to persist renamed participant: ${(err as Error).message}`),
+        this.logger.warn(`[${client.id}] Failed to persist renamed participant: ${describeError(err)}`),
       );
     }
 
@@ -2399,16 +2397,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           body: combined.title,
           data: { docId: result.docId, downloadUrl: result.downloadUrl },
         })
-        .catch((err) => this.logger.warn(`Push notification failed for auto-summary ${result.docId}:`, err));
+        .catch((err) => this.logger.warn(`Push notification failed for auto-summary ${result.docId}: ${describeError(err)}`));
 
       // Fire-and-forget, same as the push notification above: for a user
       // who's already closed the app, this is the one delivery channel that
       // doesn't depend on a live connection or a notification permission.
       this.sendSummaryReadyEmail(session, combined).catch((err) =>
-        this.logger.warn(`Summary-ready email failed for conversation ${session.conversationId}:`, err),
+        this.logger.warn(`Summary-ready email failed for conversation ${session.conversationId}: ${describeError(err)}`),
       );
 
-      this.logger.log(`Auto-summary generated for conversation ${session.conversationId}: ${result.downloadUrl}`);
+      this.logger.log(`Auto-summary generated for conversation ${session.conversationId} (doc ${result.docId})`);
     } catch (err) {
       await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
       client.emit('document:failed', { title: combined.title, reason: "We couldn't generate your conversation summary.", auto: true });
@@ -2592,7 +2590,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           if (session.entitlements) {
             this.usageService
               .tryConsume(session.userId, 'messages', 1, session.entitlements.maxMessagesPerMonth)
-              .catch((err) => this.logger.error(`Failed to record message usage for user ${session.userId}:`, err));
+              .catch((err) => this.logger.error(`Failed to record message usage (trace=${session.traceId}): ${describeError(err)}`));
           }
 
           client.emit('ai:done', {
@@ -2747,7 +2745,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           if (session.entitlements) {
             this.usageService
               .tryConsume(session.userId, 'messages', 1, session.entitlements.maxMessagesPerMonth)
-              .catch((err) => this.logger.error(`Failed to record message usage for user ${session.userId}:`, err));
+              .catch((err) => this.logger.error(`Failed to record message usage (trace=${session.traceId}): ${describeError(err)}`));
           }
 
           client.emit('ai:done', {
@@ -2801,7 +2799,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       });
 
       session.cachedAiMemory = updatedMemory;
-      this.logger.log(`Memory saved for user ${session.userId}`);
+      this.logger.log(`Memory saved (trace=${session.traceId})`);
     } catch (err) {
       this.logger.error('saveSessionMemory error:', err);
     }
@@ -2834,7 +2832,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       if (inputType === 'voice' && history.length >= 4) {
         const relevant = await this.claudeService.checkTopicRelevance(userMessage, history, session.fieldName);
         if (!relevant) {
-          this.logger.log(`Topic filter blocked: "${userMessage.slice(0, 80)}…"`);
+          this.logger.log(`Topic filter blocked a prompt (words=${countWords(userMessage)})`);
           client.emit('ai:skipped', { reason: 'off_topic', transcript: userMessage });
           session.isProcessingAI = false;
           return;
@@ -2919,7 +2917,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const documentContext = await this.conversationService
         .getFullDocumentContext(session.conversationId, session.userId)
         .catch((err) => {
-          this.logger.warn(`Failed to load document context: ${err.message}`);
+          this.logger.warn(`Failed to load document context: ${describeError(err)}`);
           return null;
         });
 
@@ -3046,19 +3044,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             } else if (session.entitlements) {
               this.usageService
                 .tryConsume(session.userId, 'messages', 1, session.entitlements.maxMessagesPerMonth)
-                .catch((err) => this.logger.error(`Failed to record message usage for user ${session.userId}:`, err));
+                .catch((err) => this.logger.error(`Failed to record message usage (trace=${session.traceId}): ${describeError(err)}`));
             }
 
             if (session.entitlements) {
               if (generatedDocId && documentUsageLimit !== null) {
                 this.usageService
                   .tryConsume(session.userId, 'documents', 1, documentUsageLimit)
-                  .catch((err) => this.logger.error(`Failed to record document usage for user ${session.userId}:`, err));
+                  .catch((err) => this.logger.error(`Failed to record document usage (trace=${session.traceId}): ${describeError(err)}`));
               }
               if (webSearchCalls > 0) {
                 this.usageService
                   .tryConsume(session.userId, 'web_searches', webSearchCalls, session.entitlements.maxWebSearchesPerMonth)
-                  .catch((err) => this.logger.error(`Failed to record web search usage for user ${session.userId}:`, err));
+                  .catch((err) => this.logger.error(`Failed to record web search usage (trace=${session.traceId}): ${describeError(err)}`));
               }
             }
 
@@ -3079,7 +3077,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           onDocumentRequest: documentGenerationEnabled
             ? async (req) => {
-                this.logger.log(`[${client.id}] Document generation requested: "${req.title}"`);
+                this.logger.log(`[${client.id}] Document generation requested`);
                 // Include jobId so the client can match this event to future ready/failed events.
                 client.emit('document:generating', { jobId: docJobId, title: req.title, topic: req.topic });
 
@@ -3112,7 +3110,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                     downloadUrl: result.downloadUrl,
                   });
 
-                  this.logger.log(`[${client.id}] Document ready: ${result.downloadUrl}`);
+                  this.logger.log(`[${client.id}] Document ready (doc ${result.docId})`);
 
                   // Fire-and-forget push notification — socket already delivered the event,
                   // so push is a best-effort duplicate for users who may have closed the tab.
@@ -3122,10 +3120,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
                       body: req.title,
                       data: { docId: result.docId, downloadUrl: result.downloadUrl, jobId: docJobId },
                     })
-                    .catch((err) => this.logger.warn(`Push notification failed for doc ${result.docId}:`, err));
+                    .catch((err) => this.logger.warn(`Push notification failed for doc ${result.docId}: ${describeError(err)}`));
                   return result;
                 } catch (err) {
-                  this.logger.error(`[${client.id}] Document generation failed for "${req.title}":`, err);
+                  this.logger.error(`[${client.id}] Document generation failed: ${describeError(err)}`);
                   client.emit('document:failed', {
                     jobId: docJobId,
                     title: req.title,
@@ -3221,7 +3219,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           audioUrl,
           voiceSpeakerId,
         );
-        this.logger.log(`[${client.id}] Owner voice profile reinforced from single-speaker session (id=${voiceSpeakerId})`);
+        this.logger.log(`[${client.id}] Owner voice profile reinforced from single-speaker session`);
       } else {
         const regResult = await this.voiceVerificationService.registerSpeaker(
           session.cachedOwnerName,
@@ -3232,7 +3230,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           voice_embedding_id: regResult.embeddingId,
         });
         session.cachedVoiceSpeakerId = regResult.speakerId;
-        this.logger.log(`[${client.id}] Owner voice profile enrolled from single-speaker session (id=${regResult.speakerId})`);
+        this.logger.log(`[${client.id}] Owner voice profile enrolled from single-speaker session`);
       }
     } catch (err) {
       this.logger.error(`[${client.id}] Single-speaker voice profile build failed:`, err);
@@ -3284,7 +3282,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.calibrationPhase = false;
 
         this.logger.log(
-          `[${client.id}] Voice enrolled: speakerId=${regResult.speakerId}, owner=speaker ${dominantSpeaker}`,
+          `[${client.id}] Voice enrolled: owner=speaker ${dominantSpeaker}`,
         );
 
         client.emit('voice_id:result', {
@@ -3377,8 +3375,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     this.logger.log(
       `[${client.id}] Speaker ${deepgramSpeakerId} identify result: ` +
-      `identified=${result.identified}, matchedId=${result.speakerId ?? 'none'}, ` +
-      `score=${result.similarityScore.toFixed(3)}, ` +
+      `identified=${result.identified}, ` +
       `audio=${hasPerSpeakerAudio ? 'per-speaker' : 'mixed'}, ` +
       `candidates=${result.candidatesChecked}`,
     );
@@ -3452,7 +3449,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
 
       this.logger.log(
-        `[${client.id}] Speaker ${deepgramSpeakerId} identified as contact "${resolvedName}" ` +
+        `[${client.id}] Speaker ${deepgramSpeakerId} identified as a contact ` +
         `— owner corrected to speaker ${correctedOwner}`,
       );
 
@@ -3561,8 +3558,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     this.logger.log(
       `[${client.id}] Multi-speaker ${deepgramSpeakerId} identify: ` +
-      `identified=${result.identified}, matchedId=${result.speakerId ?? 'none'}, ` +
-      `score=${result.similarityScore.toFixed(3)}, candidates=${result.candidatesChecked}`,
+      `identified=${result.identified}, candidates=${result.candidatesChecked}`,
     );
 
     // ── Gap 4: always resolve to local speakers.id, never the external voice ID ──
@@ -3598,7 +3594,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         resolvedSpeakerId = priorResolved.speakerId;
         method = 'voice_id';
         this.logger.log(
-          `[${client.id}] Speaker ${deepgramSpeakerId} consolidated with prior speaker ${priorDgramId} ("${resolvedName}") — same voice print`,
+          `[${client.id}] Speaker ${deepgramSpeakerId} consolidated with prior speaker ${priorDgramId} — same voice print`,
         );
       } else {
         // 1. Check session roster (voice_speaker_id → local speaker ID)
@@ -3625,7 +3621,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.speakerIdentificationFailed.add(deepgramSpeakerId);
       this.logger.log(
         `[${client.id}] Speaker ${deepgramSpeakerId} identification returned no match ` +
-        `(score=${result.similarityScore.toFixed(3)}) — will retry`,
+        `— will retry`,
       );
     }
 
@@ -3659,7 +3655,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         recordingSessionId: session.recordingSessionId,
         providerEpoch: epoch,
       }).catch((err) =>
-        this.logger.warn(`[${client.id}] retroactive segment update failed (non-fatal): ${(err as Error).message}`),
+        this.logger.warn(`[${client.id}] retroactive segment update failed (non-fatal): ${describeError(err)}`),
       );
 
       // ── Persist the confirmed identity as a durable conversation participant ──
@@ -3673,7 +3669,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         voiceSpeakerId: resolvedVoiceSpeakerId ?? undefined,
         voiceConfirmed: true,
       }).catch((err) =>
-        this.logger.warn(`[${client.id}] Failed to persist voice-ID participant: ${(err as Error).message}`),
+        this.logger.warn(`[${client.id}] Failed to persist voice-ID participant: ${describeError(err)}`),
       );
     }
 
@@ -4284,7 +4280,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         const quality = this.isTranscriptMeaningful(transcript, avgConfidence);
         if (!quality.pass) {
-          this.logger.log(`UtteranceEnd filtered [${quality.reason}]: "${transcript}" (conf=${avgConfidence.toFixed(2)})`);
+          this.logger.log(`UtteranceEnd filtered [${quality.reason}]: words=${countWords(transcript)} (conf=${avgConfidence.toFixed(2)})`);
           client.emit('ai:skipped', { reason: quality.reason, transcript });
           return;
         }
@@ -4318,7 +4314,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       this.handleProviderDisruption(client, session, epoch, 'deepgram_closed', closeInfo);
     });
     emitter.on('transportFailure', ({ source, error }: { source: string; error: Error }) => {
-      this.logger.warn(`[${client.id}] provider transport failure (${source}) epoch=${epoch}: ${error.message}`);
+      this.logger.warn(`[${client.id}] provider transport failure (${source}) epoch=${epoch}: ${describeError(error)}`);
       this.handleProviderDisruption(client, session, epoch, 'transport_failure');
     });
   }
@@ -4428,6 +4424,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         this.attachDeepgramListeners(client, session, emitter);
 
         const droppedDurationMs = replay.droppedDurationMs;
+        // Dropped bytes are a loss even when the outage was shorter than the clock tick.
+        const audioLost = droppedDurationMs > 0 || replay.droppedBytes > 0;
 
         // Back to 'active' so a *later* disruption of the new connection is
         // recoverable too (a stale event from the replaced connection is still
@@ -4444,15 +4442,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         client.emit('session:recovered', {
           recoveryId,
           correlation: this.correlation(session),
-          ...(droppedDurationMs > 0 ? { lossReason: 'recovery_buffer_bound' satisfies AudioLossReason, droppedAudioBytes: replay.droppedBytes } : {}),
+          ...(audioLost ? { lossReason: 'recovery_buffer_bound' satisfies AudioLossReason, droppedAudioBytes: replay.droppedBytes } : {}),
           providerEpoch: session.providerEpoch,
-          audioGapDetected: droppedDurationMs > 0,
+          audioGapDetected: audioLost,
           droppedDurationMs,
         });
         return;
       } catch (err) {
         this.logger.warn(
-          `[${client.id}] provider recovery ${recoveryId} attempt ${attempt}/${PROVIDER_RECOVERY_MAX_ATTEMPTS} failed: ${(err as Error).message}`,
+          `[${client.id}] provider recovery ${recoveryId} attempt ${attempt}/${PROVIDER_RECOVERY_MAX_ATTEMPTS} failed: ${describeError(err)}`,
         );
       }
     }
@@ -4609,7 +4607,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       if (elapsedSeconds > 0) {
         this.usageService
           .tryConsume(session.userId, 'voice_seconds', elapsedSeconds, maxMinutes !== null ? maxMinutes * 60 : null)
-          .catch((err) => this.logger.error(`Failed to record voice usage for user ${session.userId}:`, err));
+          .catch((err) => this.logger.error(`Failed to record voice usage (trace=${session.traceId}): ${describeError(err)}`));
       }
     }
 

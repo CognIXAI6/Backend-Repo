@@ -16,6 +16,7 @@ import { UsersService, User } from '@/modules/users/users.service';
 import { EmailService } from '@/modules/email/email.service';
 import { generateToken, addDays, isExpired, generateOtp, addMinutes } from '@/common';
 import { SendOtpDto, VerifyOtpDto, ClerkSyncDto, RefreshTokenDto } from './dto/auth.dto';
+import { describeError } from '@/common/utils/log-safe.util';
 
 @Injectable()
 export class AuthService {
@@ -71,7 +72,7 @@ export class AuthService {
       : this.emailService.sendRegistrationOtpEmail(email, otp);
 
     emailPromise.catch((err) =>
-      this.logger.error(`Failed to send OTP email to ${email}:`, err),
+      this.logger.error(`Failed to send OTP email: ${describeError(err)}`),
     );
 
     return {

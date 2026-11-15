@@ -9,6 +9,7 @@ import { FlutterwaveService, FlutterwaveWebhookPayload } from './flutterwave.ser
 import { PlanType, isPaidTier } from '@/modules/entitlements/entitlements.types';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
+import { describeError } from '@/common/utils/log-safe.util';
 
 export type BillingCycle = 'monthly' | 'quarterly' | 'biannual' | 'yearly';
 
@@ -563,7 +564,7 @@ export class PaymentService {
         if (result.synced && (result.status === 'active' || result.status === 'trialing')) {
           synced++;
           details.push({ userId: user.id, email: user.email, result: `activated (${result.status})` });
-          this.logger.log(`bulkSync: activated user ${user.id} (${user.email}) — sub status: ${result.status}`);
+          this.logger.log(`bulkSync: activated user ${user.id} — sub status: ${result.status}`);
         } else {
           alreadyCorrect++;
           details.push({ userId: user.id, email: user.email, result: `no active Stripe sub (${result.status ?? 'none'})` });
@@ -572,7 +573,7 @@ export class PaymentService {
         failed++;
         const msg = (err as Error).message;
         details.push({ userId: user.id, email: user.email, result: `error: ${msg}` });
-        this.logger.error(`bulkSync: failed for user ${user.id} — ${msg}`);
+        this.logger.error(`bulkSync: failed for user ${user.id} — ${describeError(err)}`);
       }
     }
 
@@ -886,7 +887,7 @@ export class PaymentService {
       return;
     }
 
-    this.logger.log(`syncSubscription: matched user ${user.id} (${user.email})`);
+    this.logger.log(`syncSubscription: matched user ${user.id}`);
 
     const priceId = subscription.items.data[0]?.price.id ?? null;
     const plan = priceId ? await this.getPlanForPriceId(priceId) : null;

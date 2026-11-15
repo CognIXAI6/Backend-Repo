@@ -81,7 +81,7 @@ export class VoiceVerificationService {
       });
 
       if (!data.success) {
-        this.logger.error(`Voice registration unsuccessful for speaker: ${speakerName}`);
+        this.logger.error('Voice registration unsuccessful');
         throw new Error('Failed to register voice profile');
       }
 

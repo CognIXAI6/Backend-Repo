@@ -11,6 +11,7 @@ import { MulterError } from 'multer';
 import * as Sentry from '@sentry/nestjs';
 import { GIT_SHA } from '../utils/deployment-metadata.util';
 import { RequestWithCorrelation } from '../middleware/correlation-id.middleware';
+import { safePath } from '@/common/utils/log-safe.util';
 
 @Catch()
 export class GlobalExceptionFilter implements ExceptionFilter {
@@ -84,7 +85,7 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     }
 
     this.logger.error(
-      `${request.method} ${request.url} - ${status} correlationId=${correlationId ?? 'unknown'} durationMs=${durationMs ?? 'n/a'}`,
+      `${request.method} ${safePath(request.url)} - ${status} correlationId=${correlationId ?? 'unknown'} durationMs=${durationMs ?? 'n/a'}`,
       exception instanceof Error ? exception.stack : JSON.stringify(exception),
     );
 

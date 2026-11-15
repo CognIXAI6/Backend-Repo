@@ -3,6 +3,7 @@ import { Knex } from 'knex';
 import { KNEX_CONNECTION } from '@/database/database.module';
 import { UploadFolder, UploadService } from '../upload/upload.service';
 import { VoiceVerificationService } from '../voice/services/voice-verification.service';
+import { describeError } from '@/common/utils/log-safe.util';
 
 export interface Speaker {
   id: string;
@@ -246,7 +247,7 @@ export class SpeakersService {
     // ── 2. Attempt voice registration — non-fatal if service is unavailable ──
     if (!this.voiceVerificationService.isEnabled) {
       this.logger.warn(
-        `Voice enrollment skipped for "${speaker.name}" — VOICE_VERIFICATION_URL not configured`,
+        `Voice enrollment skipped — VOICE_VERIFICATION_URL not configured`,
       );
       return { ...speaker, voiceEnrolled: false, enrollmentError: 'Voice verification service is not configured' };
     }
@@ -281,7 +282,7 @@ export class SpeakersService {
       return { ...updated, voiceEnrolled: true };
     } catch (err) {
       this.logger.warn(
-        `Voice registration failed for "${speaker.name}" (audio saved, no embedding): ${(err as Error).message}`,
+        `Voice registration failed (audio saved, no embedding): ${describeError(err)}`,
       );
       const fresh = await this.getSpeakerById(userId, speakerId);
       return {

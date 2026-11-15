@@ -43,7 +43,7 @@ export class UploadService {
     }
 
     this.logger.log(
-      `Uploading file: ${file.originalname}, size: ${file.buffer.length} bytes, type: ${file.mimetype}`,
+      `Uploading file: size: ${file.buffer.length} bytes, type: ${file.mimetype}`,
     );
 
     try {
@@ -71,7 +71,7 @@ export class UploadService {
               reject(new BadRequestException("No result from Cloudinary"));
               return;
             }
-            this.logger.log("Cloudinary upload successful:", result.secure_url);
+            this.logger.log("Cloudinary upload successful");
             resolve(result);
           },
         );
@@ -120,7 +120,7 @@ export class UploadService {
       throw new BadRequestException('Empty buffer provided');
     }
 
-    this.logger.log(`Uploading buffer: ${filename}, size: ${buffer.length} bytes`);
+    this.logger.log(`Uploading buffer: folder=${folder}, size: ${buffer.length} bytes`);
 
     return new Promise((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
@@ -139,7 +139,7 @@ export class UploadService {
             reject(new BadRequestException('No result from Cloudinary'));
             return;
           }
-          this.logger.log(`Buffer upload successful: ${result.secure_url}`);
+          this.logger.log('Buffer upload successful');
           resolve(result);
         },
       );

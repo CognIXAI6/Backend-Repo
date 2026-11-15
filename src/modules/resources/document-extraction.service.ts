@@ -1,6 +1,7 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import * as mammoth from 'mammoth';
 import { PDFParse } from 'pdf-parse';
+import { describeError } from '@/common/utils/log-safe.util';
 
 const SUPPORTED_MIME_TYPES = [
   'application/pdf',
@@ -43,7 +44,7 @@ export class DocumentExtractionService {
         raw = buffer.toString('utf-8');
       }
     } catch (err) {
-      this.logger.error(`Text extraction failed for "${filename}":`, err);
+      this.logger.error(`Text extraction failed: ${describeError(err)}`);
       throw new BadRequestException(`Failed to read "${filename}". The file may be corrupt or password-protected.`);
     }
 

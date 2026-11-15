@@ -157,7 +157,7 @@ export class DeepgramService implements OnModuleInit {
 
       if (data?.type === 'Results') {
         const alt = data?.channel?.alternatives?.[0];
-        this.logger.debug(`[${sessionId}] transcript="${alt?.transcript ?? ''}" isFinal=${data.is_final} fromFinalize=${data.from_finalize ?? false}`);
+        this.logger.debug(`[${sessionId}] result chars=${(alt?.transcript ?? '').length} isFinal=${data.is_final} fromFinalize=${data.from_finalize ?? false}`);
 
         if (alt?.transcript) {
           emitter.emit('transcript', {

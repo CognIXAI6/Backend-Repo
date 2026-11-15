@@ -43,7 +43,7 @@ export class VideoAnalysisService {
     }
 
     this.logger.log(
-      `Analysing video: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(1)} MB)`,
+      `Analysing video (${(file.size / 1024 / 1024).toFixed(1)} MB)`,
     );
 
     const audioBuffer = await this.extractAudio(file.buffer, file.originalname);

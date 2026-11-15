@@ -26,6 +26,7 @@ import { ConfigService } from '@nestjs/config';
 import PDFDocument = require('pdfkit');
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { describeError } from '@/common/utils/log-safe.util';
 
 export interface DocumentSection {
   heading: string;
@@ -99,7 +100,7 @@ export class DocumentService {
       );
     }
 
-    this.logger.log(`Generating document: "${title}" for user ${userId} (depth: ${depth}, format: ${format})`);
+    this.logger.log(`Generating document (depth: ${depth}, format: ${format}, sections: ${sections.length})`);
 
     // Trim sections to the depth limit before enrichment — unless a page count was
     // requested, where trimming would silently shrink the document below it.
@@ -141,7 +142,7 @@ export class DocumentService {
       .returning('id');
 
     const docId = typeof row === 'object' ? (row as Record<string, string>).id : String(row);
-    this.logger.log(`Document saved: id=${docId}, url=${downloadUrl}`);
+    this.logger.log(`Document saved: id=${docId}`);
 
     return { docId, downloadUrl };
   }
@@ -443,7 +444,7 @@ export class DocumentService {
         },
         (error, result) => {
           if (error) {
-            this.logger.error('Cloudinary document upload error:', error.message);
+            this.logger.error(`Cloudinary document upload error: ${describeError(error)}`);
             reject(new Error(`Document upload failed: ${error.message}`));
             return;
           }
@@ -451,7 +452,7 @@ export class DocumentService {
             reject(new Error('No result from Cloudinary'));
             return;
           }
-          this.logger.log(`Document uploaded: ${result.secure_url}`);
+          this.logger.log('Document uploaded');
           resolve(result.secure_url);
         },
       );
@@ -518,10 +519,10 @@ export class DocumentService {
     if (doc.cloudinary_public_id) {
       cloudinary.uploader
         .destroy(doc.cloudinary_public_id, { resource_type: 'raw' })
-        .catch((err) => this.logger.warn(`Cloudinary delete failed for ${doc.cloudinary_public_id}:`, err));
+        .catch((err) => this.logger.warn(`Cloudinary delete failed for ${doc.cloudinary_public_id}: ${describeError(err)}`));
     }
 
     await this.knex('generated_documents').where({ id: docId }).delete();
-    this.logger.log(`Document deleted: id=${docId} by user=${userId}`);
+    this.logger.log(`Document deleted: id=${docId}`);
   }
 }

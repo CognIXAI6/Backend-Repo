@@ -1,6 +1,7 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { tavily } from '@tavily/core';
+import { describeError, redactText, safeHost } from '@/common/utils/log-safe.util';
 
 export interface CrawlResult {
   url: string;
@@ -40,13 +41,13 @@ export class WebCrawlService {
         extractDepth: 'advanced',
       });
     } catch (err: any) {
-      this.logger.error(`Tavily extract failed for "${url}":`, err);
+      this.logger.error(`Tavily extract failed (host=${safeHost(url)}): ${describeError(err)}`);
       throw new BadRequestException(this.mapNetworkError(err));
     }
 
     if (response.failedResults?.length && !response.results?.length) {
       const reason = response.failedResults[0]?.error ?? '';
-      this.logger.warn(`Tavily could not extract "${url}": ${reason}`);
+      this.logger.warn(`Tavily could not extract (host=${safeHost(url)}): ${redactText(reason)}`);
       throw new BadRequestException(this.mapTavilyError(url, reason));
     }
 

@@ -2,6 +2,18 @@ import { Module } from '@nestjs/common';
 import { LoggerModule as PinoLoggerModule } from 'nestjs-pino';
 import { ConfigService } from '@nestjs/config';
 
+// Request/response headers carry bearer tokens and cookies; pino-http logs them by default.
+export const REDACT = {
+  paths: [
+    'req.headers.authorization',
+    'req.headers.cookie',
+    'req.headers["x-api-key"]',
+    'req.headers["x-auth-token"]',
+    'res.headers["set-cookie"]',
+  ],
+  censor: '[redacted]',
+};
+
 @Module({
   imports: [
     PinoLoggerModule.forRootAsync({
@@ -13,6 +25,7 @@ import { ConfigService } from '@nestjs/config';
             pinoHttp: {
               level: 'info',
               autoLogging: true,
+              redact: REDACT,
             },
           };
         }
@@ -20,6 +33,7 @@ import { ConfigService } from '@nestjs/config';
         return {
           pinoHttp: {
             level: 'debug',
+            redact: REDACT,
             transport: {
               target: require.resolve('pino-pretty'),
               options: {

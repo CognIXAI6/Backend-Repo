@@ -4,6 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { tavily } from '@tavily/core';
 import { checkLength, countWords, estimatePages, PAGE_CAPACITY, targetWords } from '@/modules/documents/document-length.util';
 import { buildLanguageDirective } from '@/common/constants/conversation-languages.constant';
+import { describeError } from '@/common/utils/log-safe.util';
 
 export interface DocumentRequest {
   title: string;
@@ -485,7 +486,7 @@ export class ClaudeService implements OnModuleInit {
             }
           }
 
-          this.logger.log(`  → generating document: "${docInput.title}" (depth: ${docInput.depth ?? 'standard'}, format: ${docInput.format ?? 'docx'})`);
+          this.logger.log(`  → generating document (depth: ${docInput.depth ?? 'standard'}, format: ${docInput.format ?? 'docx'})`);
 
           try {
             const result = await callbacks.onDocumentRequest!({
@@ -502,7 +503,7 @@ export class ClaudeService implements OnModuleInit {
               `Document generated successfully (about ${estimatePages(countWords(docInput.sections), docInput.format ?? 'docx')} pages).\nTitle: ${docInput.title}\nDownload URL: ${result.downloadUrl}\nDocument ID: ${result.docId}`,
             );
           } catch (err) {
-            this.logger.error(`Document generation error for "${docInput.title}":`, err);
+            this.logger.error(`Document generation error: ${describeError(err)}`);
             docResultsMap.set(tc.id, 'Document generation failed. Please try again.');
           }
         }

@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Resend } from 'resend';
 import * as nodemailer from 'nodemailer';
+import { describeError } from '@/common/utils/log-safe.util';
 
 export interface EmailAttachment {
   filename: string;
@@ -43,8 +44,8 @@ export class EmailService {
 async sendEmail(options: EmailOptions): Promise<void> {
   const from = `${this.configService.get('email.fromName')} <${this.configService.get('email.from')}>`;
   
-  this.logger.log(`Attempting to send email to ${options.to} from ${from}`);
-  this.logger.log(`Using Resend: ${!!this.resend}, Using Nodemailer: ${!!this.transporter}`);
+  const transport = this.resend ? 'resend' : this.transporter ? 'smtp' : 'none';
+  this.logger.log(`Email send attempt transport=${transport} attachments=${options.attachments?.length ?? 0}`);
 
   try {
     if (this.resend) {
@@ -57,7 +58,7 @@ async sendEmail(options: EmailOptions): Promise<void> {
       });
 
       if (error) {
-        this.logger.error(`Resend API error:`, error);
+        this.logger.error(`Resend API error: ${describeError(error)}`);
         throw new Error(`Resend failed: ${error.message}`);
       }
 
@@ -76,7 +77,7 @@ async sendEmail(options: EmailOptions): Promise<void> {
       throw new Error('No email transport configured');
     }
   } catch (error) {
-    this.logger.error(`Failed to send email to ${options.to}:`, error);
+    this.logger.error(`Failed to send email (transport=${transport}): ${describeError(error)}`);
     throw error;
   }
 }

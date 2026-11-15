@@ -16,6 +16,7 @@ import { KNEX_CONNECTION } from '@/database/database.module';
 import { FxService } from '../payment/fx.service';
 import { EmailService } from '../email/email.service';
 import { PlanType } from '../entitlements/entitlements.types';
+import { describeError } from '@/common/utils/log-safe.util';
 
 export type AdminRole = 'super_admin' | 'admin';
 export type Period = '7d' | '30d' | '90d' | 'all';
@@ -100,9 +101,9 @@ export class AdminService {
 
     this.emailService
       .sendAdminInvitationEmail({ to: email, name, invitedByName: inviterName, role, token, acceptUrl, expiresAt })
-      .catch((err) => this.logger.error(`Failed to send invitation email to ${email}:`, err));
+      .catch((err) => this.logger.error(`Failed to send invitation email: ${describeError(err)}`));
 
-    this.logger.log(`Admin invitation created for ${email} by admin ${invitedById}`);
+    this.logger.log(`Admin invitation created by admin ${invitedById}`);
     return { message: `Invitation sent to ${email}`, token, expiresAt };
   }
 
@@ -160,7 +161,7 @@ export class AdminService {
       } catch (err) {
         failed++;
         details.push({ email: inv.email, status: 'failed', reason: (err as Error).message });
-        this.logger.error(`Failed to resend invitation to ${inv.email}:`, err);
+        this.logger.error(`Failed to resend invitation: ${describeError(err)}`);
       }
     }
 
