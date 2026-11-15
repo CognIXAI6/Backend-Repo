@@ -369,14 +369,22 @@ export class ConversationService {
   async findRecentEmptyConversation(
     userId: string,
     mode: ConversationMode,
+    fieldId: string | null = null,
   ): Promise<Conversation | null> {
-    return (
-      (await this.knex('conversations')
-        .where({ user_id: userId, mode, total_messages: 0 })
-        .whereNull('deleted_at')
-        .orderBy('created_at', 'desc')
-        .first()) ?? null
-    );
+    const q = this.knex('conversations')
+      .where({ user_id: userId, mode, total_messages: 0 })
+      .whereNull('deleted_at');
+    // Reuse only inside the same professional field (null matches null): an empty
+    // Healthcare conversation must never be handed back to a Law session.
+    if (fieldId) q.andWhere('field_id', fieldId);
+    else q.whereNull('field_id');
+    return (await q.orderBy('created_at', 'desc').first()) ?? null;
+  }
+
+  /** The field a conversation was created under (null = none). Callers must have checked ownership. */
+  async getConversationFieldId(conversationId: string): Promise<string | null> {
+    const row = await this.knex('conversations').where('id', conversationId).first('field_id');
+    return row?.field_id ?? null;
   }
 
   // ── Get paginated history list ──────────────────────────────────────────────

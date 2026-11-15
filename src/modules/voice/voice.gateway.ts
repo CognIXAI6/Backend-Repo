@@ -94,8 +94,8 @@ interface ActiveSession {
   userId: string;
   conversationId: string;
   fieldName?: string;
-  /** Last time fieldName was re-read from the user's primary field (ms epoch). */
-  fieldCheckedAt?: number;
+  /** The field this conversation is stored under (authoritative for live prompts); null = none. */
+  fieldId?: string | null;
   /** AI turns currently being processed — awaited before the session summary so a final turn isn't missed. */
   inFlightTurns: Set<Promise<unknown>>;
   /** Logical recording-session id registered via session:timing:start (authenticated sessions only). */
@@ -704,18 +704,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         return;
       }
 
-      // ── Resolve field context ─────────────────────────────────────────────
-      let resolvedFieldId = payload.fieldId;
-      let resolvedFieldName = payload.fieldName;
-
-      if (!isGuest && (!resolvedFieldId || !resolvedFieldName)) {
-        const primaryField = await this.fieldsService.getUserPrimaryField(userId);
-        if (primaryField) {
-          resolvedFieldId = resolvedFieldId ?? (primaryField.field_id ?? primaryField.custom_field_id ?? primaryField.id);
-          resolvedFieldName = resolvedFieldName ?? primaryField.name;
-        }
-      }
-
       // ── Load user data once ───────────────────────────────────────────────
       let cachedAiMemory: string | null = null;
       let cachedVoiceSpeakerId: string | null = null;
@@ -736,6 +724,56 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         } catch {
           this.logger.warn(`session:start: conversationId ${conversationId} not owned by ${userId} — creating new`);
           conversationId = undefined;
+        }
+      }
+
+      // ── Resolve the ONE field this conversation lives under ──────────────
+      // Never trust a client-supplied field ID/name pair:
+      //  • resumed conversation → its persisted field_id is authoritative (history is
+      //    not silently reclassified; a different requested field is only FLAGGED so the
+      //    client can start a new conversation for a deliberate field boundary);
+      //  • new conversation     → the requested field ID if this user may use it (name
+      //    always taken from the record), else the account's primary field;
+      //  • guests               → only a built-in field matched by name, never free text.
+      const requestedFieldId =
+        typeof payload.fieldId === 'string' && payload.fieldId.trim() ? payload.fieldId.trim() : null;
+      let fieldId: string | null = null;
+      let resolvedFieldName: string | undefined;
+      let fieldSource: 'conversation' | 'requested' | 'primary' | 'none' = 'none';
+      let fieldFallback = false;
+      let fieldMismatch = false;
+
+      if (conversationId) {
+        const persistedFieldId = await this.conversationService.getConversationFieldId(conversationId);
+        fieldId = persistedFieldId;
+        if (persistedFieldId) {
+          const record = await this.fieldsService.findFieldRecordForUser(userId, persistedFieldId);
+          resolvedFieldName = record?.name;
+          fieldSource = 'conversation';
+        }
+        fieldMismatch = requestedFieldId !== null && requestedFieldId !== persistedFieldId;
+      } else if (isGuest) {
+        const builtIn = await this.fieldsService.findActiveBuiltInByName(payload.fieldName);
+        if (builtIn) {
+          fieldId = builtIn.id;
+          resolvedFieldName = builtIn.name;
+          fieldSource = 'requested';
+        }
+      } else {
+        const authorized = await this.fieldsService.resolveAuthorizedField(userId, requestedFieldId);
+        if (authorized) {
+          fieldId = authorized.id;
+          resolvedFieldName = authorized.name;
+          fieldSource = 'requested';
+        } else {
+          // Absent, stale, malformed or someone else's: same outcome for all of them.
+          fieldFallback = requestedFieldId !== null;
+          const primary = await this.fieldsService.getUserPrimaryField(userId);
+          if (primary) {
+            fieldId = primary.field_id ?? primary.custom_field_id ?? null;
+            resolvedFieldName = primary.name;
+            fieldSource = fieldId ? 'primary' : 'none';
+          }
         }
       }
 
@@ -793,7 +831,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // creating a new one — prevents accumulation of duplicate "Untitled conversation"
         // rows when the user starts and stops recording without sending any messages.
         const emptyConv = !isGuest
-          ? await this.conversationService.findRecentEmptyConversation(userId, dbMode)
+          ? await this.conversationService.findRecentEmptyConversation(userId, dbMode, fieldId)
           : null;
 
         if (emptyConv) {
@@ -803,7 +841,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           const conv = await this.conversationService.createConversation(
             userId,
             dbMode,
-            resolvedFieldId,
+            fieldId ?? undefined,
           );
           conversationId = conv.id;
         }
@@ -841,6 +879,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         userId,
         conversationId,
         fieldName: resolvedFieldName,
+        fieldId,
         isGuest,
         startedAt: Date.now(),
         tier,
@@ -984,6 +1023,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // providerSessionEpoch above is left as-is for backward compatibility.
         providerEpoch: session.providerEpoch,
         clientSessionId: session.clientSessionId,
+        // Field this conversation lives under. `mismatch`: the client asked for a different
+        // field than a resumed conversation's own (start a new conversation to change field);
+        // `fallback`: the requested field ID was not usable, so the primary field applies.
+        field: {
+          id: fieldId,
+          name: resolvedFieldName ?? null,
+          source: fieldSource,
+          mismatch: fieldMismatch,
+          fallback: fieldFallback,
+        },
         // Capability negotiation: clients only send session:timing:* when this is present.
         capabilities: { recordingTiming: this.recordingTimingService && !isGuest ? 1 : 0 },
         isGuest,
@@ -2092,30 +2141,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── Multi-speaker prompt processing (Gap 4) ─────────────────────────────────
 
-  /**
-   * The session captures the field once, at session:start. A user who then
-   * switches field (the app persists it as their primary field) kept getting
-   * replies — and "off-topic" refusals — for the OLD field until the socket
-   * session happened to restart. Re-read the primary field before each AI
-   * turn (throttled) so a switch takes effect on the very next prompt.
-   */
-  private async refreshSessionField(session: ActiveSession): Promise<void> {
-    if (session.isGuest) return;
-    const now = Date.now();
-    if (session.fieldCheckedAt && now - session.fieldCheckedAt < 3_000) return;
-    session.fieldCheckedAt = now;
-    try {
-      const primary = await this.fieldsService.getUserPrimaryField(session.userId);
-      const name = primary?.name;
-      if (name && name !== session.fieldName) {
-        this.logger.log(`Session field changed for user ${session.userId}: "${session.fieldName}" -> "${name}"`);
-        session.fieldName = name;
-      }
-    } catch (err) {
-      this.logger.warn(`refreshSessionField failed (keeping "${session.fieldName}"):`, err);
-    }
-  }
-
   private processMultiSpeakerPrompt(client: Socket, session: ActiveSession, turns: MultiSpeakerTurn[]): Promise<void> {
     return this.trackTurn(session, () => this.runMultiSpeakerPrompt(client, session, turns));
   }
@@ -2128,8 +2153,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
-
-    await this.refreshSessionField(session);
 
     try {
       // Gap 9: exclude the current turns from the history context so they only
@@ -2284,8 +2307,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     const speakerName = session.otherSpeakerName ?? 'Guest Speaker';
     const ownerName = session.cachedOwnerName;
-
-    await this.refreshSessionField(session);
 
     try {
       const recentHistory = session.dualSpeakerHistory.slice(-40);
@@ -2461,8 +2482,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
-
-    await this.refreshSessionField(session);
 
     try {
       const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 40);
