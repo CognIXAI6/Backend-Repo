@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { createSessionMetrics } from './utils/session-metrics.util';
 import { EventEmitter } from 'events';
 import { VoiceGateway } from './voice.gateway';
 
@@ -64,6 +65,7 @@ function createFakeSession(overrides: Record<string, unknown> = {}) {
     inFlightTurns: new Set<Promise<unknown>>(),
     acceptedTurnSeq: 0,
     settledTurnSeq: 0,
+    metrics: createSessionMetrics(),
     providerEpoch: 0,
     currentRecoveryId: null,
     recoveryAttempt: 0,
@@ -2142,5 +2144,161 @@ describe('VoiceGateway final-turn persistence barrier', () => {
     d.resolve();
     await t; await Promise.resolve();
     expect([session.acceptedTurnSeq, session.settledTurnSeq]).toEqual([1, 1]);
+  });
+});
+
+
+describe('VoiceGateway bounded session memory', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
+
+  const words = (n: number, speaker: number, tag: string) =>
+    Array.from({ length: n }, (_, i) => ({ word: `${tag}${i}`, speaker, start: i * 0.1, end: i * 0.1 + 0.1 }));
+  const wire = (session: any) => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-m');
+    const emitter = new EventEmitter();
+    gateway.sessions.set(client.id, session);
+    gateway.attachDeepgramListeners(client, session, emitter);
+    return { gateway, client, emitter };
+  };
+  const tick = async () => { for (let i = 0; i < 4; i++) await Promise.resolve(); };
+
+  it('multi-speaker: a very long session keeps history/pending bounded, and every accepted turn still reaches persistence in order', async () => {
+    const session: any = createFakeSession({ isMultiSpeaker: true, isGuest: true });
+    const { gateway, emitter } = wire(session);
+    const processed: string[] = [];
+    jest.spyOn(gateway, 'processMultiSpeakerPrompt').mockImplementation(async (_c: any, _s: any, turns: any[]) => {
+      processed.push(...turns.map((t) => t.text));
+    });
+
+    const TOTAL = 3_000;
+    let maxHistory = 0;
+    let maxPending = 0;
+    for (let i = 0; i < TOTAL; i++) {
+      emitter.emit('transcript', { isFinal: true, transcript: `t${i}`, confidence: 0.9, words: words(3, i % 2, `u${i}_`) });
+      await tick();
+      maxHistory = Math.max(maxHistory, session.multiSpeakerHistory.length);
+      maxPending = Math.max(maxPending, session.pendingMultiSpeakerTurns.length);
+    }
+
+    expect(maxHistory).toBeLessThanOrEqual(400);
+    expect(maxPending).toBeLessThanOrEqual(150 + 2); // forced flush keeps the queue at its bound (+ one result's runs)
+    // nothing un-persisted was dropped: flushed + still-pending == everything accepted, in order
+    const everyTurn = [...processed, ...session.pendingMultiSpeakerTurns.map((t: any) => t.text)];
+    expect(everyTurn).toHaveLength(TOTAL * 1);
+    expect(everyTurn).toEqual(Array.from({ length: TOTAL }, (_, i) => Array.from({ length: 3 }, (_, w) => `u${i}_${w}`).join(' ')));
+    // history is the most recent window, in order
+    expect(session.multiSpeakerHistory.at(-1).text).toBe(`u${TOTAL - 1}_0 u${TOTAL - 1}_1 u${TOTAL - 1}_2`);
+    expect(session.metrics.trimmedHistoryTurns).toBe(TOTAL - session.multiSpeakerHistory.length);
+    expect(session.metrics.boundHits.multiHistoryTrim).toBeGreaterThan(0);
+    expect(session.metrics.boundHits.pendingForceFlush).toBeGreaterThan(0);
+    expect(session.metrics.highWater.multiHistoryTurns).toBeLessThanOrEqual(401);
+    expect(session.metrics.highWater.pendingTurns).toBeLessThanOrEqual(152);
+  });
+
+  it('pending turns are never dropped while a turn is processing: they exceed the bound, then drain afterwards', async () => {
+    const session: any = createFakeSession({ isMultiSpeaker: true, isGuest: true });
+    const { gateway, emitter } = wire(session);
+    const processed: string[] = [];
+    const run = jest.spyOn(gateway, 'processMultiSpeakerPrompt').mockImplementation(async (_c: any, _s: any, turns: any[]) => { processed.push(...turns.map((t) => t.text)); });
+
+    session.isProcessingAI = true; // an AI turn is running: no forced flush may start
+    for (let i = 0; i < 200; i++) emitter.emit('transcript', { isFinal: true, transcript: `t${i}`, confidence: 0.9, words: words(2, 0, `p${i}_`) });
+    await tick();
+    expect(run).not.toHaveBeenCalled();
+    expect(session.pendingMultiSpeakerTurns).toHaveLength(200); // over the bound, none dropped
+
+    session.isProcessingAI = false;
+    emitter.emit('transcript', { isFinal: true, transcript: 'next', confidence: 0.9, words: words(2, 0, 'n_') });
+    await tick();
+    expect([...processed].length + session.pendingMultiSpeakerTurns.length).toBe(201);
+    expect(session.pendingMultiSpeakerTurns).toHaveLength(0);
+  });
+
+  it('dual-speaker: history is trimmed; pending text at its bound is flushed (not dropped) as one unattributed-safe turn', async () => {
+    const session: any = createFakeSession({ isDualSpeaker: true, isGuest: true, calibrationPhase: false, ownerSpeakerId: 0 });
+    const { gateway, emitter } = wire(session);
+    const dual = jest.spyOn(gateway, 'processDualSpeakerPrompt').mockImplementation(async () => undefined);
+
+    for (let i = 0; i < 600; i++) {
+      emitter.emit('transcript', { isFinal: true, transcript: `x${i}`, confidence: 0.9, words: words(2, i % 2, `d${i}_`) });
+      await tick();
+    }
+    expect(session.dualSpeakerHistory.length).toBeLessThanOrEqual(200);
+    expect(session.metrics.boundHits.dualHistoryTrim).toBeGreaterThan(0);
+
+    // fill pending text past MAX_PENDING_CHARS in a fresh session
+    const s2: any = createFakeSession({ isDualSpeaker: true, isGuest: true, calibrationPhase: false, ownerSpeakerId: 0 });
+    const w2 = wire(s2);
+    const dual2 = jest.spyOn(w2.gateway, 'processDualSpeakerPrompt').mockImplementation(async () => undefined);
+    const big = 'word '.repeat(3_200); // ~16k chars per result
+    for (let i = 0; i < 3; i++) {
+      w2.emitter.emit('transcript', { isFinal: true, transcript: big, confidence: 0.9, words: [{ word: big.trim(), speaker: 0, start: 0, end: 1 }] });
+      await tick();
+    }
+    expect(dual2).toHaveBeenCalled();
+    expect(s2.metrics.boundHits.pendingForceFlush).toBeGreaterThan(0);
+    const textFlushed = dual2.mock.calls.map((c: any[]) => `${c[2]} ${c[3]} ${c[5] ?? ''}`).join(' ') + ` ${s2.pendingOwnerText} ${s2.pendingOtherText}`;
+    expect((textFlushed.match(/word/g) ?? []).length).toBeGreaterThanOrEqual(3 * 3_200 - 5); // every word accounted for
+    void dual;
+  });
+
+  it('confidence samples are a bounded rolling window', async () => {
+    const session: any = createFakeSession({ isGuest: true });
+    const { emitter } = wire(session);
+    for (let i = 0; i < 1_500; i++) emitter.emit('transcript', { isFinal: true, transcript: 'a b c', confidence: 0.5, words: [] });
+    expect(session.transcriptConfidences.length).toBeLessThanOrEqual(500);
+    expect(session.metrics.boundHits.confidenceTrim).toBeGreaterThan(0);
+  });
+
+  it('recovery-buffer byte overflow and age eviction are counted, and logged once per kind', () => {
+    jest.useFakeTimers();
+    const { gateway } = createGateway();
+    const warn = jest.spyOn(Logger.prototype, 'warn');
+    const session: any = createFakeSession({ providerState: 'recovering' });
+    const chunk = Buffer.alloc(200_000, 1);
+    gateway.bufferAudioForRecovery(session, chunk);
+    gateway.bufferAudioForRecovery(session, chunk); // over the byte cap → dropped
+    gateway.bufferAudioForRecovery(session, chunk);
+    expect(session.metrics.boundHits.recoveryBufferByteOverflow).toBe(2);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('recoveryBufferByteOverflow'))).toHaveLength(1);
+
+    jest.advanceTimersByTime(10 * 60_000);
+    gateway.bufferAudioForRecovery(session, Buffer.alloc(10));
+    expect(session.metrics.boundHits.recoveryBufferAgeEvict).toBeGreaterThanOrEqual(1);
+    expect(session.metrics.highWater.recoveryBufferBytes).toBeGreaterThanOrEqual(200_000);
+  });
+
+  it('audio and per-speaker buffer caps are counted when reached', () => {
+    const { gateway } = createGateway();
+    (gateway as any).voiceVerificationService = { isEnabled: true };
+    const client = createFakeClient('sock-c');
+    const session: any = createFakeSession({ isMultiSpeaker: true, audioBufferBytes: 2 * 1024 * 1024 });
+    session.speakerAudioBytes.set(0, 2 * 1024 * 1024);
+    session.sendAudio = jest.fn().mockReturnValue(true);
+    gateway.sessions.set(client.id, session);
+    gateway.handleAudioChunk(client, { chunk: Buffer.from([1, 2, 3]), sequence: 0, recordingId: 'r' });
+    expect(session.metrics.boundHits.audioBufferCap).toBe(1);
+    expect(session.metrics.boundHits.speakerAudioCap).toBe(1);
+  });
+
+  it('the cleanup log carries counters and sizes only — never transcript text', () => {
+    const { gateway } = createGateway();
+    const log = jest.spyOn(Logger.prototype, 'log');
+    const session: any = createFakeSession({ isMultiSpeaker: true, isGuest: true });
+    session.multiSpeakerHistory.push({ deepgramSpeakerId: 0, speakerId: null, speakerLabel: 'Guest 1', text: 'TOPSECRET-DIAGNOSIS', confidence: 1, startMs: null, endMs: null, identificationMethod: 'diarization' });
+    session.pendingOwnerText = 'TOPSECRET-DRUG';
+    gateway.sessions.set('sock-x', session);
+    gateway.cleanupSession('sock-x');
+    const line = log.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('Session cleaned up')) as string;
+    expect(line).toContain('metrics=');
+    expect(line).not.toMatch(/TOPSECRET/);
+    const json = JSON.parse(line.split('metrics=')[1]);
+    expect(json.highWater.multiHistoryTurns).toBe(1);
+    expect(json.highWater.pendingChars).toBe('TOPSECRET-DRUG'.length); // a size, not the text
+    expect(Object.values(json.highWater).every((v) => typeof v === 'number')).toBe(true);
   });
 });

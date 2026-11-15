@@ -37,6 +37,14 @@ import { buildCombinedSummary } from './utils/combined-summary.util';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
 import { RecordingTimingService } from './services/recording-timing.service';
+import {
+  BoundKind,
+  SESSION_BOUNDS,
+  SessionMetrics,
+  createSessionMetrics,
+  recordHighWater,
+  snapshotMetrics,
+} from './utils/session-metrics.util';
 import { PlanEntitlements, PlanType } from '@/modules/entitlements/entitlements.types';
 import { SettingsService } from '@/modules/settings/settings.service';
 import { buildUnclearFallback, buildDocumentReadyFallback } from './constants/fallback-messages.constant';
@@ -101,6 +109,8 @@ interface ActiveSession {
   /** In-memory turn sequence: turns accepted for processing vs. settled (for ordering/diagnostics; not persisted). */
   acceptedTurnSeq: number;
   settledTurnSeq: number;
+  /** Memory/queue high-water marks and bound hits (counts and bytes only). */
+  metrics: SessionMetrics;
   /** Logical recording-session id registered via session:timing:start (authenticated sessions only). */
   timingSessionId?: string;
   isGuest: boolean;
@@ -943,6 +953,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         inFlightTurns: new Set<Promise<unknown>>(),
         acceptedTurnSeq: 0,
         settledTurnSeq: 0,
+        metrics: createSessionMetrics(),
         providerEpoch: 0,
         currentRecoveryId: null,
         recoveryAttempt: 0,
@@ -1262,6 +1273,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const spk = session.currentDominantSpeaker;
       const spkBufs = session.speakerAudioBuffers.get(spk) ?? [];
       const spkBytes = session.speakerAudioBytes.get(spk) ?? 0;
+      if (spkBytes >= this.AUDIO_BUFFER_CAP) this.noteBoundHit(session, 'speakerAudioCap');
       if (spkBytes < this.AUDIO_BUFFER_CAP) {
         spkBufs.push(buffer);
         session.speakerAudioBuffers.set(spk, spkBufs);
@@ -1271,10 +1283,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     // ── General audio buffering ───────────────────────────────────────────
     const shouldBuffer = !session.isGuest && session.audioBufferBytes < this.AUDIO_BUFFER_CAP;
+    this.maybeSampleSessionMetrics(session);
     const needsBuffer =
       shouldDiarize ||
       (!session.isDualSpeaker && !session.isMultiSpeaker && !session.singleSpeakerProfileTriggered && this.voiceVerificationService.isEnabled);
 
+    if (!shouldBuffer && needsBuffer && !session.isGuest) this.noteBoundHit(session, 'audioBufferCap');
     if (shouldBuffer && needsBuffer) {
       session.audioBuffer.push(buffer);
       session.audioBufferBytes += buffer.length;
@@ -1896,6 +1910,90 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected, unattributedText);
     return true;
+  }
+
+  // ── Bounded in-memory state + observability ──────────────────────────────────
+
+  /** Counts a bound being reached; logs the first hit of each kind per session (ids only, no content). */
+  private noteBoundHit(session: ActiveSession, kind: BoundKind): void {
+    const m = session.metrics;
+    if (!m) return;
+    m.boundHits[kind] += 1;
+    if (!m.loggedKinds.has(kind)) {
+      m.loggedKinds.add(kind);
+      this.logger.warn(`Session bound reached: ${kind} (recordingSession=${session.recordingSessionId}, epoch=${session.providerEpoch})`);
+    }
+  }
+
+  private pendingTextChars(session: ActiveSession): number {
+    let chars = (session.pendingOwnerText?.length ?? 0) + (session.pendingOtherText?.length ?? 0) + (session.pendingUnattributedText?.length ?? 0);
+    for (const t of session.pendingMultiSpeakerTurns ?? []) chars += t.text.length;
+    return chars;
+  }
+
+  /** Samples current sizes into the high-water marks. O(#speakers); throttled by callers on the audio path. */
+  private sampleSessionMetrics(session: ActiveSession): void {
+    const m = session.metrics;
+    if (!m) return;
+    let speakerAudioBytes = 0;
+    for (const bytes of session.speakerAudioBytes?.values() ?? []) speakerAudioBytes += bytes;
+    recordHighWater(m, {
+      multiHistoryTurns: session.multiSpeakerHistory?.length ?? 0,
+      dualHistoryTurns: session.dualSpeakerHistory?.length ?? 0,
+      confidenceSamples: session.transcriptConfidences?.length ?? 0,
+      pendingTurns: session.pendingMultiSpeakerTurns?.length ?? 0,
+      pendingChars: this.pendingTextChars(session),
+      audioBufferBytes: session.audioBufferBytes ?? 0,
+      speakerAudioBytes,
+      recoveryBufferBytes: session.recoveryAudioBufferBytes ?? 0,
+      recoveryBufferChunks: session.recoveryAudioBuffer?.length ?? 0,
+      inFlightTurns: session.inFlightTurns?.size ?? 0,
+    });
+    m.lastSampledAt = Date.now();
+  }
+
+  /** Throttled sample for the hot audio path. */
+  private maybeSampleSessionMetrics(session: ActiveSession): void {
+    const m = session.metrics;
+    if (!m || Date.now() - m.lastSampledAt < SESSION_BOUNDS.SAMPLE_INTERVAL_MS) return;
+    this.sampleSessionMetrics(session);
+  }
+
+  /**
+   * Keeps long-session memory bounded without losing anything that matters:
+   *  • history windows / confidence samples are in-memory CONTEXT only — the full
+   *    transcript is persisted — so the oldest entries are trimmed;
+   *  • un-persisted pending turns/text are NEVER dropped: at their bound a flush is
+   *    forced instead (skipped only while a turn is already processing, which drains
+   *    them afterwards).
+   */
+  private enforceSessionBounds(client: Socket, session: ActiveSession): void {
+    const trim = <T>(arr: T[], max: number, kind: BoundKind) => {
+      const over = arr.length - max;
+      if (over > 0) {
+        arr.splice(0, over);
+        session.metrics.trimmedHistoryTurns += kind === 'confidenceTrim' ? 0 : over;
+        this.noteBoundHit(session, kind);
+      }
+    };
+    trim(session.multiSpeakerHistory, SESSION_BOUNDS.MAX_MULTI_HISTORY_TURNS, 'multiHistoryTrim');
+    trim(session.dualSpeakerHistory, SESSION_BOUNDS.MAX_DUAL_HISTORY_TURNS, 'dualHistoryTrim');
+    trim(session.transcriptConfidences, SESSION_BOUNDS.MAX_CONFIDENCE_SAMPLES, 'confidenceTrim');
+
+    this.sampleSessionMetrics(session);
+
+    const pendingTurns = session.pendingMultiSpeakerTurns.length;
+    const pendingChars = this.pendingTextChars(session);
+    const atBound = pendingTurns >= SESSION_BOUNDS.MAX_PENDING_TURNS || pendingChars >= SESSION_BOUNDS.MAX_PENDING_CHARS;
+    if (atBound && !session.isProcessingAI) {
+      this.noteBoundHit(session, 'pendingForceFlush');
+      const flush = session.isMultiSpeaker
+        ? this.flushMultiSpeakerTurns(client, session, { reason: 'utterance_end', minWords: 1 })
+        : session.isDualSpeaker
+          ? this.flushDualSpeakerPending(client, session, 1)
+          : Promise.resolve(false);
+      flush.catch((err) => this.logger.error(`[${client.id}] bound-forced flush failed:`, err));
+    }
   }
 
   /** Registers an AI turn so Stop / the summary can wait for it. Removes itself when settled. */
@@ -3835,6 +3933,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       if (typeof result.confidence === 'number') {
         session.transcriptConfidences.push(result.confidence);
+        if (session.transcriptConfidences.length > SESSION_BOUNDS.MAX_CONFIDENCE_SAMPLES) {
+          session.transcriptConfidences.splice(0, session.transcriptConfidences.length - SESSION_BOUNDS.MAX_CONFIDENCE_SAMPLES);
+          this.noteBoundHit(session, 'confidenceTrim');
+        }
       }
 
       // ── Multi-speaker path ────────────────────────────────────────────
@@ -3861,6 +3963,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         session.multiSpeakerHistory.push(...turns);
         session.pendingMultiSpeakerTurns.push(...turns);
+        this.enforceSessionBounds(client, session);
         session.accumulatedTranscript = turns.map((t) => t.text).join(' ');
 
         // Trigger per-speaker identification (first attempt + retry on prior failure)
@@ -4000,6 +4103,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             session.pendingOwnerText = (session.pendingOwnerText + ' ' + text).trim();
           }
         }
+        this.enforceSessionBounds(client, session);
 
         // No word-level speaker data: the text is real, who said it is not known.
         // Keep it as unattributed instead of dropping it or guessing owner/other.
@@ -4008,6 +4112,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           session.dualSpeakerHistory.push({ speaker: 'unknown', text: unattributedText });
           session.pendingUnattributedText = (session.pendingUnattributedText + ' ' + unattributedText).trim();
         }
+        this.enforceSessionBounds(client, session);
 
         session.accumulatedTranscript =
           (session.accumulatedTranscript + ' ' + result.transcript).trim();
@@ -4310,6 +4415,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     ) {
       const dropped = session.recoveryAudioBuffer.shift()!;
       session.recoveryAudioBufferBytes -= dropped.chunk.length;
+      this.noteBoundHit(session, 'recoveryBufferAgeEvict');
     }
 
     if (session.recoveryAudioBufferBytes + buffer.length > this.PROVIDER_RECOVERY_BUFFER_MAX_BYTES) {
@@ -4318,11 +4424,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       if (session.recoveryBufferOverflowStartedAt === null) {
         session.recoveryBufferOverflowStartedAt = now;
       }
+      this.noteBoundHit(session, 'recoveryBufferByteOverflow');
       return;
     }
 
     session.recoveryAudioBuffer.push({ chunk: buffer, enqueuedAt: now });
     session.recoveryAudioBufferBytes += buffer.length;
+    this.sampleSessionMetrics(session);
   }
 
   /** Replays the bounded recovery buffer to the newly-reconnected provider and clears it. */
@@ -4399,6 +4507,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }
     }
 
-    this.logger.log(`Session cleaned up: ${socketId}`);
+    this.sampleSessionMetrics(session);
+    this.logger.log(
+      `Session cleaned up: ${socketId} recordingSession=${session.recordingSessionId} epoch=${session.providerEpoch} ` +
+      `turns=${session.acceptedTurnSeq ?? 0}/${session.settledTurnSeq ?? 0} metrics=${JSON.stringify(session.metrics ? snapshotMetrics(session.metrics) : null)}`,
+    );
   }
 }
