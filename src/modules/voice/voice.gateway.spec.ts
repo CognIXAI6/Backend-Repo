@@ -60,6 +60,7 @@ function createFakeSession(overrides: Record<string, unknown> = {}) {
     streamSequences: new Map(),
     audioGapCount: 0,
     providerState: 'active',
+    inFlightTurns: new Set<Promise<unknown>>(),
     providerEpoch: 0,
     currentRecoveryId: null,
     recoveryAttempt: 0,
@@ -140,7 +141,7 @@ describe('VoiceGateway provider recovery', () => {
       'session:recovered',
       expect.objectContaining({ providerEpoch: 1, audioGapDetected: false, droppedDurationMs: 0 }),
     );
-    expect(session.providerState).toBe('recovered');
+    expect(session.providerState).toBe('active');
     expect(session.providerEpoch).toBe(1);
     expect(session.sendAudio).toBe(newSendAudio);
     expect(session.closeDeepgram).toBe(newClose);
@@ -193,7 +194,7 @@ describe('VoiceGateway provider recovery', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(session.providerState).toBe('recovered');
+    expect(session.providerState).toBe('active');
   });
 
   it('bounds the recovery buffer by bytes and flushes it in order on reconnect', () => {
@@ -1099,5 +1100,181 @@ describe('VoiceGateway recording timing events', () => {
     const gateway = new VoiceGateway(noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop) as any;
     gateway.sessions.set('sock-1', { userId: 'u1', conversationId: 'c1', isGuest: false });
     await expect(gateway.handleTimingStart({ id: 'sock-1' }, { sessionId: 'a' })).resolves.toBeUndefined();
+  });
+});
+
+
+describe('VoiceGateway repeated provider recovery', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('recovers a second disruption of the replacement connection (state returns to active)', async () => {
+    const { gateway, deepgramService } = createGateway();
+    deepgramService.createLiveSession
+      .mockResolvedValueOnce({ emitter: new EventEmitter(), sendAudio: jest.fn(), sendFinalize: jest.fn(), close: jest.fn() })
+      .mockResolvedValueOnce({ emitter: new EventEmitter(), sendAudio: jest.fn(), sendFinalize: jest.fn(), close: jest.fn() });
+    const client = createFakeClient('sock-r');
+    const session = createFakeSession();
+    gateway.sessions.set(client.id, session);
+
+    await gateway.recoverProviderSession(client, session, 0, 'deepgram_closed', null);
+    expect(session.providerEpoch).toBe(1);
+    expect(session.providerState).toBe('active');
+
+    await gateway.recoverProviderSession(client, session, 1, 'deepgram_closed', null);
+    expect(deepgramService.createLiveSession).toHaveBeenCalledTimes(2);
+    expect(session.providerEpoch).toBe(2);
+    expect(session.providerState).toBe('active');
+    expect(client.emit.mock.calls.filter((c: any[]) => c[0] === 'session:recovered')).toHaveLength(2);
+  });
+
+  it('still ignores a stale event from the replaced connection after a recovery', async () => {
+    const { gateway, deepgramService } = createGateway();
+    deepgramService.createLiveSession.mockResolvedValue({ emitter: new EventEmitter(), sendAudio: jest.fn(), sendFinalize: jest.fn(), close: jest.fn() });
+    const client = createFakeClient('sock-s');
+    const session = createFakeSession();
+    gateway.sessions.set(client.id, session);
+
+    await gateway.recoverProviderSession(client, session, 0, 'deepgram_closed', null);
+    await gateway.recoverProviderSession(client, session, 0, 'deepgram_error', null); // late event from epoch 0
+
+    expect(deepgramService.createLiveSession).toHaveBeenCalledTimes(1);
+    expect(session.providerEpoch).toBe(1);
+  });
+});
+
+describe('VoiceGateway audio acknowledgement', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const payload = () => ({ chunk: Buffer.from([1, 2, 3]), sequence: 0, recordingId: 'rec-a' });
+  const acks = (client: any) => client.emit.mock.calls.filter((c: any[]) => c[0] === 'audio:ack');
+
+  it('acks a chunk the provider accepted', () => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-a');
+    const session = createFakeSession();
+    session.sendAudio = jest.fn().mockReturnValue(true);
+    gateway.sessions.set(client.id, session);
+    gateway.handleAudioChunk(client, payload());
+    expect(acks(client)).toHaveLength(1);
+  });
+
+  it('when the provider socket cannot accept audio, buffers the chunk, starts recovery, and acks it as held (not lost)', () => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-b');
+    const session = createFakeSession();
+    session.sendAudio = jest.fn().mockReturnValue(false);
+    const disruption = jest.spyOn(gateway, 'handleProviderDisruption').mockImplementation(() => undefined);
+    gateway.sessions.set(client.id, session);
+
+    gateway.handleAudioChunk(client, payload());
+
+    expect(session.recoveryAudioBuffer).toHaveLength(1);
+    expect(disruption).toHaveBeenCalledWith(client, session, 0, 'transport_failure');
+    expect(acks(client)).toHaveLength(1);
+  });
+
+  it('does not ack a chunk that was neither sent nor buffered (provider closed for good)', () => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-c');
+    const session = createFakeSession({ providerState: 'intentionally_closed' });
+    session.sendAudio = jest.fn().mockReturnValue(false);
+    gateway.sessions.set(client.id, session);
+
+    gateway.handleAudioChunk(client, payload());
+
+    expect(session.recoveryAudioBuffer).toHaveLength(0);
+    expect(acks(client)).toHaveLength(0);
+  });
+
+  it('keeps acking buffered chunks while a recovery is in progress', () => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-d');
+    const session = createFakeSession({ providerState: 'recovering' });
+    gateway.sessions.set(client.id, session);
+    gateway.handleAudioChunk(client, payload());
+    expect(session.recoveryAudioBuffer).toHaveLength(1);
+    expect(acks(client)).toHaveLength(1);
+  });
+});
+
+describe('VoiceGateway Stop waits for in-flight turns', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
+
+  it('tracks a turn while it runs and forgets it once settled', async () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession();
+    let release!: () => void;
+    const turn = gateway.trackTurn(session, () => new Promise<void>((r) => { release = r; }));
+    expect(session.inFlightTurns.size).toBe(1);
+    release();
+    await turn;
+    await Promise.resolve();
+    expect(session.inFlightTurns.size).toBe(0);
+  });
+
+  it('forgets a turn that rejects, and still surfaces the rejection to its caller', async () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession();
+    await expect(gateway.trackTurn(session, () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
+    await Promise.resolve();
+    expect(session.inFlightTurns.size).toBe(0);
+  });
+
+  it('session:end does not tear down or finish until the in-flight turn has been persisted', async () => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-e');
+    const session = createFakeSession({ isGuest: true, isMultiSpeaker: false });
+    gateway.sessions.set(client.id, session);
+    const cleanup = jest.spyOn(gateway, 'cleanupSession').mockImplementation(() => undefined);
+
+    let finishTurn!: () => void;
+    gateway.trackTurn(session, () => new Promise<void>((r) => { finishTurn = r; }));
+
+    const ending = gateway.handleSessionEnd(client);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(client.emit).not.toHaveBeenCalledWith('session:ended');
+
+    finishTurn();
+    await ending;
+    expect(cleanup).toHaveBeenCalledWith('sock-e');
+    expect(client.emit).toHaveBeenCalledWith('session:ended');
+  });
+
+  it('gives up waiting after the bound so a hung turn cannot block Stop forever', async () => {
+    jest.useFakeTimers();
+    const { gateway } = createGateway();
+    const session = createFakeSession();
+    gateway.trackTurn(session, () => new Promise<void>(() => undefined)); // never settles
+    const waiting = gateway.awaitInFlightTurns(session, 5_000);
+    await jest.advanceTimersByTimeAsync(5_000);
+    await expect(waiting).resolves.toBeUndefined();
+  });
+
+  it('the auto-summary waits for the in-flight turn before reading saved messages', async () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession();
+    const order: string[] = [];
+    let finishTurn!: () => void;
+    gateway.trackTurn(session, () => new Promise<void>((r) => { finishTurn = () => { order.push('turn-saved'); r(); }; }));
+    jest.spyOn(gateway, 'saveSessionMemory').mockResolvedValue(undefined);
+    jest.spyOn(gateway, 'autoGenerateConversationSummary').mockImplementation(async () => { order.push('summary-started'); });
+
+    const done = gateway.finalizeSessionOnExit(createFakeClient('sock-f'), session);
+    await Promise.resolve();
+    expect(order).toEqual([]);
+    finishTurn();
+    await done;
+    expect(order).toEqual(['turn-saved', 'summary-started']);
   });
 });

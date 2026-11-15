@@ -92,6 +92,8 @@ interface ActiveSession {
   fieldName?: string;
   /** Last time fieldName was re-read from the user's primary field (ms epoch). */
   fieldCheckedAt?: number;
+  /** AI turns currently being processed — awaited before the session summary so a final turn isn't missed. */
+  inFlightTurns: Set<Promise<unknown>>;
   /** Logical recording-session id registered via session:timing:start (authenticated sessions only). */
   timingSessionId?: string;
   isGuest: boolean;
@@ -103,7 +105,8 @@ interface ActiveSession {
   tier?: PlanType;
   entitlements?: PlanEntitlements;
   deepgramEmitter: EventEmitter;
-  sendAudio: (chunk: Buffer) => void;
+  /** Returns false when the provider socket could not accept the chunk (not OPEN / send threw). */
+  sendAudio: (chunk: Buffer) => boolean | void;
   sendFinalize: () => void;
   closeDeepgram: () => void;
   accumulatedTranscript: string;
@@ -236,6 +239,9 @@ interface ActiveSession {
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
+
+/** Upper bound Stop waits for an AI turn that is already being processed. */
+const IN_FLIGHT_TURN_WAIT_MS = 20_000;
 
 @WebSocketGateway({
   namespace: '/voice',
@@ -884,6 +890,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         streamSequences: new Map(),
         audioGapCount: 0,
         providerState: 'active',
+        inFlightTurns: new Set<Promise<unknown>>(),
         providerEpoch: 0,
         currentRecoveryId: null,
         recoveryAttempt: 0,
@@ -1120,10 +1127,28 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // While the provider connection is being replaced, hold audio in the
     // bounded recovery buffer instead of dropping it on the floor — it gets
     // replayed in order once the new connection is up (see flushRecoveryBuffer).
+    // `held` = the server has taken responsibility for this chunk (sent to the
+    // provider, or buffered for replay after recovery). Only held chunks are
+    // acknowledged, so the client never frees audio that was silently lost.
+    let held = true;
     if (session.providerState === 'recovering') {
       this.bufferAudioForRecovery(session, buffer);
     } else {
-      session.sendAudio(buffer);
+      const accepted = session.sendAudio(buffer) !== false;
+      if (!accepted) {
+        // Re-read: sendAudio's own failure signal may already have started recovery.
+        const stateNow = session.providerState as ProviderSessionState;
+        if (stateNow === 'active') {
+          // Provider socket isn't usable: keep this chunk for replay and start recovery.
+          this.bufferAudioForRecovery(session, buffer);
+          this.handleProviderDisruption(client, session, session.providerEpoch, 'transport_failure');
+        } else if (stateNow === 'recovering') {
+          // sendAudio's own failure signal already started recovery.
+          this.bufferAudioForRecovery(session, buffer);
+        } else {
+          held = false;
+        }
+      }
     }
 
     // Capture the container header for per-speaker audio reconstruction
@@ -1160,11 +1185,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.streamSequences.set(streamId, payload.sequence);
       if (!session.activeStreamId) session.activeStreamId = streamId;
 
-      client.emit('audio:ack', {
-        sequence: payload.sequence,
-        streamId,
-        clientSessionId: session.clientSessionId,
-      });
+      if (held) {
+        client.emit('audio:ack', {
+          sequence: payload.sequence,
+          streamId,
+          clientSessionId: session.clientSessionId,
+        });
+      }
     }
 
     // ── Per-speaker audio tagging ─────────────────────────────────────────
@@ -1720,6 +1747,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
     }
 
+    // Stop ordering: let a turn that is already being processed finish and
+    // persist before the session is torn down and summarised.
+    if (session) await this.awaitInFlightTurns(session);
+
     if (session && !session.isGuest) {
       void this.recordingTimingService?.closeBySocket({
         conversationId: session.conversationId,
@@ -1751,7 +1782,41 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * multi-speaker flush: that must be awaited by the caller before
    * cleanupSession clears the buffers it depends on, so it can't live here.
    */
+  /** Registers an AI turn so Stop / the summary can wait for it. Removes itself when settled. */
+  private trackTurn(session: ActiveSession, run: () => Promise<void>): Promise<void> {
+    const promise = run();
+    const set = session.inFlightTurns;
+    if (!set) return promise;
+    set.add(promise);
+    const done = () => { set.delete(promise); };
+    promise.then(done, done);
+    return promise;
+  }
+
+  /**
+   * Waits (bounded) for every AI turn still being processed, so the final
+   * turn is persisted before the session summary reads the saved messages.
+   * Never throws; a hung turn only costs `timeoutMs`.
+   */
+  private async awaitInFlightTurns(session: ActiveSession, timeoutMs = IN_FLIGHT_TURN_WAIT_MS): Promise<void> {
+    const pending = session.inFlightTurns;
+    if (!pending || pending.size === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        this.logger.warn(`Gave up waiting for ${pending.size} in-flight turn(s) after ${timeoutMs}ms`);
+        resolve();
+      }, timeoutMs);
+    });
+    try {
+      await Promise.race([Promise.allSettled([...pending]).then(() => undefined), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private async finalizeSessionOnExit(client: Socket, session: ActiveSession): Promise<void> {
+    await this.awaitInFlightTurns(session);
     this.saveSessionMemory(session).catch((err) => this.logger.error('Memory save failed:', err));
     await this.autoGenerateConversationSummary(client, session);
   }
@@ -2030,7 +2095,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
   }
 
-  private async processMultiSpeakerPrompt(
+  private processMultiSpeakerPrompt(client: Socket, session: ActiveSession, turns: MultiSpeakerTurn[]): Promise<void> {
+    return this.trackTurn(session, () => this.runMultiSpeakerPrompt(client, session, turns));
+  }
+
+  private async runMultiSpeakerPrompt(
     client: Socket,
     session: ActiveSession,
     turns: MultiSpeakerTurn[],
@@ -2164,7 +2233,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── Dual-speaker prompt processing ──────────────────────────────────────────
 
-  private async processDualSpeakerPrompt(
+  private processDualSpeakerPrompt(
+    client: Socket,
+    session: ActiveSession,
+    otherPersonText: string,
+    ownerText: string = '',
+    speakerDetected = true,
+  ): Promise<void> {
+    return this.trackTurn(session, () =>
+      this.runDualSpeakerPrompt(client, session, otherPersonText, ownerText, speakerDetected),
+    );
+  }
+
+  private async runDualSpeakerPrompt(
     client: Socket,
     session: ActiveSession,
     otherPersonText: string,
@@ -2319,7 +2400,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── Core single-speaker prompt processing ───────────────────────────────────
 
-  private async processPrompt(
+  private processPrompt(
+    client: Socket,
+    session: ActiveSession,
+    userMessage: string,
+    inputType: 'voice' | 'text',
+  ): Promise<void> {
+    return this.trackTurn(session, () => this.runPrompt(client, session, userMessage, inputType));
+  }
+
+  private async runPrompt(
     client: Socket,
     session: ActiveSession,
     userMessage: string,
@@ -3857,7 +3947,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         const { droppedDurationMs } = this.flushRecoveryBuffer(session);
 
-        session.providerState = 'recovered';
+        // Back to 'active' so a *later* disruption of the new connection is
+        // recoverable too (a stale event from the replaced connection is still
+        // rejected by the epoch check above).
+        session.providerState = 'active';
         session.currentRecoveryId = null;
 
         this.logger.log(

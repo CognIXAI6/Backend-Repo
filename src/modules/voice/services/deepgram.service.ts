@@ -87,7 +87,7 @@ export class DeepgramService implements OnModuleInit {
 
   async createLiveSession(sessionId: string, options?: { diarize?: boolean; utteranceEndMs?: number; meetingMode?: boolean; audioFormat?: DeepgramLiveAudioFormat; connectionTimeoutMs?: number }): Promise<{
     emitter: EventEmitter;
-    sendAudio: (chunk: Buffer) => void;
+    sendAudio: (chunk: Buffer) => boolean;
     sendFinalize: () => void;
     close: () => void;
   }> {
@@ -286,17 +286,20 @@ export class DeepgramService implements OnModuleInit {
     }, DEEPGRAM_KEEPALIVE_INTERVAL_MS);
 
     // ── sendAudio ─────────────────────────────────────────────────────────────
-    const sendAudio = (chunk: Buffer): void => {
+    /** Returns true only if the chunk was actually handed to the provider socket. */
+    const sendAudio = (chunk: Buffer): boolean => {
       try {
         if (socket.readyState === 1) {
           socket.sendMedia(chunk);
           lastAudioAt = Date.now();
-        } else {
-          this.logger.warn(`[${sessionId}] sendAudio skipped — readyState=${socket.readyState}`);
+          return true;
         }
+        this.logger.warn(`[${sessionId}] sendAudio skipped — readyState=${socket.readyState}`);
+        return false;
       } catch (err) {
         this.logger.warn(`[${sessionId}] sendMedia failed: ${(err as Error).message}`);
         emitter.emit('transportFailure', { source: 'sendMedia', error: err as Error });
+        return false;
       }
     };
 
