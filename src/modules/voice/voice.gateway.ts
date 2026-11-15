@@ -98,6 +98,9 @@ interface ActiveSession {
   fieldId?: string | null;
   /** AI turns currently being processed — awaited before the session summary so a final turn isn't missed. */
   inFlightTurns: Set<Promise<unknown>>;
+  /** In-memory turn sequence: turns accepted for processing vs. settled (for ordering/diagnostics; not persisted). */
+  acceptedTurnSeq: number;
+  settledTurnSeq: number;
   /** Logical recording-session id registered via session:timing:start (authenticated sessions only). */
   timingSessionId?: string;
   isGuest: boolean;
@@ -251,6 +254,8 @@ const UNATTRIBUTED_SPEAKER_LABEL = 'Unknown speaker';
 
 /** Upper bound Stop waits for an AI turn that is already being processed. */
 const IN_FLIGHT_TURN_WAIT_MS = 20_000;
+/** Safety cap on wait→flush→wait rounds at one stop boundary. */
+const MAX_DRAIN_PASSES = 4;
 
 @WebSocketGateway({
   namespace: '/voice',
@@ -582,16 +587,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     this.logger.log(`Client disconnected: ${client.id}`);
     const session = this.sessions.get(client.id);
 
-    // Same ordering requirement as handleSessionEnd: flush before
-    // cleanupSession clears the buffers it reads.
-    if (session?.isMultiSpeaker && session.pendingMultiSpeakerTurns.length > 0) {
-      await this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 }).catch(
-        (err) => this.logger.error('disconnect flush failed:', err),
-      );
-    }
+    // Same ordering requirement as handleSessionEnd: drain before cleanupSession
+    // clears the buffers it reads.
+    const drain = session ? await this.drainSessionTurns(client, session, 'disconnect') : { complete: true };
 
     if (session && !session.isGuest) {
-      this.scheduleDisconnectSummary(client, session);
+      this.scheduleDisconnectSummary(client, session, drain.complete);
       // Unexpected drop: close this socket's timing session as interrupted
       // (partial). A reconnect re-registers the same logical id and resumes it.
       void this.recordingTimingService?.closeBySocket({
@@ -604,12 +605,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     this.cleanupSession(client.id);
   }
 
-  private scheduleDisconnectSummary(client: Socket, session: ActiveSession): void {
+  private scheduleDisconnectSummary(client: Socket, session: ActiveSession, drainComplete = true): void {
     const { conversationId } = session;
     this.cancelPendingDisconnectSummary(conversationId);
     const timer = setTimeout(() => {
       this.pendingDisconnectSummaries.delete(conversationId);
-      this.finalizeSessionOnExit(client, session).catch((err) =>
+      this.finalizeSessionOnExit(client, session, { drainComplete }).catch((err) =>
         this.logger.error(`Auto-summary on disconnect failed for conversation ${conversationId}:`, err),
       );
     }, this.DISCONNECT_SUMMARY_GRACE_MS);
@@ -940,6 +941,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         audioGapCount: 0,
         providerState: 'active',
         inFlightTurns: new Set<Promise<unknown>>(),
+        acceptedTurnSeq: 0,
+        settledTurnSeq: 0,
         providerEpoch: 0,
         currentRecoveryId: null,
         recoveryAttempt: 0,
@@ -1352,7 +1355,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (session.isMultiSpeaker) {
       this.logger.log(`[${client.id}] audio:stop streamId=${streamId} drainMs=${drainMs} turnsPending=${session.pendingMultiSpeakerTurns.length}`);
       client.emit('audio:finalized', { recordingId: streamId, transcriptDetected: session.pendingMultiSpeakerTurns.length > 0 });
-      await this.flushMultiSpeakerTurns(client, session, { reason: 'audio_stop', minWords: 1 });
+      // Wait for the turn that is running, then process the final turns queued behind
+      // it — an 'already_processing' result must never be taken as completion.
+      await this.drainSessionTurns(client, session, 'audio_stop');
       return;
     }
 
@@ -1365,6 +1370,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.accumulatedTranscript = '';
     session.pendingInterimTranscript = '';
     session.transcriptConfidences = [];
+    if (session.isDualSpeaker) {
+      // The same words are also in the dual-speaker pending buffers; this path takes
+      // them as one turn, so clear them or the session-end flush would save them twice.
+      session.pendingOtherText = '';
+      session.pendingOwnerText = '';
+      session.pendingUnattributedText = '';
+    }
 
     this.logger.log(`[${client.id}] audio:stop streamId=${streamId} drainMs=${drainMs} transcriptEmpty=${!transcript}`);
     client.emit('audio:finalized', { recordingId: streamId, transcriptDetected: Boolean(transcript) });
@@ -1375,8 +1387,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     if (session.isProcessingAI) {
-      client.emit('ai:skipped', { reason: 'already_processing' });
-      return;
+      // The final words are already taken out of the buffers above, so dropping them
+      // here would lose them. Wait for the running turn (bounded) and then process
+      // them; only a turn that really never finishes yields a truthful skip.
+      const settled = await this.awaitInFlightTurns(session);
+      if (!settled || session.isProcessingAI) {
+        client.emit('ai:skipped', { reason: 'already_processing', transcript });
+        return;
+      }
     }
 
     const avgConfidence =
@@ -1808,18 +1826,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   async handleSessionEnd(@ConnectedSocket() client: Socket): Promise<void> {
     const session = this.sessions.get(client.id);
 
-    // Flush any pending multi-speaker turns before tearing down so they are
-    // not silently discarded when the user stops recording. Must be awaited
-    // here, before cleanupSession below clears the buffers it reads.
-    if (session?.isMultiSpeaker && session.pendingMultiSpeakerTurns.length > 0) {
-      await this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 }).catch(
-        (err) => this.logger.error('session:end flush failed:', err),
-      );
-    }
-
-    // Stop ordering: let a turn that is already being processed finish and
-    // persist before the session is torn down and summarised.
-    if (session) await this.awaitInFlightTurns(session);
+    // Stop ordering: wait for the turn that is running, process the final text
+    // queued behind it, and wait for that too — all before cleanupSession clears the
+    // buffers and before the summary reads history. `complete:false` means persistence
+    // was not confirmed within the bound.
+    const drain = session ? await this.drainSessionTurns(client, session, 'session_end') : { complete: true };
 
     if (session && !session.isGuest) {
       void this.recordingTimingService?.closeBySocket({
@@ -1833,7 +1844,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // finishes after the live connection is already gone — delivery is via
       // the conversation's document list + push notification, same as any
       // document generated mid-conversation after the user has moved on.
-      this.finalizeSessionOnExit(client, session).catch((err) =>
+      this.finalizeSessionOnExit(client, session, { drainComplete: drain.complete }).catch((err) =>
         this.logger.error(`Auto-summary failed for conversation ${session.conversationId}:`, err),
       );
     }
@@ -1852,28 +1863,69 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * multi-speaker flush: that must be awaited by the caller before
    * cleanupSession clears the buffers it depends on, so it can't live here.
    */
+  /**
+   * Hands the dual-speaker pending text (owner / other / unattributed) to one AI
+   * turn once it reaches `minWords`. Returns true if a turn was started. The text
+   * is claimed synchronously after the quota await so concurrent callers can't both take it.
+   */
+  private async flushDualSpeakerPending(client: Socket, session: ActiveSession, minWords: number): Promise<boolean> {
+    if (session.calibrationPhase) return false;
+
+    const wordsIn = () =>
+      `${session.pendingOwnerText} ${session.pendingOtherText} ${session.pendingUnattributedText}`
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean).length;
+    if (wordsIn() < minWords) return false;
+    if (!(await this.checkMessageQuota(client, session))) return false;
+
+    if (session.isProcessingAI || wordsIn() < minWords) return false;
+    const otherText = session.pendingOtherText.trim();
+    const ownerText = session.pendingOwnerText.trim();
+    const unattributedText = session.pendingUnattributedText.trim();
+
+    session.pendingOtherText = '';
+    session.pendingOwnerText = '';
+    session.pendingUnattributedText = '';
+    session.accumulatedTranscript = '';
+    client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
+
+    const primaryText = otherText || ownerText;
+    const contextText = otherText ? ownerText : '';
+    const speakerDetected = Boolean(otherText);
+
+    await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected, unattributedText);
+    return true;
+  }
+
   /** Registers an AI turn so Stop / the summary can wait for it. Removes itself when settled. */
   private trackTurn(session: ActiveSession, run: () => Promise<void>): Promise<void> {
     const promise = run();
     const set = session.inFlightTurns;
     if (!set) return promise;
+    session.acceptedTurnSeq = (session.acceptedTurnSeq ?? 0) + 1;
     set.add(promise);
-    const done = () => { set.delete(promise); };
+    const done = () => {
+      set.delete(promise);
+      session.settledTurnSeq = (session.settledTurnSeq ?? 0) + 1;
+    };
     promise.then(done, done);
     return promise;
   }
 
   /**
-   * Waits (bounded) for every AI turn still being processed, so the final
-   * turn is persisted before the session summary reads the saved messages.
-   * Never throws; a hung turn only costs `timeoutMs`.
+   * Waits (bounded) for every AI turn still being processed. Resolves true when
+   * all have settled, false if the bound was hit first — callers must treat
+   * false as "persistence not confirmed", not as completion. Never throws.
    */
-  private async awaitInFlightTurns(session: ActiveSession, timeoutMs = IN_FLIGHT_TURN_WAIT_MS): Promise<void> {
+  private async awaitInFlightTurns(session: ActiveSession, timeoutMs = IN_FLIGHT_TURN_WAIT_MS): Promise<boolean> {
     const pending = session.inFlightTurns;
-    if (!pending || pending.size === 0) return;
+    if (!pending || pending.size === 0) return true;
     let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
     const timeout = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
+        timedOut = true;
         this.logger.warn(`Gave up waiting for ${pending.size} in-flight turn(s) after ${timeoutMs}ms`);
         resolve();
       }, timeoutMs);
@@ -1883,10 +1935,104 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     } finally {
       if (timer) clearTimeout(timer);
     }
+    return !timedOut && pending.size === 0;
   }
 
-  private async finalizeSessionOnExit(client: Socket, session: ActiveSession): Promise<void> {
-    await this.awaitInFlightTurns(session);
+  /** Resolves 'done' with the promise's outcome, or 'timeout' if it has not settled within `ms`. */
+  private async withDeadline(promise: Promise<unknown>, ms: number): Promise<'done' | 'timeout'> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), Math.max(0, ms)); });
+    try {
+      return await Promise.race([promise.then(() => 'done' as const, () => 'done' as const), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Whether one more turn may be spent right now (guest prompt trial / plan quota). */
+  private async canSpendTurn(client: Socket, session: ActiveSession): Promise<boolean> {
+    if (session.isGuest && session.guestSessionId) {
+      const gs = await this.guestSessionService.getStatus(session.guestSessionId);
+      return gs.canSend;
+    }
+    return this.checkMessageQuota(client, session);
+  }
+
+  /**
+   * Starts whatever final text this session still holds un-processed (multi-speaker
+   * queue, dual-speaker pending text, single-speaker accumulated transcript) as a
+   * tracked turn. Returns true if a turn was started. The queue/buffer is claimed
+   * synchronously after the quota await, so two concurrent exits can't both take it.
+   */
+  private async flushPendingTurnsForExit(client: Socket, session: ActiveSession): Promise<boolean> {
+    if (session.isMultiSpeaker) {
+      return this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 });
+    }
+    if (session.isDualSpeaker) {
+      return this.flushDualSpeakerPending(client, session, 1);
+    }
+
+    const transcript = (session.accumulatedTranscript ?? '').trim();
+    if (!transcript) return false;
+    if (!(await this.canSpendTurn(client, session))) return false;
+    const claimed = (session.accumulatedTranscript ?? '').trim();
+    if (!claimed || session.isProcessingAI) return false;
+    session.accumulatedTranscript = '';
+    session.transcriptConfidences = [];
+    await this.processPrompt(client, session, claimed, 'voice');
+    return true;
+  }
+
+  /**
+   * The one barrier at every stop/end boundary (audio:stop, session:end, raw
+   * disconnect). Loops: wait for the running turn → start whatever final text is
+   * still queued behind it → wait again, until nothing new starts. `complete` is
+   * true only when every turn accepted before the boundary has reached a terminal
+   * state; false means the bound was hit and persistence is NOT confirmed.
+   */
+  private async drainSessionTurns(
+    client: Socket,
+    session: ActiveSession,
+    reason: 'audio_stop' | 'session_end' | 'disconnect',
+  ): Promise<{ complete: boolean; passes: number }> {
+    const deadline = Date.now() + IN_FLIGHT_TURN_WAIT_MS;
+    for (let pass = 1; pass <= MAX_DRAIN_PASSES; pass++) {
+      if (!(await this.awaitInFlightTurns(session, Math.max(0, deadline - Date.now())))) {
+        this.logger.warn(`[${client.id}] turn drain incomplete (${reason}) accepted=${session.acceptedTurnSeq} settled=${session.settledTurnSeq}`);
+        return { complete: false, passes: pass };
+      }
+      const flush = this.flushPendingTurnsForExit(client, session).catch((err) => {
+        this.logger.error(`[${client.id}] ${reason} flush failed:`, err);
+        return false;
+      });
+      const outcome = await this.withDeadline(flush, deadline - Date.now());
+      if (outcome === 'timeout') {
+        this.logger.warn(`[${client.id}] turn drain timed out while flushing (${reason})`);
+        return { complete: false, passes: pass };
+      }
+      if (!(await flush)) {
+        return { complete: (session.inFlightTurns?.size ?? 0) === 0, passes: pass };
+      }
+    }
+    return { complete: (session.inFlightTurns?.size ?? 0) === 0, passes: MAX_DRAIN_PASSES };
+  }
+
+  private async finalizeSessionOnExit(
+    client: Socket,
+    session: ActiveSession,
+    opts: { drainComplete?: boolean } = {},
+  ): Promise<void> {
+    const settled = await this.awaitInFlightTurns(session);
+    if (opts.drainComplete === false || !settled) {
+      // A turn accepted before the stop was not confirmed persisted: a summary now
+      // would claim complete context it doesn't have. Mark it retryable instead; the
+      // next resume + stop re-claims (failed is claimable) and summarises everything.
+      this.logger.warn(`Auto-summary withheld for ${session.conversationId}: final turns not confirmed persisted`);
+      await this.conversationService
+        .setSummaryStatus(session.conversationId, 'failed', { skipReason: 'final_turns_incomplete' })
+        .catch((err) => this.logger.error('Failed to mark summary incomplete:', err));
+      return;
+    }
     this.saveSessionMemory(session).catch((err) => this.logger.error('Memory save failed:', err));
     await this.autoGenerateConversationSummary(client, session);
   }
@@ -1900,7 +2046,42 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * bypass the document quota a tier is supposed to enforce; it only
    * applies to conversations with enough actual content to summarize.
    */
+  /**
+   * Conversations whose summary this process is generating right now, and the
+   * conversations that were stopped again while that was running. A Stop that
+   * lands on an in-flight generation can't claim (it's 'pending'), but its newer
+   * turns are not in the in-flight summary's snapshot — so it asks for exactly one
+   * follow-up run, executed when the in-flight one finishes, instead of being
+   * silently dropped.
+   */
+  private readonly summariesInFlight = new Set<string>();
+  private readonly summaryRerunRequests = new Map<string, { client: Socket; session: ActiveSession }>();
+
   private async autoGenerateConversationSummary(client: Socket, session: ActiveSession): Promise<void> {
+    const id = session.conversationId;
+    if (this.summariesInFlight.has(id)) {
+      this.summaryRerunRequests.set(id, { client, session });
+      this.logger.log(`Auto-summary for ${id} already running — queued one follow-up run for newer turns`);
+      return;
+    }
+
+    this.summariesInFlight.add(id);
+    try {
+      await this.runAutoSummary(client, session);
+    } finally {
+      this.summariesInFlight.delete(id);
+      const again = this.summaryRerunRequests.get(id);
+      if (again) {
+        this.summaryRerunRequests.delete(id);
+        // Re-claims: succeeds only if something was said after the finished run's snapshot.
+        await this.autoGenerateConversationSummary(again.client, again.session).catch((err) =>
+          this.logger.error(`Follow-up auto-summary failed for conversation ${id}:`, err),
+        );
+      }
+    }
+  }
+
+  private async runAutoSummary(client: Socket, session: ActiveSession): Promise<void> {
     // Set 'pending' immediately so a client polling GET /conversations/:id
     // right after session:end sees real state instead of 'not_started' while
     // the gates below are still being evaluated — the live socket events
@@ -3569,7 +3750,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return false;
     }
 
-    const turns = [...session.pendingMultiSpeakerTurns];
+    const turns: MultiSpeakerTurn[] = [...session.pendingMultiSpeakerTurns];
     if (turns.length === 0) {
       if (options.reason !== 'utterance_end') {
         client.emit('ai:skipped', { reason: 'empty_transcript' });
@@ -3595,6 +3776,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     if (!(await this.checkMessageQuota(client, session))) return false;
+
+    // Another flush (utterance-end vs Stop) may have run while the quota check was
+    // awaited. Re-read the live queue and processing flag: from here to the call
+    // below everything is synchronous, so exactly one flush takes any given turns.
+    if (session.isProcessingAI) {
+      client.emit('ai:skipped', { reason: 'already_processing' });
+      return false;
+    }
+    const liveTurns = [...session.pendingMultiSpeakerTurns];
+    if (liveTurns.length === 0) return false;
+    turns.length = 0;
+    turns.push(...liveTurns);
 
     // Commit the drain only after threshold is confirmed
     session.pendingMultiSpeakerTurns = [];
@@ -3898,29 +4091,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         if (session.isDualSpeaker) {
           if (session.calibrationPhase) return;
 
-          const otherText = session.pendingOtherText.trim();
-          const ownerText = session.pendingOwnerText.trim();
-          const unattributedText = session.pendingUnattributedText.trim();
-
-          const combinedWords = `${ownerText} ${otherText} ${unattributedText}`
-            .trim()
-            .split(/\s+/)
-            .filter(Boolean).length;
-
-          if (combinedWords < 8) return;
-          if (!(await this.checkMessageQuota(client, session))) return;
-
-          session.pendingOtherText = '';
-          session.pendingOwnerText = '';
-          session.pendingUnattributedText = '';
-          session.accumulatedTranscript = '';
-          client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
-
-          const primaryText = otherText || ownerText;
-          const contextText = otherText ? ownerText : '';
-          const speakerDetected = Boolean(otherText);
-
-          await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected, unattributedText);
+          await this.flushDualSpeakerPending(client, session, 8);
           return;
         }
 

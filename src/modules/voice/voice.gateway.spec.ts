@@ -62,6 +62,8 @@ function createFakeSession(overrides: Record<string, unknown> = {}) {
     audioGapCount: 0,
     providerState: 'active',
     inFlightTurns: new Set<Promise<unknown>>(),
+    acceptedTurnSeq: 0,
+    settledTurnSeq: 0,
     providerEpoch: 0,
     currentRecoveryId: null,
     recoveryAttempt: 0,
@@ -546,6 +548,96 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
   });
   afterEach(() => jest.restoreAllMocks());
+
+  describe('Stop while a summary is already being generated (outage longer than the 90s grace)', () => {
+    const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((r) => { resolve = r; }); return { promise, resolve }; };
+
+    it('queues exactly one follow-up run instead of dropping the newer turns, and runs it after the in-flight one finishes', async () => {
+      const { gateway } = createSummaryGateway();
+      const first = deferred();
+      const order: string[] = [];
+      const run = jest.spyOn(gateway, 'runAutoSummary').mockImplementation(async () => {
+        order.push('run-start');
+        if (run.mock.calls.length === 1) await first.promise;
+        order.push('run-end');
+      });
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements: { maxDocumentsPerMonth: 10, allowedDocumentDepths: ['brief'] } });
+
+      const inFlight = gateway.autoGenerateConversationSummary(client, session); // outage ended by a deferred summary
+      await Promise.resolve();
+      await gateway.autoGenerateConversationSummary(client, session); // resume + Stop meanwhile
+      await gateway.autoGenerateConversationSummary(client, session); // duplicate trigger coalesces
+      expect(run).toHaveBeenCalledTimes(1);
+
+      first.resolve();
+      await inFlight;
+      expect(run).toHaveBeenCalledTimes(2);
+      expect(order).toEqual(['run-start', 'run-end', 'run-start', 'run-end']);
+
+      await gateway.autoGenerateConversationSummary(client, session);
+      expect(run).toHaveBeenCalledTimes(3); // nothing left in flight → a normal run
+    });
+
+    it('the follow-up run summarises only the newer turns and appends them as another part (nothing stranded)', async () => {
+      const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
+      const entitlementsLocal = { maxDocumentsPerMonth: 10, allowedDocumentDepths: ['brief'] };
+      const gate = deferred();
+      conversationService.getUnsummarizedMessages
+        .mockResolvedValueOnce([{ id: 'm1', role: 'user', content: 'first stretch', created_at: new Date(Date.UTC(2026, 10, 10, 9, 0)) }])
+        .mockResolvedValueOnce([{ id: 'm2', role: 'user', content: 'said after the first snapshot', created_at: new Date(Date.UTC(2026, 10, 10, 9, 30)) }]);
+      claudeService.generateConversationSummaryDocument
+        .mockImplementationOnce(async () => { await gate.promise; return { title: 'Part A', topic: 'a', sections: [{ heading: 'Summary', content: 'A' }] }; })
+        .mockResolvedValueOnce({ title: 'Part B', topic: 'b', sections: [{ heading: 'Summary', content: 'B' }] });
+      documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/d' });
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession({ entitlements: entitlementsLocal });
+
+      const first = gateway.autoGenerateConversationSummary(client, session);
+      await new Promise((r) => setTimeout(r, 5));
+      await gateway.autoGenerateConversationSummary(client, session); // Stop during the pending summary
+      expect(conversationService.claimSummaryGeneration).toHaveBeenCalledTimes(1);
+
+      gate.resolve();
+      await first;
+
+      expect(conversationService.claimSummaryGeneration).toHaveBeenCalledTimes(2);
+      expect(claudeService.generateConversationSummaryDocument.mock.calls.map((c: any[]) => c[0])).toEqual([
+        [{ role: 'user', content: 'first stretch' }],
+        [{ role: 'user', content: 'said after the first snapshot' }],
+      ]);
+      expect(conversationService.addSummaryPart.mock.calls.map((c: any[]) => [c[2], c[3]])).toEqual([['m1', 'm1'], ['m2', 'm2']]);
+    });
+
+    it('a failed in-flight run still lets the queued follow-up proceed', async () => {
+      const { gateway } = createSummaryGateway();
+      const first = deferred();
+      const run = jest.spyOn(gateway, 'runAutoSummary').mockImplementation(async () => {
+        if (run.mock.calls.length === 1) { await first.promise; throw new Error('boom'); }
+      });
+      const client = createFakeClient('sock-1');
+      const session = createFakeSession();
+      const inFlight = gateway.autoGenerateConversationSummary(client, session).catch(() => undefined);
+      await Promise.resolve();
+      await gateway.autoGenerateConversationSummary(client, session);
+      first.resolve();
+      await inFlight;
+      expect(run).toHaveBeenCalledTimes(2);
+    });
+
+    it('different conversations never block each other', async () => {
+      const { gateway } = createSummaryGateway();
+      const first = deferred();
+      const run = jest.spyOn(gateway, 'runAutoSummary').mockImplementation(async () => { if (run.mock.calls.length === 1) await first.promise; });
+      const client = createFakeClient('sock-1');
+      const a = gateway.autoGenerateConversationSummary(client, createFakeSession({ conversationId: 'conv-A' }));
+      await Promise.resolve();
+      await gateway.autoGenerateConversationSummary(client, createFakeSession({ conversationId: 'conv-B' }));
+      expect(run).toHaveBeenCalledTimes(2);
+      first.resolve();
+      await a;
+    });
+  });
 
   describe('buildVerbatimTranscript', () => {
     it('resolves owner/other labels to the session’s real names and keeps assistant turns attributed to CognIX AI', async () => {
@@ -1234,7 +1326,7 @@ describe('VoiceGateway Stop waits for in-flight turns', () => {
     gateway.trackTurn(session, () => new Promise<void>(() => undefined)); // never settles
     const waiting = gateway.awaitInFlightTurns(session, 5_000);
     await jest.advanceTimersByTimeAsync(5_000);
-    await expect(waiting).resolves.toBeUndefined();
+    await expect(waiting).resolves.toBe(false); // bound hit: persistence NOT confirmed
   });
 
   it('the auto-summary waits for the in-flight turn before reading saved messages', async () => {
@@ -1774,5 +1866,281 @@ describe('VoiceGateway session:start — field authority and the typed→voice s
       expect(t.client.emit).not.toHaveBeenCalledWith('ai:start');
       expect(t.deepgramService.createLiveSession).not.toHaveBeenCalled();
     });
+  });
+});
+
+
+describe('VoiceGateway final-turn persistence barrier', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
+
+  const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((r) => { resolve = r; }); return { promise, resolve }; };
+  const turn = (text: string) => ({ deepgramSpeakerId: 0, speakerId: null, speakerLabel: 'Guest 1', text, confidence: 1, startMs: null, endMs: null, identificationMethod: 'diarization' as const });
+
+  const build = () => {
+    const conversationService = { setSummaryStatus: jest.fn().mockResolvedValue(undefined) };
+    const noop = {} as any;
+    const gateway = new VoiceGateway(
+      noop, noop, conversationService as any, noop, noop, noop, noop, noop, noop, { log: jest.fn() } as any,
+      noop, noop, noop, noop, noop, noop, noop, noop,
+    ) as any;
+    const client = createFakeClient('sock-b');
+    const order: string[] = [];
+    jest.spyOn(gateway, 'cleanupSession').mockImplementation(() => { order.push('cleanup'); });
+    jest.spyOn(gateway, 'checkMessageQuota').mockResolvedValue(true);
+    jest.spyOn(gateway, 'finalizeAndDrain').mockResolvedValue(undefined);
+    return { gateway, client, conversationService, order };
+  };
+
+  /** A multi-speaker turn run that, like the real one, flags processing synchronously and "commits" when released. */
+  const controllableRun = (gateway: any, order: string[]) => {
+    const gates: Array<{ turns: any[]; release: () => void }> = [];
+    const run = jest.spyOn(gateway, 'runMultiSpeakerPrompt').mockImplementation(async (_c: any, session: any, turns: any[]) => {
+      session.isProcessingAI = true;
+      order.push(`start:${turns.map((t) => t.text).join('+')}`);
+      const d = deferred();
+      gates.push({ turns, release: d.resolve });
+      await d.promise;
+      order.push(`committed:${turns.map((t) => t.text).join('+')}`);
+      session.isProcessingAI = false;
+    });
+    return { run, gates };
+  };
+
+  it('flushMultiSpeakerTurns: two concurrent flushes (utterance-end vs Stop) take the same turns only once', async () => {
+    const { gateway, client, order } = build();
+    const quota = deferred();
+    (gateway.checkMessageQuota as jest.Mock).mockImplementation(async () => { await quota.promise; return true; });
+    const { run, gates } = controllableRun(gateway, order);
+    const session = createFakeSession({ isMultiSpeaker: true, pendingMultiSpeakerTurns: [turn('we should finalise the budget before friday')] });
+    gateway.sessions.set(client.id, session);
+
+    const a = gateway.flushMultiSpeakerTurns(client, session, { reason: 'utterance_end', minWords: 8 });
+    const b = gateway.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 });
+    quota.resolve();
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    gates.forEach((g) => g.release());
+    const results = await Promise.all([a, b]);
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(session.pendingMultiSpeakerTurns).toEqual([]);
+  });
+
+  it('session:end waits for the running turn, then processes the final turns queued behind it, and only then tears down', async () => {
+    const { gateway, client, order } = build();
+    const { run, gates } = controllableRun(gateway, order);
+    const session = createFakeSession({ isMultiSpeaker: true, isGuest: true });
+    gateway.sessions.set(client.id, session);
+    // A turn is mid-processing; the final words arrived while it ran and sit in the queue.
+    gateway.processMultiSpeakerPrompt(client, session, [turn('running turn')]);
+    (session as any).pendingMultiSpeakerTurns = [turn('final words after it')];
+
+    const ending = gateway.handleSessionEnd(client);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(order).toEqual(['start:running turn']); // queued turn NOT dropped as 'already_processing', and not processed concurrently
+    expect(client.emit).not.toHaveBeenCalledWith('session:ended');
+
+    gates[0].release();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(order).toEqual(['start:running turn', 'committed:running turn', 'start:final words after it']);
+    expect(order).not.toContain('cleanup'); // still waiting for the second turn's commit
+
+    gates[1].release();
+    await ending;
+    expect(order).toEqual(['start:running turn', 'committed:running turn', 'start:final words after it', 'committed:final words after it', 'cleanup']);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(client.emit).toHaveBeenCalledWith('session:ended');
+  });
+
+  it('Stop during the persistence pause: audio:stop then session:end do not finalize before the commit, and the turn is processed exactly once', async () => {
+    const { gateway, client, order } = build();
+    const { run, gates } = controllableRun(gateway, order);
+    const session = createFakeSession({ isMultiSpeaker: true, activeStreamId: 'rec-1', pendingMultiSpeakerTurns: [turn('the last thing said before stop')] });
+    gateway.sessions.set(client.id, session);
+    jest.spyOn(gateway, 'finalizeSessionOnExit').mockImplementation(async () => { order.push('finalize'); });
+
+    // The utterance flush has just drained the queue and is paused before the database commit.
+    const flushing = gateway.flushMultiSpeakerTurns(client, session, { reason: 'utterance_end', minWords: 1 });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(session.pendingMultiSpeakerTurns).toEqual([]);
+
+    const stopping = gateway.handleAudioStop(client);
+    const ending = gateway.handleSessionEnd(client);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(order).toEqual(['start:the last thing said before stop']);
+
+    gates[0].release();
+    await Promise.all([flushing, stopping, ending]);
+    expect(run).toHaveBeenCalledTimes(1); // exactly one saved turn
+    expect(order).toEqual(['start:the last thing said before stop', 'committed:the last thing said before stop', 'finalize', 'cleanup']);
+    expect(client.emit).toHaveBeenCalledWith('session:ended');
+  });
+
+  it('raw disconnect: cleanup and the deferred summary are scheduled only after the in-flight and queued turns are committed', async () => {
+    const { gateway, client, order } = build();
+    const { gates } = controllableRun(gateway, order);
+    const session = createFakeSession({ isMultiSpeaker: true });
+    gateway.sessions.set(client.id, session);
+    jest.spyOn(gateway, 'scheduleDisconnectSummary').mockImplementation((_c: any, _s: any, complete: boolean) => { order.push(`schedule:${complete}`); });
+    gateway.processMultiSpeakerPrompt(client, session, [turn('running')]);
+    (session as any).pendingMultiSpeakerTurns = [turn('queued')];
+
+    const disconnecting = gateway.handleDisconnect(client);
+    await new Promise((r) => setTimeout(r, 5));
+    gates[0].release();
+    await new Promise((r) => setTimeout(r, 5));
+    gates[1].release();
+    await disconnecting;
+    expect(order).toEqual(['start:running', 'committed:running', 'start:queued', 'committed:queued', 'schedule:true', 'cleanup']);
+  });
+
+  it('timeout: the drain reports incomplete, the summary is withheld and marked retryable instead of claiming complete context', async () => {
+    jest.useFakeTimers();
+    const { gateway, client, conversationService, order } = build();
+    const session = createFakeSession({ isMultiSpeaker: true });
+    gateway.sessions.set(client.id, session);
+    gateway.trackTurn(session, () => new Promise<void>(() => undefined)); // never commits
+    const auto = jest.spyOn(gateway, 'autoGenerateConversationSummary').mockResolvedValue(undefined);
+    const finalize = jest.spyOn(gateway, 'finalizeSessionOnExit');
+    jest.spyOn(gateway, 'saveSessionMemory').mockResolvedValue(undefined);
+
+    const ending = gateway.handleSessionEnd(client);
+    await jest.advanceTimersByTimeAsync(21_000);
+    await ending;
+
+    expect(client.emit).toHaveBeenCalledWith('session:ended');
+    expect(order).toContain('cleanup');
+    // The (fire-and-forget) finalize ran with drainComplete:false: it withholds the summary.
+    await jest.advanceTimersByTimeAsync(21_000);
+    expect(finalize).toHaveBeenCalledWith(client, session, { drainComplete: false });
+    expect(auto).not.toHaveBeenCalled();
+    expect(conversationService.setSummaryStatus).toHaveBeenCalledWith(session.conversationId, 'failed', { skipReason: 'final_turns_incomplete' });
+    expect(finalize).toHaveBeenCalled();
+  });
+
+  it('a settled drain lets the summary proceed', async () => {
+    const { gateway, client } = build();
+    const session = createFakeSession({ isMultiSpeaker: true });
+    const auto = jest.spyOn(gateway, 'autoGenerateConversationSummary').mockResolvedValue(undefined);
+    jest.spyOn(gateway, 'saveSessionMemory').mockResolvedValue(undefined);
+    await gateway.finalizeSessionOnExit(client, session, { drainComplete: true });
+    expect(auto).toHaveBeenCalledTimes(1);
+  });
+
+  describe('single / dual speaker', () => {
+    const SENTENCE = 'we should wait for the numbers before deciding anything';
+
+    it('audio:stop while an AI turn is running keeps the final words and processes them once that turn finishes (not dropped as already_processing)', async () => {
+      const { gateway, client } = build();
+      const session = createFakeSession({ accumulatedTranscript: SENTENCE, activeStreamId: 'rec-1', isGuest: true });
+      gateway.sessions.set(client.id, session);
+      const running = deferred();
+      session.isProcessingAI = true;
+      gateway.trackTurn(session, async () => { await running.promise; session.isProcessingAI = false; });
+      const processed = jest.spyOn(gateway, 'processPrompt').mockResolvedValue(undefined);
+      jest.spyOn(gateway, 'isTranscriptMeaningful').mockReturnValue({ pass: true });
+      (gateway as any).guestSessionService = { getStatus: jest.fn().mockResolvedValue({ canSend: true }) };
+
+      const stopping = gateway.handleAudioStop(client);
+      await new Promise((r) => setTimeout(r, 5));
+      expect(processed).not.toHaveBeenCalled();
+      running.resolve();
+      await stopping;
+
+      expect(processed).toHaveBeenCalledTimes(1);
+      expect(processed).toHaveBeenCalledWith(client, session, SENTENCE, 'voice');
+      expect(client.emit).not.toHaveBeenCalledWith('ai:skipped', expect.objectContaining({ reason: 'already_processing' }));
+    });
+
+    it('if that turn never finishes the stop reports already_processing truthfully (with the transcript) and does not process concurrently', async () => {
+      jest.useFakeTimers();
+      const { gateway, client } = build();
+      const session = createFakeSession({ accumulatedTranscript: SENTENCE, activeStreamId: 'rec-1' });
+      gateway.sessions.set(client.id, session);
+      session.isProcessingAI = true;
+      gateway.trackTurn(session, () => new Promise<void>(() => undefined));
+      const processed = jest.spyOn(gateway, 'processPrompt').mockResolvedValue(undefined);
+      jest.spyOn(gateway, 'isTranscriptMeaningful').mockReturnValue({ pass: true });
+
+      const stopping = gateway.handleAudioStop(client);
+      await jest.advanceTimersByTimeAsync(21_000);
+      await stopping;
+      expect(processed).not.toHaveBeenCalled();
+      expect(client.emit).toHaveBeenCalledWith('ai:skipped', { reason: 'already_processing', transcript: SENTENCE });
+    });
+
+    it('a duplicate audio:stop for the same recording processes the turn once', async () => {
+      const { gateway, client } = build();
+      const session = createFakeSession({ accumulatedTranscript: SENTENCE, activeStreamId: 'rec-1', isGuest: true });
+      gateway.sessions.set(client.id, session);
+      const processed = jest.spyOn(gateway, 'processPrompt').mockResolvedValue(undefined);
+      jest.spyOn(gateway, 'isTranscriptMeaningful').mockReturnValue({ pass: true });
+      (gateway as any).guestSessionService = { getStatus: jest.fn().mockResolvedValue({ canSend: true }) };
+      await Promise.all([gateway.handleAudioStop(client), gateway.handleAudioStop(client)]);
+      expect(processed).toHaveBeenCalledTimes(1);
+    });
+
+    it('empty final audio is a deterministic no-turn', async () => {
+      const { gateway, client } = build();
+      const session = createFakeSession({ accumulatedTranscript: '', activeStreamId: 'rec-1' });
+      gateway.sessions.set(client.id, session);
+      const processed = jest.spyOn(gateway, 'processPrompt').mockResolvedValue(undefined);
+      await gateway.handleAudioStop(client);
+      expect(processed).not.toHaveBeenCalled();
+      expect(client.emit).toHaveBeenCalledWith('ai:skipped', { reason: 'empty_transcript' });
+    });
+
+    it('session:end flushes leftover single-speaker text that never reached audio:stop (disconnect without a stop)', async () => {
+      const { gateway, client } = build();
+      const session = createFakeSession({ accumulatedTranscript: 'last words never stopped', isGuest: true });
+      (gateway as any).guestSessionService = { getStatus: jest.fn().mockResolvedValue({ canSend: true }) };
+      gateway.sessions.set(client.id, session);
+      const processed = jest.spyOn(gateway, 'processPrompt').mockResolvedValue(undefined);
+      await gateway.handleSessionEnd(client);
+      expect(processed).toHaveBeenCalledWith(client, session, 'last words never stopped', 'voice');
+      expect(session.accumulatedTranscript).toBe('');
+    });
+
+    it('session:end flushes dual-speaker text still below the utterance threshold (nothing stranded)', async () => {
+      const { gateway, client } = build();
+      const session = createFakeSession({ isDualSpeaker: true, calibrationPhase: false, isGuest: true, pendingOwnerText: 'okay then', pendingUnattributedText: 'unclear bit' });
+      gateway.sessions.set(client.id, session);
+      const dual = jest.spyOn(gateway, 'processDualSpeakerPrompt').mockResolvedValue(undefined);
+      await gateway.handleSessionEnd(client);
+      expect(dual).toHaveBeenCalledWith(client, session, 'okay then', '', false, 'unclear bit');
+      expect(session.pendingOwnerText).toBe('');
+      expect(session.pendingUnattributedText).toBe('');
+    });
+
+    it('dual-speaker audio:stop takes the words as one turn and clears the pending buffers, so session:end does not save them twice', async () => {
+      const { gateway, client } = build();
+      const session = createFakeSession({
+        isDualSpeaker: true, calibrationPhase: false, isGuest: true, activeStreamId: 'rec-1',
+        accumulatedTranscript: SENTENCE, pendingOwnerText: SENTENCE,
+      });
+      (gateway as any).guestSessionService = { getStatus: jest.fn().mockResolvedValue({ canSend: true }) };
+      gateway.sessions.set(client.id, session);
+      const single = jest.spyOn(gateway, 'processPrompt').mockResolvedValue(undefined);
+      const dual = jest.spyOn(gateway, 'processDualSpeakerPrompt').mockResolvedValue(undefined);
+      jest.spyOn(gateway, 'isTranscriptMeaningful').mockReturnValue({ pass: true });
+      await gateway.handleAudioStop(client);
+      await gateway.handleSessionEnd(client);
+      expect(single).toHaveBeenCalledTimes(1);
+      expect(dual).not.toHaveBeenCalled();
+    });
+  });
+
+  it('turn sequence counters advance as turns are accepted and settle', async () => {
+    const { gateway } = build();
+    const session = createFakeSession();
+    const d = deferred();
+    const t = gateway.trackTurn(session, () => d.promise);
+    expect([session.acceptedTurnSeq, session.settledTurnSeq]).toEqual([1, 0]);
+    d.resolve();
+    await t; await Promise.resolve();
+    expect([session.acceptedTurnSeq, session.settledTurnSeq]).toEqual([1, 1]);
   });
 });
