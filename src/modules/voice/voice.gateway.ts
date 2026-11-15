@@ -38,6 +38,12 @@ import { EntitlementsService } from '@/modules/entitlements/entitlements.service
 import { UsageService } from '@/modules/entitlements/usage.service';
 import { RecordingTimingService } from './services/recording-timing.service';
 import {
+  AudioLossReason,
+  SessionCorrelation,
+  SessionTerminalReason,
+  providerDisruptionCause,
+} from './utils/session-lifecycle.util';
+import {
   BoundKind,
   SESSION_BOUNDS,
   SessionMetrics,
@@ -111,6 +117,11 @@ interface ActiveSession {
   settledTurnSeq: number;
   /** Memory/queue high-water marks and bound hits (counts and bytes only). */
   metrics: SessionMetrics;
+  /** Server-generated per session:start — correlates every lifecycle log/event of this session. */
+  traceId: string;
+  /** Ack boundary: the last audio sequence acknowledged, and on which stream. */
+  lastAckedSequence: number | null;
+  lastAckedStreamId: string | null;
   /** Logical recording-session id registered via session:timing:start (authenticated sessions only). */
   timingSessionId?: string;
   isGuest: boolean;
@@ -562,7 +573,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     this.logger.warn(
       `beforeApplicationShutdown(${signal}) — notifying ${this.sessions.size} active voice session(s) before restart`,
     );
+    for (const active of this.sessions.values()) {
+      this.logLifecycle(active, 'session_terminal', { reason: 'server_restart' satisfies SessionTerminalReason });
+    }
     this.server.emit('server:restarting', {
+      reason: 'server_restart' satisfies SessionTerminalReason,
       message: 'The server is restarting for a brief update. Please reconnect in a few seconds.',
     });
     await sleep(500);
@@ -600,6 +615,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // Same ordering requirement as handleSessionEnd: drain before cleanupSession
     // clears the buffers it reads.
     const drain = session ? await this.drainSessionTurns(client, session, 'disconnect') : { complete: true };
+    if (session) this.logLifecycle(session, 'session_terminal', { reason: 'client_disconnect' satisfies SessionTerminalReason, drainComplete: drain.complete });
 
     if (session && !session.isGuest) {
       this.scheduleDisconnectSummary(client, session, drain.complete);
@@ -954,6 +970,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         acceptedTurnSeq: 0,
         settledTurnSeq: 0,
         metrics: createSessionMetrics(),
+        traceId: randomUUID(),
+        lastAckedSequence: null,
+        lastAckedStreamId: null,
         providerEpoch: 0,
         currentRecoveryId: null,
         recoveryAttempt: 0,
@@ -1022,6 +1041,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }
 
       const rosterCount = speakerRoster.length;
+      this.logLifecycle(session, 'session_start', { mode, isGuest });
       this.logger.log(
         `Session started — user: ${userId} (${isGuest ? 'guest' : 'auth'}), ` +
         `conv: ${conversationId}, mode: ${mode}, roster: ${rosterCount}, ` +
@@ -1037,6 +1057,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // providerSessionEpoch above is left as-is for backward compatibility.
         providerEpoch: session.providerEpoch,
         clientSessionId: session.clientSessionId,
+        traceId: session.traceId,
         // Field this conversation lives under. `mismatch`: the client asked for a different
         // field than a resumed conversation's own (start a new conversation to change field);
         // `fallback`: the requested field ID was not usable, so the primary field applies.
@@ -1175,7 +1196,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       `audioSource=${payload.audioSource ?? session.audioSource}`,
     );
 
+    this.logLifecycle(session, 'stream_start', { streamEpoch: payload.streamEpoch ?? 0 });
     client.emit('stream:ready', {
+      traceId: session.traceId,
       recordingId: streamId,
       streamEpoch: payload.streamEpoch ?? 0,
       expectedSequence: 0,
@@ -1246,7 +1269,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           `[${client.id}] Audio gap in stream "${streamId}": ` +
           `expected=${lastSeq + 1} actual=${payload.sequence} (gaps=${session.audioGapCount})`,
         );
+        this.logLifecycle(session, 'sequence_gap', { expected: lastSeq + 1, actual: payload.sequence, gaps: session.audioGapCount });
         client.emit('audio:continuity_warning', {
+          reason: 'sequence_gap' satisfies AudioLossReason,
+          correlation: this.correlation(session),
           streamId,
           expected: lastSeq + 1,
           actual: payload.sequence,
@@ -1259,6 +1285,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       if (!session.activeStreamId) session.activeStreamId = streamId;
 
       if (held) {
+        session.lastAckedSequence = payload.sequence;
+        session.lastAckedStreamId = streamId;
         client.emit('audio:ack', {
           sequence: payload.sequence,
           streamId,
@@ -1298,8 +1326,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (session.idleTimeoutHandle) clearTimeout(session.idleTimeoutHandle);
     session.idleTimeoutHandle = setTimeout(() => {
       this.logger.warn(`[${client.id}] Session idle for 30 min — auto-closing`);
+      this.logLifecycle(session, 'session_terminal', { reason: 'idle_timeout' satisfies SessionTerminalReason });
+      const correlation = this.correlation(session);
       this.cleanupSession(client.id);
-      client.emit('session:ended', { reason: 'idle_timeout' });
+      client.emit('session:ended', { reason: 'idle_timeout' satisfies SessionTerminalReason, correlation });
     }, this.SESSION_IDLE_TIMEOUT_MS);
   }
 
@@ -1863,8 +1893,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
     }
 
+    if (session) this.logLifecycle(session, 'session_terminal', { reason: 'explicit_end' satisfies SessionTerminalReason, drainComplete: drain.complete });
+    const endCorrelation = session ? this.correlation(session) : null;
     this.cleanupSession(client.id);
-    client.emit('session:ended');
+    client.emit(
+      'session:ended',
+      session ? { reason: 'explicit_end' satisfies SessionTerminalReason, drainComplete: drain.complete, correlation: endCorrelation } : undefined,
+    );
   }
 
   /**
@@ -1912,6 +1947,29 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     return true;
   }
 
+  // ── Lifecycle correlation and terminal reasons (redacted: ids and counters only) ──
+
+  private correlation(session: ActiveSession): SessionCorrelation {
+    return {
+      traceId: session.traceId ?? null,
+      recordingSessionId: session.recordingSessionId ?? null,
+      clientSessionId: session.clientSessionId ?? null,
+      streamId: session.activeStreamId ?? null,
+      providerEpoch: session.providerEpoch ?? null,
+      lastAckedSequence: session.lastAckedSequence ?? null,
+    };
+  }
+
+  /** One structured lifecycle line: event name + correlation ids + optional code/counters. Never content. */
+  private logLifecycle(session: ActiveSession, event: string, extra: Record<string, string | number | boolean | null> = {}): void {
+    const c = this.correlation(session);
+    const kv = Object.entries({ ...c, ...extra })
+      .filter(([, v]) => v !== null && v !== undefined)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(' ');
+    this.logger.log(`lifecycle event=${event} ${kv}`);
+  }
+
   // ── Bounded in-memory state + observability ──────────────────────────────────
 
   /** Counts a bound being reached; logs the first hit of each kind per session (ids only, no content). */
@@ -1921,7 +1979,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     m.boundHits[kind] += 1;
     if (!m.loggedKinds.has(kind)) {
       m.loggedKinds.add(kind);
-      this.logger.warn(`Session bound reached: ${kind} (recordingSession=${session.recordingSessionId}, epoch=${session.providerEpoch})`);
+      this.logger.warn(`Session bound reached: ${kind} (trace=${session.traceId}, recordingSession=${session.recordingSessionId}, epoch=${session.providerEpoch})`);
     }
   }
 
@@ -4306,9 +4364,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     );
 
     // Notify — emitted exactly once per recovery sequence, not per attempt.
+    const cause = providerDisruptionCause(reason);
+    this.logLifecycle(session, 'provider_disruption', { cause, recoveryId });
     client.emit('session:recovering', {
       recoveryId,
       reason,
+      cause,
+      correlation: this.correlation(session),
       attempt: 1,
       maxAttempts: PROVIDER_RECOVERY_MAX_ATTEMPTS,
       recoverable: true,
@@ -4358,8 +4420,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           `(epoch=${session.providerEpoch}, droppedDurationMs=${droppedDurationMs})`,
         );
 
+        this.logLifecycle(session, 'provider_recovered', { recoveryId, attempt, droppedDurationMs });
         client.emit('session:recovered', {
           recoveryId,
+          correlation: this.correlation(session),
+          ...(droppedDurationMs > 0 ? { lossReason: 'recovery_buffer_bound' satisfies AudioLossReason } : {}),
           providerEpoch: session.providerEpoch,
           audioGapDetected: droppedDurationMs > 0,
           droppedDurationMs,
@@ -4385,6 +4450,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       severity: 'error',
       context: {
         socketId: client.id,
+        traceId: session.traceId,
         recoveryId,
         incidentId,
         providerEpoch: session.providerEpoch,
@@ -4393,9 +4459,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       },
     });
 
+    this.logLifecycle(session, 'session_terminal', { reason: 'provider_recovery_exhausted' satisfies SessionTerminalReason, cause: providerDisruptionCause(reason), incidentId });
     client.emit('session:degraded', {
       recoveryId,
-      reason: 'provider_recovery_exhausted',
+      reason: 'provider_recovery_exhausted' satisfies SessionTerminalReason,
+      cause: providerDisruptionCause(reason),
+      correlation: this.correlation(session),
       category: 'provider_recovery_failed',
       recoverable: false,
       incidentId,

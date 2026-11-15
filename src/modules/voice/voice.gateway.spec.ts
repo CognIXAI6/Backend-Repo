@@ -66,6 +66,9 @@ function createFakeSession(overrides: Record<string, unknown> = {}) {
     acceptedTurnSeq: 0,
     settledTurnSeq: 0,
     metrics: createSessionMetrics(),
+    traceId: 'trace-default',
+    lastAckedSequence: null,
+    lastAckedStreamId: null,
     providerEpoch: 0,
     currentRecoveryId: null,
     recoveryAttempt: 0,
@@ -1313,12 +1316,12 @@ describe('VoiceGateway Stop waits for in-flight turns', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(cleanup).not.toHaveBeenCalled();
-    expect(client.emit).not.toHaveBeenCalledWith('session:ended');
+    expect(client.emit).not.toHaveBeenCalledWith('session:ended', expect.anything());
 
     finishTurn();
     await ending;
     expect(cleanup).toHaveBeenCalledWith('sock-e');
-    expect(client.emit).toHaveBeenCalledWith('session:ended');
+    expect(client.emit).toHaveBeenCalledWith('session:ended', expect.objectContaining({ reason: 'explicit_end' }));
   });
 
   it('gives up waiting after the bound so a hung turn cannot block Stop forever', async () => {
@@ -1943,7 +1946,7 @@ describe('VoiceGateway final-turn persistence barrier', () => {
     const ending = gateway.handleSessionEnd(client);
     await new Promise((r) => setTimeout(r, 5));
     expect(order).toEqual(['start:running turn']); // queued turn NOT dropped as 'already_processing', and not processed concurrently
-    expect(client.emit).not.toHaveBeenCalledWith('session:ended');
+    expect(client.emit).not.toHaveBeenCalledWith('session:ended', expect.anything());
 
     gates[0].release();
     await new Promise((r) => setTimeout(r, 5));
@@ -1954,7 +1957,7 @@ describe('VoiceGateway final-turn persistence barrier', () => {
     await ending;
     expect(order).toEqual(['start:running turn', 'committed:running turn', 'start:final words after it', 'committed:final words after it', 'cleanup']);
     expect(run).toHaveBeenCalledTimes(2);
-    expect(client.emit).toHaveBeenCalledWith('session:ended');
+    expect(client.emit).toHaveBeenCalledWith('session:ended', expect.objectContaining({ reason: 'explicit_end' }));
   });
 
   it('Stop during the persistence pause: audio:stop then session:end do not finalize before the commit, and the turn is processed exactly once', async () => {
@@ -1978,7 +1981,7 @@ describe('VoiceGateway final-turn persistence barrier', () => {
     await Promise.all([flushing, stopping, ending]);
     expect(run).toHaveBeenCalledTimes(1); // exactly one saved turn
     expect(order).toEqual(['start:the last thing said before stop', 'committed:the last thing said before stop', 'finalize', 'cleanup']);
-    expect(client.emit).toHaveBeenCalledWith('session:ended');
+    expect(client.emit).toHaveBeenCalledWith('session:ended', expect.objectContaining({ reason: 'explicit_end' }));
   });
 
   it('raw disconnect: cleanup and the deferred summary are scheduled only after the in-flight and queued turns are committed', async () => {
@@ -2013,7 +2016,7 @@ describe('VoiceGateway final-turn persistence barrier', () => {
     await jest.advanceTimersByTimeAsync(21_000);
     await ending;
 
-    expect(client.emit).toHaveBeenCalledWith('session:ended');
+    expect(client.emit).toHaveBeenCalledWith('session:ended', expect.objectContaining({ reason: 'explicit_end' }));
     expect(order).toContain('cleanup');
     // The (fire-and-forget) finalize ran with drainComplete:false: it withholds the summary.
     await jest.advanceTimersByTimeAsync(21_000);
@@ -2300,5 +2303,208 @@ describe('VoiceGateway bounded session memory', () => {
     expect(json.highWater.multiHistoryTurns).toBe(1);
     expect(json.highWater.pendingChars).toBe('TOPSECRET-DRUG'.length); // a size, not the text
     expect(Object.values(json.highWater).every((v) => typeof v === 'number')).toBe(true);
+  });
+});
+
+describe('VoiceGateway lifecycle correlation and terminal reasons', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
+
+  const eventsOf = (client: any, name: string) => client.emit.mock.calls.filter((c: any[]) => c[0] === name).map((c: any[]) => c[1]);
+  const lifecycleLines = () => (Logger.prototype.log as jest.Mock).mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('lifecycle '));
+  const liveSession = () => ({ emitter: new EventEmitter(), sendAudio: jest.fn().mockReturnValue(true), sendFinalize: jest.fn(), close: jest.fn() });
+
+  const buildStartable = () => {
+    const conversationService = {
+      assertOwnership: jest.fn(), getConversationFieldId: jest.fn().mockResolvedValue(null),
+      findRecentEmptyConversation: jest.fn().mockResolvedValue(null), createConversation: jest.fn().mockResolvedValue({ id: 'conv-1' }),
+      getConversationParticipants: jest.fn().mockResolvedValue([]), upsertConversationParticipant: jest.fn().mockResolvedValue(undefined),
+    };
+    const noop = {} as any;
+    const deepgramService = { createLiveSession: jest.fn(async () => liveSession()) };
+    const gateway = new VoiceGateway(
+      deepgramService as any, noop, conversationService as any, noop, noop, noop,
+      { findById: jest.fn().mockResolvedValue({ name: 'Tolu', email: 'tolu@example.com', ai_memory: null, voice_speaker_id: null }) } as any,
+      { resolveAuthorizedField: jest.fn().mockResolvedValue(null), findFieldRecordForUser: jest.fn(), getUserPrimaryField: jest.fn().mockResolvedValue(null) } as any,
+      noop, { log: jest.fn() } as any, { verify: jest.fn().mockReturnValue({ sub: 'u1' }) } as any, { get: jest.fn().mockReturnValue('secret') } as any,
+      noop, noop, noop,
+      { getUserEntitlements: jest.fn().mockResolvedValue({ tier: 'xpress', entitlements: { allowedVoiceModes: ['single', 'multiple_speaker'], maxVoiceMinutesPerMonth: null } }) } as any,
+      noop, noop,
+    ) as any;
+    return { gateway };
+  };
+
+  it('every session:start gets its own server-generated traceId, returned in session:ready and stream:ready', async () => {
+    const { gateway } = buildStartable();
+    const a = createFakeClient('sock-a');
+    const b = createFakeClient('sock-b');
+    await gateway.handleSessionStart(a, { accessToken: 'jwt', mode: 'single' });
+    await gateway.handleSessionStart(b, { accessToken: 'jwt', mode: 'single' });
+    const ta = eventsOf(a, 'session:ready')[0].traceId;
+    const tb = eventsOf(b, 'session:ready')[0].traceId;
+    expect(ta).toMatch(/^[0-9a-f-]{36}$/);
+    expect(tb).toMatch(/^[0-9a-f-]{36}$/);
+    expect(ta).not.toBe(tb);
+
+    gateway.handleStreamStart(a, { recordingId: 'rec-1', streamEpoch: 1 });
+    expect(eventsOf(a, 'stream:ready')[0].traceId).toBe(ta);
+    expect(lifecycleLines().filter((l) => l.includes(`traceId=${ta}`)).map((l) => l.match(/event=(\S+)/)![1])).toEqual(['session_start', 'stream_start']);
+  });
+
+  it('a reconnected session start gets a new trace (it is a new server session) while the client session id stays the correlation link', async () => {
+    const { gateway } = buildStartable();
+    const c = createFakeClient('sock-c');
+    await gateway.handleSessionStart(c, { accessToken: 'jwt', mode: 'single', clientSessionId: 'client-123' });
+    await gateway.handleSessionStart(c, { accessToken: 'jwt', mode: 'single', clientSessionId: 'client-123' });
+    const [r1, r2] = eventsOf(c, 'session:ready');
+    expect(r1.traceId).not.toBe(r2.traceId);
+    expect(r1.clientSessionId).toBe('client-123');
+    expect(r2.clientSessionId).toBe('client-123');
+  });
+
+  describe('provider disruption causes are distinct and carry the same trace through recovery', () => {
+    const run = async (reason: 'deepgram_closed' | 'deepgram_error' | 'transport_failure') => {
+      const { gateway, deepgramService } = createGateway();
+      deepgramService.createLiveSession.mockResolvedValue(liveSession());
+      const client = createFakeClient('sock-r');
+      const session: any = createFakeSession({ traceId: 'trace-xyz', clientSessionId: 'client-9', activeStreamId: 'rec-7', lastAckedSequence: 41 });
+      gateway.sessions.set(client.id, session);
+      await gateway.recoverProviderSession(client, session, 0, reason, null);
+      return { client };
+    };
+
+    it.each([
+      ['deepgram_closed', 'provider_closed'],
+      ['deepgram_error', 'provider_error'],
+      ['transport_failure', 'provider_transport_failure'],
+    ] as const)('%s → cause %s, same correlation on session:recovering and session:recovered', async (reason, cause) => {
+      const { client } = await run(reason);
+      const [recovering] = eventsOf(client, 'session:recovering');
+      const [recovered] = eventsOf(client, 'session:recovered');
+      expect(recovering.cause).toBe(cause);
+      for (const ev of [recovering, recovered]) {
+        expect(ev.correlation).toMatchObject({ traceId: 'trace-xyz', clientSessionId: 'client-9', streamId: 'rec-7', lastAckedSequence: 41 });
+      }
+      expect(recovering.correlation.providerEpoch).toBe(0);
+      expect(recovered.correlation.providerEpoch).toBe(1); // the epoch advanced
+    });
+
+    it('recovered after a buffer overflow reports the loss reason (audio was dropped, not "recovered cleanly")', async () => {
+      const { gateway, deepgramService } = createGateway();
+      deepgramService.createLiveSession.mockResolvedValue(liveSession());
+      const client = createFakeClient('sock-l');
+      const session: any = createFakeSession({ traceId: 'trace-l', recoveryBufferOverflowStartedAt: Date.now() - 4_000 });
+      gateway.sessions.set(client.id, session);
+      await gateway.recoverProviderSession(client, session, 0, 'deepgram_closed', null);
+      expect(eventsOf(client, 'session:recovered')[0]).toMatchObject({ audioGapDetected: true, lossReason: 'recovery_buffer_bound' });
+      const clean = await run('deepgram_closed');
+      expect(eventsOf(clean.client, 'session:recovered')[0]).not.toHaveProperty('lossReason');
+    });
+
+    it('exhausted recovery is terminal: reason provider_recovery_exhausted, the original cause, correlation, and the trace in the error log', async () => {
+      const { gateway, deepgramService, errorLogService } = createGateway();
+      deepgramService.createLiveSession.mockRejectedValue(new Error('connect failed'));
+      const client = createFakeClient('sock-x');
+      const session: any = createFakeSession({ traceId: 'trace-ex' });
+      gateway.sessions.set(client.id, session);
+      await gateway.recoverProviderSession(client, session, 0, 'transport_failure', null);
+      const [degraded] = eventsOf(client, 'session:degraded');
+      expect(degraded).toMatchObject({ reason: 'provider_recovery_exhausted', cause: 'provider_transport_failure', category: 'provider_recovery_failed', correlation: { traceId: 'trace-ex' } });
+      expect(errorLogService.log).toHaveBeenCalledWith(expect.objectContaining({ context: expect.objectContaining({ traceId: 'trace-ex' }) }));
+    }, 10_000);
+  });
+
+  it('a sequence gap is a non-terminal, correlated continuity warning that records the ack boundary', () => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-g');
+    const session: any = createFakeSession({ traceId: 'trace-gap', activeStreamId: 'rec-1' });
+    session.sendAudio = jest.fn().mockReturnValue(true);
+    gateway.sessions.set(client.id, session);
+    gateway.handleAudioChunk(client, { chunk: Buffer.from([1]), sequence: 0, recordingId: 'rec-1' });
+    gateway.handleAudioChunk(client, { chunk: Buffer.from([1]), sequence: 2, recordingId: 'rec-1' }); // 1 is missing
+    const [warning] = eventsOf(client, 'audio:continuity_warning');
+    expect(warning).toMatchObject({ reason: 'sequence_gap', expected: 1, actual: 2, recoverable: true, streamId: 'rec-1' });
+    expect(warning.correlation).toMatchObject({ traceId: 'trace-gap', lastAckedSequence: 0 });
+    expect(session.lastAckedSequence).toBe(2);
+    expect(session.lastAckedStreamId).toBe('rec-1');
+    expect(client.emit).not.toHaveBeenCalledWith('session:ended', expect.anything());
+  });
+
+  describe('gateway idle policy is unchanged and distinguishable', () => {
+    it('30 minutes without chunks ends the session with reason idle_timeout; incoming chunks keep resetting the timer', () => {
+      jest.useFakeTimers();
+      const { gateway } = createGateway();
+      const client = createFakeClient('sock-i');
+      const session: any = createFakeSession({ traceId: 'trace-idle', activeStreamId: 'rec-1' });
+      session.sendAudio = jest.fn().mockReturnValue(true);
+      gateway.sessions.set(client.id, session);
+      const chunk = (n: number) => gateway.handleAudioChunk(client, { chunk: Buffer.from([1]), sequence: n, recordingId: 'rec-1' });
+
+      chunk(0);
+      for (let i = 1; i <= 8; i++) { jest.advanceTimersByTime(29 * 60_000); chunk(i); } // 3h54m of audio, never idle 30 min
+      expect(client.emit).not.toHaveBeenCalledWith('session:ended', expect.anything());
+
+      jest.advanceTimersByTime(30 * 60_000);
+      const [ended] = eventsOf(client, 'session:ended');
+      expect(ended).toMatchObject({ reason: 'idle_timeout', correlation: { traceId: 'trace-idle', lastAckedSequence: 8 } });
+      expect(gateway.sessions.has(client.id)).toBe(false);
+    });
+  });
+
+  it('explicit end, disconnect and server restart each report their own reason', async () => {
+    const { gateway } = createGateway();
+    jest.spyOn(gateway, 'finalizeSessionOnExit').mockResolvedValue(undefined);
+    const end = createFakeClient('sock-e');
+    gateway.sessions.set(end.id, createFakeSession({ traceId: 'trace-end', isGuest: true }));
+    await gateway.handleSessionEnd(end);
+    expect(eventsOf(end, 'session:ended')[0]).toMatchObject({ reason: 'explicit_end', drainComplete: true, correlation: { traceId: 'trace-end' } });
+
+    const dropped = createFakeClient('sock-d');
+    gateway.sessions.set(dropped.id, createFakeSession({ traceId: 'trace-drop', isGuest: true }));
+    await gateway.handleDisconnect(dropped);
+
+    gateway.sessions.set('sock-s', createFakeSession({ traceId: 'trace-restart', isGuest: true }));
+    gateway.server = { emit: jest.fn() };
+    jest.useFakeTimers();
+    const shutdown = gateway.beforeApplicationShutdown('SIGTERM');
+    await jest.advanceTimersByTimeAsync(600);
+    await shutdown;
+    expect(gateway.server.emit).toHaveBeenCalledWith('server:restarting', expect.objectContaining({ reason: 'server_restart' }));
+
+    const terminal = lifecycleLines().filter((l) => l.includes('event=session_terminal'));
+    expect(terminal.map((l) => [l.match(/traceId=(\S+)/)![1], l.match(/reason=(\S+)/)![1]])).toEqual([
+      ['trace-end', 'explicit_end'], ['trace-drop', 'client_disconnect'], ['trace-restart', 'server_restart'],
+    ]);
+  });
+
+  it('every stop/loss cause has a different code', () => {
+    const codes = ['explicit_end', 'client_disconnect', 'idle_timeout', 'provider_recovery_exhausted', 'server_restart', 'provider_closed', 'provider_error', 'provider_transport_failure', 'sequence_gap', 'recovery_buffer_bound'];
+    expect(new Set(codes).size).toBe(codes.length);
+  });
+
+  it('events and lifecycle logs carry ids and counters only — no transcript text, prompt, email or token', async () => {
+    const { gateway, deepgramService } = createGateway();
+    deepgramService.createLiveSession.mockResolvedValue(liveSession());
+    const client = createFakeClient('sock-p');
+    const session: any = createFakeSession({ traceId: 'trace-priv', isGuest: true, accumulatedTranscript: 'TOPSECRET-DIAGNOSIS', pendingOwnerText: 'TOPSECRET-DRUG', cachedOwnerName: 'Tolu Secret', fieldName: 'TOPSECRET-FIELD' });
+    session.multiSpeakerHistory.push({ deepgramSpeakerId: 0, speakerId: null, speakerLabel: 'Guest 1', text: 'TOPSECRET-HISTORY', confidence: 1, startMs: null, endMs: null, identificationMethod: 'diarization' });
+    session.sendAudio = jest.fn().mockReturnValue(true);
+    gateway.sessions.set(client.id, session);
+
+    gateway.handleAudioChunk(client, { chunk: Buffer.from([1]), sequence: 0, recordingId: 'rec-1' });
+    gateway.handleAudioChunk(client, { chunk: Buffer.from([1]), sequence: 5, recordingId: 'rec-1' });
+    await gateway.recoverProviderSession(client, session, 0, 'deepgram_closed', { code: 1006, reason: 'TOPSECRET-CLOSE-REASON' } as any);
+    jest.spyOn(gateway, 'finalizeSessionOnExit').mockResolvedValue(undefined);
+    await gateway.handleSessionEnd(client);
+
+    const payloads = JSON.stringify(client.emit.mock.calls.filter((c: any[]) => ['session:recovering', 'session:recovered', 'session:ended', 'audio:continuity_warning'].includes(c[0])));
+    const lines = lifecycleLines().join('\n');
+    for (const blob of [payloads, lines]) {
+      expect(blob).not.toMatch(/TOPSECRET/);
+      expect(blob).not.toMatch(/Tolu Secret|@example\.com|Bearer |eyJ/);
+    }
+    expect(lines).toContain('traceId=trace-priv');
   });
 });
