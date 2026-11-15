@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Knex } from 'knex';
+import { fetchTimingDetail, fetchTimingSummaries } from './recording-timing.service';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -402,7 +403,11 @@ export class ConversationService {
 
     const total = Number(count);
 
-    return { data, total, page, lastPage: Math.ceil(total / limit) };
+    // Additive: list-safe timing aggregate + independent message-date bounds.
+    const summaries = await fetchTimingSummaries(this.knex, data);
+    const withTiming = data.map((conv) => ({ ...conv, ...(summaries.get(conv.id) ?? {}) }));
+
+    return { data: withTiming, total, page, lastPage: Math.ceil(total / limit) };
   }
 
   /**
@@ -452,7 +457,7 @@ export class ConversationService {
   async getConversation(
     conversationId: string,
     userId: string,
-  ): Promise<Conversation & { messages: ConversationMessage[]; transcriptSegments: TranscriptSegment[] }> {
+  ): Promise<Conversation & { messages: ConversationMessage[]; transcriptSegments: TranscriptSegment[]; timing: Record<string, unknown>; messageDateBounds: Record<string, unknown> }> {
     const conversation = await this.knex('conversations')
       .where({ id: conversationId, user_id: userId })
       .whereNull('deleted_at')
@@ -468,7 +473,9 @@ export class ConversationService {
         .select('*'),
     ]);
 
-    return { ...conversation, messages, transcriptSegments };
+    const { timing, messageDateBounds } = await fetchTimingDetail(this.knex, conversation);
+
+    return { ...conversation, messages, transcriptSegments, timing, messageDateBounds };
   }
 
   // ── Auto-summary status ─────────────────────────────────────────────────────

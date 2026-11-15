@@ -7,6 +7,7 @@ import { VideoAnalysisController } from './controllers/video-analysis.controller
 import { DeepgramService } from './services/deepgram.service';
 import { ClaudeService } from './services/claude.service';
 import { ConversationService } from './services/conversation.service';
+import { RecordingTimingService } from './services/recording-timing.service';
 import { ConversationCleanupService } from './services/conversation-cleanup.service';
 import { GuestSessionService } from './services/guest-session.service';
 import { VoiceVerificationService } from './services/voice-verification.service';
@@ -50,6 +51,7 @@ import { PushNotificationModule } from '@/modules/notifications/push-notificatio
     DeepgramService,
     ClaudeService,
     ConversationService,
+    RecordingTimingService,
     ConversationCleanupService,
     GuestSessionService,
     VoiceVerificationService,
@@ -59,6 +61,6 @@ import { PushNotificationModule } from '@/modules/notifications/push-notificatio
   // specifically so VoiceGatewayModule (a separate process) can inject
   // them for VoiceGateway — they weren't previously exported because
   // VoiceGateway used to resolve them as same-module providers.
-  exports: [ConversationService, ClaudeService, DeepgramService, VoiceService, GuestSessionService, VoiceVerificationService],
+  exports: [ConversationService, RecordingTimingService, ClaudeService, DeepgramService, VoiceService, GuestSessionService, VoiceVerificationService],
 })
 export class VoiceModule {}

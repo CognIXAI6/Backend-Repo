@@ -8,7 +8,7 @@ import {
   OnGatewayConnection,
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
-import { Logger, BeforeApplicationShutdown } from '@nestjs/common';
+import { Logger, BeforeApplicationShutdown, Optional } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
@@ -36,6 +36,7 @@ import { wrapPcm16AsWav } from './utils/pcm-wav.util';
 import { buildCombinedSummary } from './utils/combined-summary.util';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
+import { RecordingTimingService } from './services/recording-timing.service';
 import { PlanEntitlements, PlanType } from '@/modules/entitlements/entitlements.types';
 import { SettingsService } from '@/modules/settings/settings.service';
 import { buildUnclearFallback, buildDocumentReadyFallback } from './constants/fallback-messages.constant';
@@ -91,6 +92,8 @@ interface ActiveSession {
   fieldName?: string;
   /** Last time fieldName was re-read from the user's primary field (ms epoch). */
   fieldCheckedAt?: number;
+  /** Logical recording-session id registered via session:timing:start (authenticated sessions only). */
+  timingSessionId?: string;
   isGuest: boolean;
   /** Only set for guest sessions */
   guestSessionId?: string;
@@ -372,6 +375,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly entitlementsService: EntitlementsService,
     private readonly usageService: UsageService,
     private readonly settingsService: SettingsService,
+    @Optional() private readonly recordingTimingService?: RecordingTimingService,
   ) {}
 
   private emitError(
@@ -573,6 +577,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     if (session && !session.isGuest) {
       this.scheduleDisconnectSummary(client, session);
+      // Unexpected drop: close this socket's timing session as interrupted
+      // (partial). A reconnect re-registers the same logical id and resumes it.
+      void this.recordingTimingService?.closeBySocket({
+        conversationId: session.conversationId,
+        socketId: client.id,
+        status: 'interrupted',
+      });
     }
 
     this.cleanupSession(client.id);
@@ -956,6 +967,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // providerSessionEpoch above is left as-is for backward compatibility.
         providerEpoch: session.providerEpoch,
         clientSessionId: session.clientSessionId,
+        // Capability negotiation: clients only send session:timing:* when this is present.
+        capabilities: { recordingTiming: this.recordingTimingService && !isGuest ? 1 : 0 },
         isGuest,
         mode,
         isDualSpeaker,
@@ -983,6 +996,57 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     } catch (err) {
       this.logger.error('session:start failed', err);
       this.emitError(client, 'SESSION_START_FAILED', (err as Error).message, { clientMessage: 'Failed to start session. Please refresh and try again.' });
+    }
+  }
+
+  // ─── session:timing:* ───────────────────────────────────────────────────────
+  // Durable per-logical-session capture timing. Clients send `start` only after
+  // fresh microphone capture succeeded; reconnects reuse the same sessionId.
+  // `report` carries cumulative captured intervals (offsets in ms from session
+  // start) with a monotonic `seq`; `final: true` closes the session as complete.
+  // Billing/usage metering is unaffected.
+  private static readonly TIMING_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+  @SubscribeMessage('session:timing:start')
+  async handleTimingStart(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { sessionId?: string },
+  ): Promise<void> {
+    const session = this.sessions.get(client.id);
+    const sessionId = payload?.sessionId;
+    if (!session || session.isGuest || !this.recordingTimingService) return;
+    if (typeof sessionId !== 'string' || !VoiceGateway.TIMING_ID_PATTERN.test(sessionId)) return;
+    try {
+      const res = await this.recordingTimingService.startSession({
+        userId: session.userId,
+        conversationId: session.conversationId,
+        clientSessionId: sessionId,
+        socketId: client.id,
+      });
+      if (res) session.timingSessionId = sessionId;
+    } catch (err) {
+      this.logger.error(`session:timing:start failed for conversation ${session.conversationId}`, err as Error);
+    }
+  }
+
+  @SubscribeMessage('session:timing:report')
+  async handleTimingReport(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { sessionId?: string; seq?: number; intervals?: unknown; final?: boolean },
+  ): Promise<void> {
+    const session = this.sessions.get(client.id);
+    if (!session || session.isGuest || !this.recordingTimingService) return;
+    const sessionId = payload?.sessionId;
+    if (typeof sessionId !== 'string' || !VoiceGateway.TIMING_ID_PATTERN.test(sessionId)) return;
+    try {
+      await this.recordingTimingService.applyReport({
+        userId: session.userId,
+        conversationId: session.conversationId,
+        clientSessionId: sessionId,
+        report: { seq: Number(payload.seq), intervals: payload.intervals, final: payload.final === true },
+      });
+    } catch (err) {
+      this.logger.error(`session:timing:report failed for conversation ${session.conversationId}`, err as Error);
     }
   }
 
@@ -1657,6 +1721,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     if (session && !session.isGuest) {
+      void this.recordingTimingService?.closeBySocket({
+        conversationId: session.conversationId,
+        socketId: client.id,
+        status: 'ended',
+      });
       this.cancelPendingDisconnectSummary(session.conversationId);
       // Fire-and-forget: the client disconnects its socket immediately after
       // emitting session:end (doesn't wait for any ack), so this routinely

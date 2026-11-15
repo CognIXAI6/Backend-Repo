@@ -1019,3 +1019,85 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     });
   });
 });
+
+describe('VoiceGateway recording timing events', () => {
+  function build() {
+    const timing = {
+      startSession: jest.fn().mockResolvedValue({ created: true }),
+      applyReport: jest.fn().mockResolvedValue({ applied: true }),
+      closeBySocket: jest.fn().mockResolvedValue(undefined),
+    };
+    const noop = {} as any;
+    const gateway = new VoiceGateway(
+      noop, noop, noop, noop, noop, noop, noop, noop, noop, noop,
+      noop, noop, noop, noop, noop, noop, noop, noop, timing as any,
+    ) as any;
+    const client: any = { id: 'sock-1', emit: jest.fn() };
+    const put = (over: Record<string, unknown> = {}) =>
+      gateway.sessions.set('sock-1', {
+        userId: 'u1', conversationId: 'c1', isGuest: false, isMultiSpeaker: false,
+        pendingMultiSpeakerTurns: [], ...over,
+      });
+    return { gateway, timing, client, put };
+  }
+
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('registers a logical session for an authenticated socket and remembers its id', async () => {
+    const { gateway, timing, client, put } = build();
+    put();
+    await gateway.handleTimingStart(client, { sessionId: 'logical-1' });
+    expect(timing.startSession).toHaveBeenCalledWith({
+      userId: 'u1', conversationId: 'c1', clientSessionId: 'logical-1', socketId: 'sock-1',
+    });
+    expect(gateway.sessions.get('sock-1').timingSessionId).toBe('logical-1');
+  });
+
+  it('ignores guests, unknown sockets and malformed ids', async () => {
+    const { gateway, timing, client, put } = build();
+    await gateway.handleTimingStart(client, { sessionId: 'ok' }); // no session
+    put({ isGuest: true });
+    await gateway.handleTimingStart(client, { sessionId: 'ok' });
+    put();
+    await gateway.handleTimingStart(client, { sessionId: 'bad id!' });
+    await gateway.handleTimingReport(client, { sessionId: '../x', seq: 1, intervals: [] });
+    expect(timing.startSession).not.toHaveBeenCalled();
+    expect(timing.applyReport).not.toHaveBeenCalled();
+  });
+
+  it('forwards reports using the server-side user and conversation, never client-supplied ones', async () => {
+    const { gateway, timing, client, put } = build();
+    put();
+    await gateway.handleTimingReport(client, {
+      sessionId: 'logical-1', seq: 3, intervals: [{ startMs: 0, endMs: 10 }], final: true,
+      userId: 'attacker', conversationId: 'other',
+    } as any);
+    expect(timing.applyReport).toHaveBeenCalledWith({
+      userId: 'u1', conversationId: 'c1', clientSessionId: 'logical-1',
+      report: { seq: 3, intervals: [{ startMs: 0, endMs: 10 }], final: true },
+    });
+  });
+
+  it('marks the timing session interrupted on socket disconnect and ended on session:end', async () => {
+    const { gateway, timing, client, put } = build();
+    jest.spyOn(gateway, 'scheduleDisconnectSummary').mockImplementation(() => undefined);
+    jest.spyOn(gateway, 'cleanupSession').mockImplementation(() => undefined);
+    jest.spyOn(gateway, 'finalizeSessionOnExit').mockResolvedValue(undefined);
+    put();
+    await gateway.handleDisconnect(client);
+    expect(timing.closeBySocket).toHaveBeenCalledWith({ conversationId: 'c1', socketId: 'sock-1', status: 'interrupted' });
+    put();
+    await gateway.handleSessionEnd(client);
+    expect(timing.closeBySocket).toHaveBeenCalledWith({ conversationId: 'c1', socketId: 'sock-1', status: 'ended' });
+  });
+
+  it('still works (no-ops) when the timing service is not provided', async () => {
+    const noop = {} as any;
+    const gateway = new VoiceGateway(noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop) as any;
+    gateway.sessions.set('sock-1', { userId: 'u1', conversationId: 'c1', isGuest: false });
+    await expect(gateway.handleTimingStart({ id: 'sock-1' }, { sessionId: 'a' })).resolves.toBeUndefined();
+  });
+});
