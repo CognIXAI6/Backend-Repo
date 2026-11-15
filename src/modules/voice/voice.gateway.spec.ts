@@ -23,6 +23,7 @@ function createFakeSession(overrides: Record<string, unknown> = {}) {
     dualSpeakerHistory: [],
     pendingOtherText: '',
     pendingOwnerText: '',
+    pendingUnattributedText: '',
     utteranceDebounceMs: 3000,
     utteranceDebounceTimer: null,
     speakerRoster: [],
@@ -1276,5 +1277,284 @@ describe('VoiceGateway Stop waits for in-flight turns', () => {
     finishTurn();
     await done;
     expect(order).toEqual(['turn-saved', 'summary-started']);
+  });
+});
+
+describe('VoiceGateway speaker attribution and provider-epoch scoping', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const w = (word: string, speaker: number, start: number, end: number) => ({ word, speaker, start, end });
+
+  it('interleaved word-level IDs A, B, A become three chronological turns with stable speaker numbers', () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession({ isMultiSpeaker: true, providerEpoch: 2 });
+    const turns = gateway.buildMultiSpeakerTurns(session, [
+      w('hello', 0, 0, 0.4), w('there', 0, 0.4, 0.8),
+      w('hi', 1, 1.0, 1.2),
+      w('how', 0, 1.5, 1.7), w('are', 0, 1.7, 1.9), w('you', 0, 1.9, 2.1),
+    ], 0.9, 'hello there hi how are you');
+    expect(turns.map((t: any) => [t.deepgramSpeakerId, t.text])).toEqual([[0, 'hello there'], [1, 'hi'], [0, 'how are you']]);
+    expect(turns.every((t: any) => t.providerEpoch === 2)).toBe(true);
+    expect(turns[0].speakerLabel).toBe(turns[2].speakerLabel); // same speaker → same label
+    expect(turns[0].speakerLabel).not.toBe(turns[1].speakerLabel);
+  });
+
+  it('without word-level data the text is kept but NOT attributed to the last-seen speaker', () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession({ isMultiSpeaker: true, currentDominantSpeaker: 1 });
+    session.resolvedSpeakers.set(1, { speakerId: 'spk-alice', label: 'Alice', voiceSpeakerId: 'v1', method: 'voice_id', confidence: 0.9 });
+    const turns = gateway.buildMultiSpeakerTurns(session, [], 0.4, '  the budget is approved  ');
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({
+      deepgramSpeakerId: null, speakerId: null, speakerLabel: 'Unknown speaker',
+      text: 'the budget is approved', identificationMethod: 'unknown', startMs: null, endMs: null,
+    });
+    expect(session.anonymousSpeakerLabels.size).toBe(0); // no fabricated "Guest N"
+  });
+
+  it('empty wordless transcript yields no turn', () => {
+    const { gateway } = createGateway();
+    expect(gateway.buildMultiSpeakerTurns(createFakeSession({ isMultiSpeaker: true }), [], 0.4, '   ')).toEqual([]);
+  });
+
+  it('persisted segment rows carry the recording session and provider epoch (unattributed rows keep a null speaker number)', () => {
+    const { gateway } = createGateway();
+    const session = createFakeSession({ isMultiSpeaker: true, providerEpoch: 3, recordingSessionId: 'rec-9', conversationId: 'c1' });
+    const dtos = gateway.buildMultiSpeakerSegmentDtos(session, [
+      { deepgramSpeakerId: 0, providerEpoch: 3, speakerId: null, speakerLabel: 'Guest 1', text: 'a', confidence: 1, startMs: 0, endMs: 1, identificationMethod: 'diarization' },
+      { deepgramSpeakerId: null, providerEpoch: 3, speakerId: null, speakerLabel: 'Unknown speaker', text: 'b', confidence: 1, startMs: null, endMs: null, identificationMethod: 'unknown' },
+    ]);
+    expect(dtos.map((d: any) => [d.deepgramSpeakerId, d.recordingSessionId, d.providerEpoch])).toEqual([[0, 'rec-9', 3], [null, 'rec-9', 3]]);
+  });
+
+  it('a provider reconnect drops everything learned about speaker numbers, so the new connection\'s speaker 0 is not Alice', async () => {
+    const { gateway, deepgramService } = createGateway();
+    deepgramService.createLiveSession.mockResolvedValue({ emitter: new EventEmitter(), sendAudio: jest.fn(), sendFinalize: jest.fn(), close: jest.fn() });
+    const client = createFakeClient('sock-ep');
+    const session = createFakeSession({ isMultiSpeaker: true });
+    session.resolvedSpeakers.set(0, { speakerId: 'spk-alice', label: 'Alice', voiceSpeakerId: 'v1', method: 'voice_id', confidence: 0.9 });
+    session.speakerIdentificationTriggered.add(0);
+    session.speakerWordSeconds.set(0, 42);
+    gateway.sessions.set(client.id, session);
+
+    expect(gateway.resolveSpeakerLabel(session, 0).speakerLabel).toBe('Alice');
+    await gateway.recoverProviderSession(client, session, 0, 'deepgram_closed', null);
+
+    expect(session.providerEpoch).toBe(1);
+    expect(session.resolvedSpeakers.size).toBe(0);
+    expect(session.speakerIdentificationTriggered.size).toBe(0);
+    expect(session.speakerWordSeconds.size).toBe(0);
+    const bob = gateway.resolveSpeakerLabel(session, 0);
+    expect(bob.speakerId).toBeNull();
+    expect(bob.speakerLabel).not.toBe('Alice');
+  });
+
+  describe('late corrections', () => {
+    const buildCorrectionGateway = () => {
+      const conversationService = { correctTranscriptSpeaker: jest.fn().mockResolvedValue(undefined), renameAnonymousSpeaker: jest.fn().mockResolvedValue(undefined), upsertConversationParticipant: jest.fn().mockResolvedValue(undefined) };
+      const speakersService = { getSpeakerById: jest.fn().mockResolvedValue({ id: 'spk-bob', name: 'Bob', voice_speaker_id: 'v2', is_owner: false }) };
+      const noop = {} as any;
+      const gateway = new VoiceGateway(
+        noop, noop, conversationService as any, noop, noop, noop, noop, noop, noop, noop, noop, noop,
+        speakersService as any, noop, noop, noop, noop, noop,
+      ) as any;
+      const client = createFakeClient('sock-c1');
+      const session = createFakeSession({ isMultiSpeaker: true, providerEpoch: 2, recordingSessionId: 'rec-1', conversationId: 'c1', userId: 'u1' });
+      gateway.sessions.set(client.id, session);
+      return { gateway, conversationService, client, session };
+    };
+
+    it('a correction for the current epoch is scoped to (recording session, epoch), updates live labels, and the event carries the scope', async () => {
+      const { gateway, conversationService, client, session } = buildCorrectionGateway();
+      await gateway.handleCorrectSpeaker(client, { deepgramSpeakerId: 0, speakerId: 'spk-bob' });
+      expect(conversationService.correctTranscriptSpeaker).toHaveBeenCalledWith(expect.objectContaining({ recordingSessionId: 'rec-1', providerEpoch: 2, deepgramSpeakerId: 0 }));
+      expect(session.resolvedSpeakers.get(0)?.label).toBe('Bob');
+      expect(client.emit).toHaveBeenCalledWith('transcript:speaker_corrected', expect.objectContaining({ recordingSessionId: 'rec-1', providerEpoch: 2 }));
+    });
+
+    it('a correction for an OLDER epoch is persisted under that epoch and does not relabel the current epoch\'s same-numbered speaker', async () => {
+      const { gateway, conversationService, client, session } = buildCorrectionGateway();
+      await gateway.handleCorrectSpeaker(client, { deepgramSpeakerId: 0, speakerId: 'spk-bob', providerEpoch: 0 });
+      expect(conversationService.correctTranscriptSpeaker).toHaveBeenCalledWith(expect.objectContaining({ providerEpoch: 0 }));
+      expect(session.resolvedSpeakers.has(0)).toBe(false);
+      expect(client.emit).toHaveBeenCalledWith('transcript:speaker_corrected', expect.objectContaining({ providerEpoch: 0 }));
+    });
+
+    it('ignores an epoch from the future or a non-integer and falls back to the current epoch', async () => {
+      const { gateway, conversationService, client } = buildCorrectionGateway();
+      await gateway.handleCorrectSpeaker(client, { deepgramSpeakerId: 0, speakerId: 'spk-bob', providerEpoch: 99 });
+      await gateway.handleCorrectSpeaker(client, { deepgramSpeakerId: 0, speakerId: 'spk-bob', providerEpoch: 1.5 as any });
+      expect(conversationService.correctTranscriptSpeaker.mock.calls.map((c: any[]) => c[0].providerEpoch)).toEqual([2, 2]);
+    });
+
+    it('a guest rename of an older epoch is scoped to that epoch and leaves live state alone', async () => {
+      const { gateway, conversationService, client, session } = buildCorrectionGateway();
+      await gateway.handleRenameGuest(client, { deepgramSpeakerId: 1, displayName: 'Dana', providerEpoch: 1 });
+      expect(conversationService.renameAnonymousSpeaker).toHaveBeenCalledWith(expect.objectContaining({ providerEpoch: 1, recordingSessionId: 'rec-1' }));
+      expect(session.resolvedSpeakers.has(1)).toBe(false);
+    });
+  });
+});
+
+
+describe('VoiceGateway dual-speaker text without word-level speaker data', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const finalResult = (transcript: string, words: any[] = []) => ({ isFinal: true, transcript, confidence: 0.9, words });
+  const dualSession = (over: Record<string, unknown> = {}) =>
+    createFakeSession({ isDualSpeaker: true, isGuest: true, calibrationPhase: false, ownerSpeakerId: 0, utteranceDebounceMs: 0, ...over });
+  const wire = (session: any) => {
+    const { gateway } = createGateway();
+    const client = createFakeClient('sock-dual');
+    const emitter = new EventEmitter();
+    gateway.sessions.set(client.id, session);
+    gateway.attachDeepgramListeners(client, session, emitter);
+    return { gateway, client, emitter };
+  };
+
+  it('keeps wordless text as unattributed: not dropped, not owner, not other, no speaker guess', () => {
+    const session = dualSession({ currentDominantSpeaker: 1 });
+    const { client, emitter } = wire(session);
+    emitter.emit('transcript', finalResult('we should move the deadline'));
+
+    expect(session.dualSpeakerHistory).toEqual([{ speaker: 'unknown', text: 'we should move the deadline' }]);
+    expect(session.pendingUnattributedText).toBe('we should move the deadline');
+    expect(session.pendingOwnerText).toBe('');
+    expect(session.pendingOtherText).toBe('');
+    expect(session.currentDominantSpeaker).toBe(1);
+    expect(session.ownerSpeakerId).toBe(0);
+    expect(client.emit).toHaveBeenCalledWith('transcript:update', expect.objectContaining({
+      isFinal: true, unattributed: 'we should move the deadline', attribution: 'unknown', speakers: {},
+    }));
+  });
+
+  it('a result WITH word-level speakers is attributed as before and creates no unattributed text', () => {
+    const session = dualSession();
+    const { emitter } = wire(session);
+    emitter.emit('transcript', finalResult('hello there hi', [
+      { word: 'hello', speaker: 0, start: 0, end: 0.3 }, { word: 'there', speaker: 0, start: 0.3, end: 0.6 }, { word: 'hi', speaker: 1, start: 0.7, end: 0.9 },
+    ]));
+    expect(session.dualSpeakerHistory).toEqual([{ speaker: 'owner', text: 'hello there' }, { speaker: 'other', text: 'hi' }]);
+    expect(session.pendingUnattributedText).toBe('');
+  });
+
+  it('on utterance end the unattributed text is handed to the AI turn (clearing pending), without being claimed by owner/other', async () => {
+    const session = dualSession();
+    const { gateway, emitter } = wire(session);
+    jest.spyOn(gateway, 'checkMessageQuota').mockResolvedValue(true);
+    const prompt = jest.spyOn(gateway, 'processDualSpeakerPrompt').mockResolvedValue(undefined);
+    emitter.emit('transcript', finalResult('we need to finalise the budget before friday please'));
+    emitter.emit('utteranceEnd');
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(prompt).toHaveBeenCalledWith(expect.anything(), session, '', '', false, 'we need to finalise the budget before friday please');
+    expect(session.pendingUnattributedText).toBe('');
+  });
+
+  it('too-short unattributed text keeps waiting (same 8-word rule as attributed text)', async () => {
+    const session = dualSession();
+    const { gateway, emitter } = wire(session);
+    const prompt = jest.spyOn(gateway, 'processDualSpeakerPrompt').mockResolvedValue(undefined);
+    emitter.emit('transcript', finalResult('just five little words here'));
+    emitter.emit('utteranceEnd');
+    await new Promise((r) => setTimeout(r, 15));
+    expect(prompt).not.toHaveBeenCalled();
+    expect(session.pendingUnattributedText).toBe('just five little words here');
+  });
+
+  describe('the AI turn', () => {
+    const build = () => {
+      const saved: any[] = [];
+      const conversationService = {
+        saveMessage: jest.fn(async (m: any) => { saved.push(m); return {}; }),
+        getFullDocumentContext: jest.fn().mockResolvedValue(null),
+        setTitle: jest.fn().mockResolvedValue(true),
+      };
+      const claudeService = {
+        buildDualSpeakerPrompt: jest.fn().mockReturnValue('SYSTEM'),
+        generateConversationTitle: jest.fn().mockResolvedValue('Title'),
+        streamResponse: jest.fn(async (_m: string, _h: unknown, _s: string, cb: any) => { await cb.onDone('Insight.', 5, 5); }),
+      };
+      const noop = {} as any;
+      const gateway = new VoiceGateway(
+        noop, claudeService as any, conversationService as any, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop,
+      ) as any;
+      const client = createFakeClient('sock-ai');
+      return { gateway, client, conversationService, claudeService, saved };
+    };
+
+    it('answers from the unattributed text, saves it as its own message labelled "unknown", and never as other/owner', async () => {
+      const { gateway, client, saved, claudeService } = build();
+      const session = dualSession({ dualSpeakerHistory: [{ speaker: 'owner', text: 'earlier remark' }, { speaker: 'unknown', text: 'the budget moved' }] });
+      await gateway.runDualSpeakerPrompt(client, session, '', '', false, 'the budget moved');
+
+      const userMsgs = saved.filter((m) => m.role === 'user');
+      expect(userMsgs).toEqual([expect.objectContaining({ content: 'the budget moved', speakerLabel: 'unknown' })]);
+      const aiInput: string = claudeService.streamResponse.mock.calls[0][0];
+      expect(aiInput).toContain('[Unknown speaker]: the budget moved');
+      expect(aiInput).toContain('Most recent exchange: "the budget moved"');
+      expect(client.emit).toHaveBeenCalledWith('transcript:confirmed', expect.objectContaining({ speaker: 'unknown', transcript: 'the budget moved' }));
+    });
+
+    it('alongside attributed speech, each text is saved under its own label', async () => {
+      const { gateway, client, saved } = build();
+      const session = dualSession();
+      await gateway.runDualSpeakerPrompt(client, session, 'what about friday', 'i think so', true, 'unclear bit');
+      expect(saved.filter((m) => m.role === 'user').map((m) => [m.speakerLabel, m.content])).toEqual([
+        ['owner', 'i think so'], ['other', 'what about friday'], ['unknown', 'unclear bit'],
+      ]);
+    });
+
+    it('owner-only speech (no other speaker detected) is saved as the owner\'s, not as "other"', async () => {
+      const { gateway, client, saved } = build();
+      const session = dualSession();
+      // The utterance-end caller promotes the owner's text into the primary slot when nobody else spoke.
+      await gateway.runDualSpeakerPrompt(client, session, 'i think we should wait', '', false);
+      expect(saved.filter((m) => m.role === 'user').map((m) => [m.speakerLabel, m.content])).toEqual([['owner', 'i think we should wait']]);
+      const done = client.emit.mock.calls.find((c: any[]) => c[0] === 'ai:done')[1];
+      expect(done.dualSpeaker.owner.transcript).toBe('i think we should wait');
+      expect(done.dualSpeaker.speaker.transcript).toBe('');
+    });
+
+    it('end to end: only the owner speaks → the persisted message is labelled owner', async () => {
+      const { gateway, client, saved } = build();
+      const session = dualSession({ pendingOwnerText: 'we should really wait until the numbers come in' });
+      const emitter = new EventEmitter();
+      gateway.sessions.set(client.id, session);
+      jest.spyOn(gateway, 'checkMessageQuota').mockResolvedValue(true);
+      gateway.attachDeepgramListeners(client, session, emitter);
+      emitter.emit('utteranceEnd');
+      await new Promise((r) => setTimeout(r, 25));
+      expect(saved.filter((m) => m.role === 'user').map((m) => m.speakerLabel)).toEqual(['owner']);
+    });
+
+    it('without unattributed text behaviour is unchanged', async () => {
+      const { gateway, client, saved } = build();
+      await gateway.runDualSpeakerPrompt(client, dualSession(), 'what about friday', 'i think so', true);
+      expect(saved.filter((m) => m.role === 'user').map((m) => m.speakerLabel)).toEqual(['owner', 'other']);
+    });
+  });
+
+  it('the owner swap re-labels owner and other but leaves unattributed text unattributed', () => {
+    const conversationService = { relabelSpeakers: jest.fn().mockResolvedValue(undefined) };
+    const noop = {} as any;
+    const gateway = new VoiceGateway(
+      noop, noop, conversationService as any, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop,
+    ) as any;
+    const client = createFakeClient('sock-s');
+    const session: any = dualSession({ ownerSpeakerId: 0 });
+    session.dualSpeakerHistory = [{ speaker: 'owner', text: 'a' }, { speaker: 'other', text: 'b' }, { speaker: 'unknown', text: 'c' }];
+    gateway.sessions.set(client.id, session);
+
+    gateway.handleSwapSpeakers(client);
+
+    expect(session.dualSpeakerHistory.map((t: any) => t.speaker)).toEqual(['other', 'owner', 'unknown']);
+    expect(session.ownerSpeakerId).toBe(1);
   });
 });

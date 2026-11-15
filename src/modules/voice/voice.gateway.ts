@@ -55,7 +55,8 @@ interface ClientAudioFormatHint {
 // ─── Per-socket session state ─────────────────────────────────────────────────
 
 interface DualSpeakerTurn {
-  speaker: 'owner' | 'other';
+  /** 'unknown' = recognised text for which the provider reported no word-level speaker. */
+  speaker: 'owner' | 'other' | 'unknown';
   text: string;
 }
 
@@ -67,7 +68,10 @@ interface SpeakerRosterEntry {
 }
 
 interface MultiSpeakerTurn {
-  deepgramSpeakerId: number;
+  /** null = the provider gave no word-level speaker data for this text (attribution unknown). */
+  deepgramSpeakerId: number | null;
+  /** Provider connection the speaker number belongs to (numbering can restart on reconnect). */
+  providerEpoch?: number;
   speakerId: string | null;
   speakerLabel: string;
   text: string;
@@ -134,6 +138,8 @@ interface ActiveSession {
   pendingOtherText: string;
   /** Owner words accumulated since last Claude trigger */
   pendingOwnerText: string;
+  /** Recognised dual-speaker text with no word-level speaker data — kept, never guessed into owner/other. */
+  pendingUnattributedText: string;
   /** Debounce timer — Claude fires only after this much silence (ms) */
   utteranceDebounceMs: number;
   /** Active debounce timeout handle */
@@ -239,6 +245,9 @@ interface ActiveSession {
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
+
+/** Label for recognised text whose speaker the provider did not report. */
+const UNATTRIBUTED_SPEAKER_LABEL = 'Unknown speaker';
 
 /** Upper bound Stop waits for an AI turn that is already being processed. */
 const IN_FLIGHT_TURN_WAIT_MS = 20_000;
@@ -853,6 +862,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         dualSpeakerHistory: [],
         pendingOtherText: '',
         pendingOwnerText: '',
+        pendingUnattributedText: '',
         utteranceDebounceMs: shouldDiarize ? 8_000 : 3_000,
         utteranceDebounceTimer: null,
         speakerRoster,
@@ -1407,10 +1417,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.ownerSpeakerId = session.ownerSpeakerId === 0 ? 1 : 0;
 
-    session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
-      ...turn,
-      speaker: turn.speaker === 'owner' ? 'other' : 'owner',
-    }));
+    session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
     this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
       this.logger.error(`[${client.id}] relabelSpeakers (swap) failed:`, err),
@@ -1535,7 +1542,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.ownerSpeakerId = confirmedOwnerSpeakerId;
       session.calibrationPhase = false;
 
-      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => {
+      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn): DualSpeakerTurn => {
+        if (turn.speaker === 'unknown') return turn; // never re-attributed by an owner correction
         const deepgramId = turn.speaker === 'owner'
           ? (confirmedOwnerSpeakerId === 0 ? 0 : 1)
           : (confirmedOwnerSpeakerId === 0 ? 1 : 0);
@@ -1585,6 +1593,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       segmentId?: string;
       speakerId: string;
       applyTo?: 'segment' | 'session_speaker' | 'conversation_speaker';
+      /** Provider epoch the speaker number was shown under (defaults to the current one). */
+      providerEpoch?: number;
     },
   ): Promise<void> {
     const session = this.sessions.get(client.id);
@@ -1605,6 +1615,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
+    const correctionEpoch = this.resolveCorrectionEpoch(session, payload.providerEpoch);
     try {
       await this.conversationService.correctTranscriptSpeaker({
         conversationId: session.conversationId,
@@ -1614,6 +1625,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerLabel: speaker.name,
         applyTo: payload.applyTo ?? 'session_speaker',
         recordingSessionId: session.recordingSessionId,
+        providerEpoch: correctionEpoch,
       });
     } catch (err) {
       this.logger.warn(`[${client.id}] correctTranscriptSpeaker DB error: ${(err as Error).message}`);
@@ -1624,8 +1636,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // Update in-memory state only after DB confirms
-    if (payload.deepgramSpeakerId != null) {
+    // Update in-memory state only after DB confirms — and only for the current
+    // provider connection: an older epoch's speaker number must not label the
+    // current connection's speaker with the same number.
+    if (payload.deepgramSpeakerId != null && correctionEpoch === session.providerEpoch) {
       session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
         speakerId: speaker.id,
         label: speaker.name,
@@ -1640,6 +1654,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     );
 
     client.emit('transcript:speaker_corrected', {
+      ...this.speakerScope(session, correctionEpoch),
       deepgramSpeakerId: payload.deepgramSpeakerId,
       segmentId: payload.segmentId,
       speakerId: speaker.id,
@@ -1658,6 +1673,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       deepgramSpeakerId: number;
       displayName: string;
       applyTo?: 'session_speaker' | 'conversation_speaker';
+      providerEpoch?: number;
     },
   ): Promise<void> {
     const session = this.sessions.get(client.id);
@@ -1678,6 +1694,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
+    const renameEpoch = this.resolveCorrectionEpoch(session, payload.providerEpoch);
     try {
       const applyTo = payload.applyTo ?? 'session_speaker';
       await this.conversationService.renameAnonymousSpeaker({
@@ -1686,6 +1703,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerLabel: name,
         applyTo,
         recordingSessionId: session.recordingSessionId,
+        providerEpoch: renameEpoch,
       });
     } catch (err) {
       this.logger.warn(`[${client.id}] renameAnonymousSpeaker DB error: ${(err as Error).message}`);
@@ -1696,15 +1714,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // Update in-memory state only after DB confirms
-    session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
-      speakerId: null,
-      label: name,
-      voiceSpeakerId: null,
-      method: 'manual',
-      confidence: 1,
-    });
-    session.anonymousSpeakerLabels.set(payload.deepgramSpeakerId, name);
+    // Update in-memory state only after DB confirms (current provider connection only)
+    if (renameEpoch === session.providerEpoch) {
+      session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
+        speakerId: null,
+        label: name,
+        voiceSpeakerId: null,
+        method: 'manual',
+        confidence: 1,
+      });
+      session.anonymousSpeakerLabels.set(payload.deepgramSpeakerId, name);
+    }
 
     this.logger.log(`[${client.id}] Guest renamed: deepgramId=${payload.deepgramSpeakerId} → "${name}"`);
 
@@ -1723,6 +1743,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     client.emit('transcript:speaker_corrected', {
+      ...this.speakerScope(session, renameEpoch),
       deepgramSpeakerId: payload.deepgramSpeakerId,
       speakerId: null,
       speakerLabel: name,
@@ -2239,9 +2260,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     otherPersonText: string,
     ownerText: string = '',
     speakerDetected = true,
+    unattributedText: string = '',
   ): Promise<void> {
     return this.trackTurn(session, () =>
-      this.runDualSpeakerPrompt(client, session, otherPersonText, ownerText, speakerDetected),
+      this.runDualSpeakerPrompt(client, session, otherPersonText, ownerText, speakerDetected, unattributedText),
     );
   }
 
@@ -2251,7 +2273,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     otherPersonText: string,
     ownerText: string = '',
     speakerDetected = true,
+    unattributedText: string = '',
   ): Promise<void> {
+    // The text the AI answers: the other person's words, else (nothing attributed
+    // to anyone) the unattributed text.
+    const primaryText = otherPersonText || unattributedText;
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
@@ -2264,12 +2290,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     try {
       const recentHistory = session.dualSpeakerHistory.slice(-40);
       const conversationContext = recentHistory
-        .map((t) => `[${t.speaker === 'owner' ? ownerName : speakerName}]: ${t.text}`)
+        .map((t) => `[${t.speaker === 'owner' ? ownerName : t.speaker === 'unknown' ? UNATTRIBUTED_SPEAKER_LABEL : speakerName}]: ${t.text}`)
         .join('\n');
 
       const userMessage = speakerDetected
         ? `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`
-        : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${otherPersonText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
+        : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${primaryText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
 
       const dsDocContext = await this.conversationService.getFullDocumentContext(session.conversationId, session.userId).catch(() => null);
       const outputLanguage = session.isGuest ? 'en' : await this.settingsService.getEffectiveLanguage(session.userId);
@@ -2281,9 +2307,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
 
       client.emit('transcript:confirmed', {
-        transcript: otherPersonText,
+        transcript: primaryText,
         inputType: 'voice',
-        speaker: speakerDetected ? 'other' : 'owner',
+        speaker: speakerDetected ? 'other' : otherPersonText || ownerText ? 'owner' : 'unknown',
+        ...(unattributedText ? { unattributed: { transcript: unattributedText } } : {}),
         owner: ownerText ? { transcript: ownerText, name: ownerName } : undefined,
         otherSpeaker: speakerDetected ? { transcript: otherPersonText, name: speakerName } : undefined,
       });
@@ -2313,13 +2340,28 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               speakerLabel: 'owner',
             });
           }
-          await this.conversationService.saveMessage({
-            conversationId: session.conversationId,
-            role: 'user',
-            content: otherPersonText,
-            transcript: otherPersonText,
-            speakerLabel: 'other',
-          });
+          if (otherPersonText) {
+            await this.conversationService.saveMessage({
+              conversationId: session.conversationId,
+              role: 'user',
+              content: otherPersonText,
+              transcript: otherPersonText,
+              // With no other speaker detected, otherPersonText is really the owner's own
+              // words (the caller promotes them to the primary slot) — never label them 'other'.
+              speakerLabel: speakerDetected ? 'other' : 'owner',
+            });
+          }
+          if (unattributedText) {
+            // Persisted as its own message with an explicit 'unknown' speaker so the
+            // recognised words are never lost and never pinned on owner/other.
+            await this.conversationService.saveMessage({
+              conversationId: session.conversationId,
+              role: 'user',
+              content: unattributedText,
+              transcript: unattributedText,
+              speakerLabel: 'unknown',
+            });
+          }
           await this.conversationService.saveMessage({
             conversationId: session.conversationId,
             role: 'assistant',
@@ -2329,7 +2371,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           });
 
           this.claudeService
-            .generateConversationTitle(otherPersonText, fullText, session.fieldName, outputLanguage)
+              .generateConversationTitle(primaryText, fullText, session.fieldName, outputLanguage)
             .then(async (title) => {
               const wasSet = await this.conversationService.setTitle(session.conversationId, title);
               if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
@@ -2347,8 +2389,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             tokensUsed: inputTokens + outputTokens,
             latencyMs: Date.now() - aiStartTime,
             dualSpeaker: {
-              owner: { transcript: ownerText, name: ownerName },
-              speaker: { transcript: otherPersonText, name: speakerName },
+              owner: { transcript: speakerDetected ? ownerText : ownerText || otherPersonText, name: ownerName },
+              speaker: { transcript: speakerDetected ? otherPersonText : '', name: speakerName },
+              ...(unattributedText ? { unattributed: { transcript: unattributedText } } : {}),
             },
           });
           session.isProcessingAI = false;
@@ -2922,7 +2965,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (candidateIds.length === 0) {
       session.identifiedDeepgramSpeakers.set(deepgramSpeakerId, fallbackName);
       if (!session.otherSpeakerName) session.otherSpeakerName = fallbackName;
-      client.emit('speaker:identified', {
+      client.emit('speaker:identified', { ...this.speakerScope(session),
         deepgramSpeakerId,
         speakerName: fallbackName,
         method: 'no_registered_speakers',
@@ -3006,10 +3049,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         const previousOwner = session.ownerSpeakerId;
         session.ownerSpeakerId = deepgramSpeakerId;
 
-        session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
-          ...turn,
-          speaker: turn.speaker === 'owner' ? 'other' : 'owner',
-        }));
+        session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
         this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
           this.logger.error(`[${client.id}] relabelSpeakers (biometric correction) failed:`, err),
@@ -3041,10 +3081,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const correctedOwner = deepgramSpeakerId === 0 ? 1 : 0;
       session.ownerSpeakerId = correctedOwner;
 
-      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
-        ...turn,
-        speaker: turn.speaker === 'owner' ? 'other' : 'owner',
-      }));
+      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
       this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
         this.logger.error(`[${client.id}] relabelSpeakers (contact flip) failed:`, err),
@@ -3067,7 +3104,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.otherSpeakerName = resolvedName;
     }
 
-    client.emit('speaker:identified', {
+    client.emit('speaker:identified', { ...this.speakerScope(session),
       deepgramSpeakerId,
       speakerName: resolvedName,
       isOwner,
@@ -3089,6 +3126,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     deepgramSpeakerId: number,
   ): Promise<void> {
     if (session.isGuest) return;
+    // The speaker number below belongs to THIS provider connection; the voice-ID
+    // call is async, so pin the epoch now and compare when it returns.
+    const epoch = session.providerEpoch;
 
     // Build candidate voice IDs from session roster first.
     // When no roster was provided, fall back to all account-wide enrolled speakers
@@ -3117,7 +3157,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (candidateIds.length === 0) {
       const resolved: ResolvedSpeaker = { speakerId: null, label: anonymousLabel, voiceSpeakerId: null, method: 'diarization' };
       session.resolvedSpeakers.set(deepgramSpeakerId, resolved);
-      client.emit('speaker:identified', { deepgramSpeakerId, speakerId: null, speakerLabel: anonymousLabel, method: 'diarization' });
+      client.emit('speaker:identified', { ...this.speakerScope(session, epoch),  deepgramSpeakerId, speakerId: null, speakerLabel: anonymousLabel, method: 'diarization' });
       return;
     }
 
@@ -3166,6 +3206,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let resolvedSpeakerId: string | null = null;
     let resolvedVoiceSpeakerId: string | null = null;
     let method: 'voice_id' | 'diarization' = 'diarization';
+
+    // The provider connection was replaced while voice-ID ran: this speaker number
+    // now refers to a different connection's numbering, so applying the result
+    // could label (or rewrite) the wrong person. Drop it; the old segments keep
+    // their diarization labels and can still be corrected explicitly.
+    if (session.providerEpoch !== epoch) {
+      this.logger.warn(`[${client.id}] Dropping stale voice-ID result for speaker ${deepgramSpeakerId} (epoch ${epoch} → ${session.providerEpoch})`);
+      return;
+    }
 
     if (result.identified && result.speakerId) {
       resolvedVoiceSpeakerId = result.speakerId;
@@ -3229,7 +3278,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // ── Update in-memory turn history so the AI context uses the correct name
       // immediately — without waiting for the next transcript event to rebuild labels.
       const updateTurn = (t: MultiSpeakerTurn): MultiSpeakerTurn =>
-        t.deepgramSpeakerId === deepgramSpeakerId
+        t.deepgramSpeakerId === deepgramSpeakerId && t.providerEpoch === epoch
           ? { ...t, speakerLabel: resolvedName, speakerId: resolvedSpeakerId, identificationMethod: 'voice_id' as const }
           : t;
 
@@ -3244,6 +3293,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerLabel: resolvedName,
         identificationMethod: 'voice_id',
         recordingSessionId: session.recordingSessionId,
+        providerEpoch: epoch,
       }).catch((err) =>
         this.logger.warn(`[${client.id}] retroactive segment update failed (non-fatal): ${(err as Error).message}`),
       );
@@ -3263,7 +3313,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
     }
 
-    client.emit('speaker:identified', {
+    client.emit('speaker:identified', { ...this.speakerScope(session, epoch),
       deepgramSpeakerId,
       speakerId: resolvedSpeakerId,
       previousLabel: anonymousLabel,
@@ -3298,17 +3348,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // Fallback when Deepgram returns no word-level data.
     if (!words.length) {
       if (!fallbackTranscript?.trim()) return [];
-      const spkId = session.currentDominantSpeaker ?? 0;
-      const identity = this.resolveSpeakerLabel(session, spkId);
+      // Keep the recognised text but do NOT guess who said it: attributing it to
+      // the last-seen ("dominant") speaker would present uncertain attribution
+      // as fact, and could fabricate or merge speakers.
       return [{
-        deepgramSpeakerId: spkId,
-        speakerId: identity.speakerId,
-        speakerLabel: identity.speakerLabel,
+        deepgramSpeakerId: null,
+        providerEpoch: session.providerEpoch,
+        speakerId: null,
+        speakerLabel: UNATTRIBUTED_SPEAKER_LABEL,
         text: fallbackTranscript.trim(),
         confidence,
         startMs: null,
         endMs: null,
-        identificationMethod: identity.identificationMethod,
+        identificationMethod: 'unknown',
       }];
     }
 
@@ -3334,6 +3386,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const identity = this.resolveSpeakerLabel(session, run.speakerId);
       turns.push({
         deepgramSpeakerId: run.speakerId,
+        providerEpoch: session.providerEpoch,
         speakerId: identity.speakerId,
         speakerLabel: identity.speakerLabel,
         text,
@@ -3348,6 +3401,43 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   /** Returns the current resolved identity for a Deepgram speaker ID (multi-speaker). */
+  /** Swaps owner/other when the owner assignment is corrected; unattributed text stays unattributed. */
+  private flipDualTurn(turn: DualSpeakerTurn): DualSpeakerTurn {
+    if (turn.speaker === 'unknown') return turn;
+    return { ...turn, speaker: turn.speaker === 'owner' ? 'other' : 'owner' };
+  }
+
+  /** Additive scope fields so clients can tell which provider connection a speaker number belongs to. */
+  private speakerScope(session: ActiveSession, epoch: number = session.providerEpoch) {
+    return { recordingSessionId: session.recordingSessionId, providerEpoch: epoch };
+  }
+
+  /** The epoch a client-supplied correction applies to: a valid past/current epoch, else the current one. */
+  private resolveCorrectionEpoch(session: ActiveSession, requested: unknown): number {
+    return typeof requested === 'number' && Number.isInteger(requested) && requested >= 0 && requested <= session.providerEpoch
+      ? requested
+      : session.providerEpoch;
+  }
+
+  /**
+   * A new provider connection restarts speaker numbering, so everything the
+   * session learned about "speaker N" belongs to the old connection. Drop it,
+   * so a new connection's speaker 0 can't inherit an earlier speaker 0's
+   * name, voice-ID state or audio. Persisted segments keep their own epoch.
+   */
+  private resetSpeakerStateForNewEpoch(session: ActiveSession): void {
+    session.resolvedSpeakers.clear();
+    session.identifiedDeepgramSpeakers.clear();
+    session.anonymousSpeakerLabels.clear();
+    session.speakerIdentificationTriggered.clear();
+    session.speakerIdentificationFailed.clear();
+    session.speakerIdentificationAtSeconds.clear();
+    session.speakerWordSeconds.clear();
+    session.speakerAudioBuffers.clear();
+    session.speakerAudioBytes.clear();
+    session.currentDominantSpeaker = 0;
+  }
+
   private resolveSpeakerLabel(
     session: ActiveSession,
     deepgramSpeakerId: number,
@@ -3429,6 +3519,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       confidence: t.confidence,
       identificationMethod: t.identificationMethod,
       recordingSessionId: session.recordingSessionId,
+      providerEpoch: t.providerEpoch ?? session.providerEpoch,
     }));
   }
 
@@ -3478,6 +3569,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           mode: 'multiple_speaker',
           transcript: turns.map((t) => t.text).join(' '),
           segments: turns,
+          ...this.speakerScope(session),
         });
       }
       return false;
@@ -3600,6 +3692,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           confidence: result.confidence,
           transcript: session.accumulatedTranscript,
           segments: turns,
+          ...this.speakerScope(session),
         });
         return;
       }
@@ -3696,6 +3789,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           }
         }
 
+        // No word-level speaker data: the text is real, who said it is not known.
+        // Keep it as unattributed instead of dropping it or guessing owner/other.
+        const unattributedText = words.length === 0 ? (result.transcript ?? '').trim() : '';
+        if (unattributedText) {
+          session.dualSpeakerHistory.push({ speaker: 'unknown', text: unattributedText });
+          session.pendingUnattributedText = (session.pendingUnattributedText + ' ' + unattributedText).trim();
+        }
+
         session.accumulatedTranscript =
           (session.accumulatedTranscript + ' ' + result.transcript).trim();
 
@@ -3703,6 +3804,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           transcript: session.accumulatedTranscript,
           isFinal: true,
           confidence: result.confidence,
+          ...(unattributedText ? { unattributed: unattributedText, attribution: 'unknown' } : {}),
           speakers: Object.fromEntries(
             Array.from(speakerTexts.entries()).map(([id, text]) => [
               id === ownerSpk ? 'owner' : 'other',
@@ -3779,8 +3881,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           const otherText = session.pendingOtherText.trim();
           const ownerText = session.pendingOwnerText.trim();
+          const unattributedText = session.pendingUnattributedText.trim();
 
-          const combinedWords = `${ownerText} ${otherText}`
+          const combinedWords = `${ownerText} ${otherText} ${unattributedText}`
             .trim()
             .split(/\s+/)
             .filter(Boolean).length;
@@ -3790,6 +3893,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
           session.pendingOtherText = '';
           session.pendingOwnerText = '';
+          session.pendingUnattributedText = '';
           session.accumulatedTranscript = '';
           client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
 
@@ -3797,7 +3901,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           const contextText = otherText ? ownerText : '';
           const speakerDetected = Boolean(otherText);
 
-          await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected);
+          await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected, unattributedText);
           return;
         }
 
@@ -3943,6 +4047,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         session.sendFinalize = sendFinalize;
         session.closeDeepgram = close;
         session.providerEpoch += 1;
+        this.resetSpeakerStateForNewEpoch(session);
         this.attachDeepgramListeners(client, session, emitter);
 
         const { droppedDurationMs } = this.flushRecoveryBuffer(session);
