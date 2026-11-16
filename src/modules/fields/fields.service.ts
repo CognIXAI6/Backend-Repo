@@ -105,6 +105,61 @@ export class FieldsService {
     return this.knex('fields').where('id', id).first();
   }
 
+  private static readonly UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  /**
+   * Authorization for an explicitly requested field ID: the user may use a
+   * built-in field they are assigned, or a custom field they own. Returns the
+   * canonical record (so the caller takes the NAME from here, never from the
+   * client), or null — and null is identical for "doesn't exist", "belongs to
+   * someone else" and "malformed", so a caller can't probe for other users' fields.
+   */
+  async resolveAuthorizedField(
+    userId: string,
+    fieldId: string | null | undefined,
+  ): Promise<{ id: string; name: string; isCustom: boolean } | null> {
+    if (!fieldId || !FieldsService.UUID_RE.test(fieldId)) return null;
+
+    const builtIn = await this.knex('user_fields')
+      .join('fields', 'user_fields.field_id', 'fields.id')
+      .where('user_fields.user_id', userId)
+      .andWhere('user_fields.field_id', fieldId)
+      .first('fields.id as id', 'fields.name as name');
+    if (builtIn) return { id: builtIn.id, name: builtIn.name, isCustom: false };
+
+    const custom = await this.knex('custom_fields').where({ user_id: userId, id: fieldId }).first('id', 'name');
+    if (custom) return { id: custom.id, name: custom.name, isCustom: true };
+
+    return null;
+  }
+
+  /**
+   * Name of the field a conversation was created under. Historical, so it does
+   * NOT require the user to still have the field assigned — but a custom field
+   * must still be the caller's own.
+   */
+  async findFieldRecordForUser(
+    userId: string,
+    fieldId: string | null | undefined,
+  ): Promise<{ id: string; name: string; isCustom: boolean } | null> {
+    if (!fieldId || !FieldsService.UUID_RE.test(fieldId)) return null;
+    const builtIn = await this.knex('fields').where('id', fieldId).first('id', 'name');
+    if (builtIn) return { id: builtIn.id, name: builtIn.name, isCustom: false };
+    const custom = await this.knex('custom_fields').where({ user_id: userId, id: fieldId }).first('id', 'name');
+    return custom ? { id: custom.id, name: custom.name, isCustom: true } : null;
+  }
+
+  /** Guests have no account fields: accept only a built-in, active field by name (never free text). */
+  async findActiveBuiltInByName(name: string | null | undefined): Promise<{ id: string; name: string } | null> {
+    const trimmed = (name ?? '').trim();
+    if (!trimmed) return null;
+    const row = await this.knex('fields')
+      .whereRaw('LOWER(name) = LOWER(?)', [trimmed])
+      .andWhere('is_active', true)
+      .first('id', 'name');
+    return row ? { id: row.id, name: row.name } : null;
+  }
+
   async findBySlug(slug: string): Promise<Field | null> {
     return this.knex('fields').where('slug', slug).first();
   }

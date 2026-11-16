@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Knex } from 'knex';
+import { fetchTimingDetail, fetchTimingSummaries } from './recording-timing.service';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -64,6 +65,8 @@ export interface SaveTranscriptSegmentDto {
   confidence?: number | null;
   identificationMethod: string;
   recordingSessionId?: string | null;
+  /** Provider-connection epoch the speaker number belongs to. */
+  providerEpoch?: number | null;
 }
 
 export interface TranscriptSegment {
@@ -78,6 +81,7 @@ export interface TranscriptSegment {
   end_ms: number | null;
   confidence: number | null;
   identification_method: string;
+  provider_epoch?: number | null;
   is_corrected: boolean;
   recording_session_id: string | null;
   created_at: Date;
@@ -295,6 +299,7 @@ export class ConversationService {
             confidence: s.confidence ?? null,
             identification_method: s.identificationMethod,
             recording_session_id: s.recordingSessionId ?? null,
+            provider_epoch: s.providerEpoch ?? null,
           })),
         );
       }
@@ -364,14 +369,22 @@ export class ConversationService {
   async findRecentEmptyConversation(
     userId: string,
     mode: ConversationMode,
+    fieldId: string | null = null,
   ): Promise<Conversation | null> {
-    return (
-      (await this.knex('conversations')
-        .where({ user_id: userId, mode, total_messages: 0 })
-        .whereNull('deleted_at')
-        .orderBy('created_at', 'desc')
-        .first()) ?? null
-    );
+    const q = this.knex('conversations')
+      .where({ user_id: userId, mode, total_messages: 0 })
+      .whereNull('deleted_at');
+    // Reuse only inside the same professional field (null matches null): an empty
+    // Healthcare conversation must never be handed back to a Law session.
+    if (fieldId) q.andWhere('field_id', fieldId);
+    else q.whereNull('field_id');
+    return (await q.orderBy('created_at', 'desc').first()) ?? null;
+  }
+
+  /** The field a conversation was created under (null = none). Callers must have checked ownership. */
+  async getConversationFieldId(conversationId: string): Promise<string | null> {
+    const row = await this.knex('conversations').where('id', conversationId).first('field_id');
+    return row?.field_id ?? null;
   }
 
   // ── Get paginated history list ──────────────────────────────────────────────
@@ -402,7 +415,11 @@ export class ConversationService {
 
     const total = Number(count);
 
-    return { data, total, page, lastPage: Math.ceil(total / limit) };
+    // Additive: list-safe timing aggregate + independent message-date bounds.
+    const summaries = await fetchTimingSummaries(this.knex, data);
+    const withTiming = data.map((conv) => ({ ...conv, ...(summaries.get(conv.id) ?? {}) }));
+
+    return { data: withTiming, total, page, lastPage: Math.ceil(total / limit) };
   }
 
   /**
@@ -452,7 +469,7 @@ export class ConversationService {
   async getConversation(
     conversationId: string,
     userId: string,
-  ): Promise<Conversation & { messages: ConversationMessage[]; transcriptSegments: TranscriptSegment[] }> {
+  ): Promise<Conversation & { messages: ConversationMessage[]; transcriptSegments: TranscriptSegment[]; timing: Record<string, unknown>; messageDateBounds: Record<string, unknown> }> {
     const conversation = await this.knex('conversations')
       .where({ id: conversationId, user_id: userId })
       .whereNull('deleted_at')
@@ -468,7 +485,9 @@ export class ConversationService {
         .select('*'),
     ]);
 
-    return { ...conversation, messages, transcriptSegments };
+    const { timing, messageDateBounds } = await fetchTimingDetail(this.knex, conversation);
+
+    return { ...conversation, messages, transcriptSegments, timing, messageDateBounds };
   }
 
   // ── Auto-summary status ─────────────────────────────────────────────────────
@@ -730,8 +749,30 @@ export class ConversationService {
         confidence: s.confidence ?? null,
         identification_method: s.identificationMethod,
         recording_session_id: s.recordingSessionId ?? null,
+        provider_epoch: s.providerEpoch ?? null,
       })),
     );
+  }
+
+  /**
+   * A provider speaker number is only an identity *within one provider
+   * connection of one recording session*. Every ordinal-based update is
+   * therefore pinned to (recording session, provider epoch); without both we
+   * refuse rather than widen to every segment in the conversation that
+   * happens to share the number.
+   */
+  private scopeToProviderSpeaker(
+    query: Knex.QueryBuilder,
+    scope: { deepgramSpeakerId: number; recordingSessionId?: string | null; providerEpoch?: number | null },
+  ): Knex.QueryBuilder {
+    return query
+      .andWhere('deepgram_speaker_id', scope.deepgramSpeakerId)
+      .andWhere('recording_session_id', scope.recordingSessionId as string)
+      .andWhere('provider_epoch', scope.providerEpoch as number);
+  }
+
+  private hasProviderScope(scope: { recordingSessionId?: string | null; providerEpoch?: number | null }): boolean {
+    return !!scope.recordingSessionId && Number.isInteger(scope.providerEpoch);
   }
 
   async correctTranscriptSpeaker(input: {
@@ -742,25 +783,25 @@ export class ConversationService {
     speakerLabel: string;
     applyTo: 'segment' | 'session_speaker' | 'conversation_speaker';
     recordingSessionId?: string | null;
+    providerEpoch?: number | null;
   }): Promise<void> {
     const query = this.knex('conversation_transcript_segments').where(
       'conversation_id',
       input.conversationId,
     );
 
-    if (input.applyTo === 'segment' && input.segmentId) {
+    if (input.applyTo === 'segment') {
+      if (!input.segmentId) throw new Error('Correction requires segmentId');
       query.andWhere('id', input.segmentId);
-    } else if (input.applyTo === 'session_speaker' && input.deepgramSpeakerId != null && input.recordingSessionId) {
-      // Scope to the current recording so speaker 0 in one recording doesn't
-      // accidentally relabel speaker 0 from a different recording in the same conversation.
-      query
-        .andWhere('deepgram_speaker_id', input.deepgramSpeakerId)
-        .andWhere('recording_session_id', input.recordingSessionId);
-    } else if (input.deepgramSpeakerId != null) {
-      // conversation_speaker or no recordingSessionId — update all matching rows
-      query.andWhere('deepgram_speaker_id', input.deepgramSpeakerId);
     } else {
-      throw new Error('Correction requires segmentId or deepgramSpeakerId');
+      if (input.deepgramSpeakerId == null) throw new Error('Correction requires segmentId or deepgramSpeakerId');
+      if (!this.hasProviderScope(input)) {
+        throw new Error('Correction by speaker number requires a recording session and provider epoch');
+      }
+      // Speaker numbers are not identities across recordings or provider
+      // reconnects, so both 'session_speaker' and 'conversation_speaker' stay
+      // inside the (recording session, provider epoch) the number came from.
+      this.scopeToProviderSpeaker(query, { ...input, deepgramSpeakerId: input.deepgramSpeakerId });
     }
 
     await query.update({
@@ -777,14 +818,16 @@ export class ConversationService {
     speakerLabel: string;
     applyTo: 'session_speaker' | 'conversation_speaker';
     recordingSessionId?: string | null;
+    providerEpoch?: number | null;
   }): Promise<void> {
+    if (!this.hasProviderScope(input)) {
+      throw new Error('Rename by speaker number requires a recording session and provider epoch');
+    }
     const query = this.knex('conversation_transcript_segments')
       .where('conversation_id', input.conversationId)
-      .andWhere('deepgram_speaker_id', input.deepgramSpeakerId);
-
-    if (input.applyTo === 'session_speaker' && input.recordingSessionId) {
-      query.andWhere('recording_session_id', input.recordingSessionId);
-    }
+      // Only anonymous rows: never rename segments already tied to a real identity.
+      .whereNull('speaker_id');
+    this.scopeToProviderSpeaker(query, input);
 
     await query.update({
       speaker_label: input.speakerLabel,
@@ -795,6 +838,12 @@ export class ConversationService {
 
   // ── Gap 6: retroactive segment update after voice ID resolves a speaker ────
 
+  /**
+   * Returns the number of segments updated. Only updates rows in the exact
+   * (recording session, provider epoch) the identification ran for, and never
+   * rows that were manually corrected or are already confirmed as a
+   * different identity — a late or stale voice-ID result cannot rewrite them.
+   */
   async updateTranscriptSpeakerByDeepgramId(input: {
     conversationId: string;
     deepgramSpeakerId: number;
@@ -802,17 +851,20 @@ export class ConversationService {
     speakerLabel: string;
     identificationMethod: 'voice_id' | 'manual' | 'diarization' | 'unknown';
     recordingSessionId?: string | null;
-  }): Promise<void> {
+    providerEpoch?: number | null;
+  }): Promise<number> {
+    if (!this.hasProviderScope(input)) return 0;
+
     const query = this.knex('conversation_transcript_segments')
       .where('conversation_id', input.conversationId)
-      .andWhere('deepgram_speaker_id', input.deepgramSpeakerId)
-      .andWhere('is_corrected', false);
+      .andWhere('is_corrected', false)
+      .andWhere((b) => {
+        b.whereNull('speaker_id');
+        if (input.speakerId) b.orWhere('speaker_id', input.speakerId);
+      });
+    this.scopeToProviderSpeaker(query, input);
 
-    if (input.recordingSessionId) {
-      query.andWhere('recording_session_id', input.recordingSessionId);
-    }
-
-    await query.update({
+    return query.update({
       speaker_id: input.speakerId,
       speaker_label: input.speakerLabel,
       identification_method: input.identificationMethod,

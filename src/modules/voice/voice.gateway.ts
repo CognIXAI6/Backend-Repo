@@ -8,7 +8,7 @@ import {
   OnGatewayConnection,
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
-import { Logger, BeforeApplicationShutdown } from '@nestjs/common';
+import { Logger, BeforeApplicationShutdown, Optional } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
@@ -36,6 +36,21 @@ import { wrapPcm16AsWav } from './utils/pcm-wav.util';
 import { buildCombinedSummary } from './utils/combined-summary.util';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
+import { RecordingTimingService } from './services/recording-timing.service';
+import {
+  AudioLossReason,
+  SessionCorrelation,
+  SessionTerminalReason,
+  providerDisruptionCause,
+} from './utils/session-lifecycle.util';
+import {
+  BoundKind,
+  SESSION_BOUNDS,
+  SessionMetrics,
+  createSessionMetrics,
+  recordHighWater,
+  snapshotMetrics,
+} from './utils/session-metrics.util';
 import { PlanEntitlements, PlanType } from '@/modules/entitlements/entitlements.types';
 import { SettingsService } from '@/modules/settings/settings.service';
 import { buildUnclearFallback, buildDocumentReadyFallback } from './constants/fallback-messages.constant';
@@ -54,7 +69,8 @@ interface ClientAudioFormatHint {
 // ─── Per-socket session state ─────────────────────────────────────────────────
 
 interface DualSpeakerTurn {
-  speaker: 'owner' | 'other';
+  /** 'unknown' = recognised text for which the provider reported no word-level speaker. */
+  speaker: 'owner' | 'other' | 'unknown';
   text: string;
 }
 
@@ -66,7 +82,10 @@ interface SpeakerRosterEntry {
 }
 
 interface MultiSpeakerTurn {
-  deepgramSpeakerId: number;
+  /** null = the provider gave no word-level speaker data for this text (attribution unknown). */
+  deepgramSpeakerId: number | null;
+  /** Provider connection the speaker number belongs to (numbering can restart on reconnect). */
+  providerEpoch?: number;
   speakerId: string | null;
   speakerLabel: string;
   text: string;
@@ -89,8 +108,22 @@ interface ActiveSession {
   userId: string;
   conversationId: string;
   fieldName?: string;
-  /** Last time fieldName was re-read from the user's primary field (ms epoch). */
-  fieldCheckedAt?: number;
+  /** The field this conversation is stored under (authoritative for live prompts); null = none. */
+  fieldId?: string | null;
+  /** AI turns currently being processed — awaited before the session summary so a final turn isn't missed. */
+  inFlightTurns: Set<Promise<unknown>>;
+  /** In-memory turn sequence: turns accepted for processing vs. settled (for ordering/diagnostics; not persisted). */
+  acceptedTurnSeq: number;
+  settledTurnSeq: number;
+  /** Memory/queue high-water marks and bound hits (counts and bytes only). */
+  metrics: SessionMetrics;
+  /** Server-generated per session:start — correlates every lifecycle log/event of this session. */
+  traceId: string;
+  /** Ack boundary: the last audio sequence acknowledged, and on which stream. */
+  lastAckedSequence: number | null;
+  lastAckedStreamId: string | null;
+  /** Logical recording-session id registered via session:timing:start (authenticated sessions only). */
+  timingSessionId?: string;
   isGuest: boolean;
   /** Only set for guest sessions */
   guestSessionId?: string;
@@ -100,8 +133,9 @@ interface ActiveSession {
   tier?: PlanType;
   entitlements?: PlanEntitlements;
   deepgramEmitter: EventEmitter;
-  sendAudio: (chunk: Buffer) => void;
-  sendFinalize: () => void;
+  /** Returns false when the provider socket could not accept the chunk (not OPEN / send threw). */
+  sendAudio: (chunk: Buffer) => boolean | void;
+  sendFinalize: () => boolean | void;
   closeDeepgram: () => void;
   accumulatedTranscript: string;
   /**
@@ -128,6 +162,8 @@ interface ActiveSession {
   pendingOtherText: string;
   /** Owner words accumulated since last Claude trigger */
   pendingOwnerText: string;
+  /** Recognised dual-speaker text with no word-level speaker data — kept, never guessed into owner/other. */
+  pendingUnattributedText: string;
   /** Debounce timer — Claude fires only after this much silence (ms) */
   utteranceDebounceMs: number;
   /** Active debounce timeout handle */
@@ -230,9 +266,19 @@ interface ActiveSession {
   recoveryAudioBufferBytes: number;
   /** Wall-clock timestamp when overflow-driven dropping started this recovery cycle; null when not currently dropping. */
   recoveryBufferOverflowStartedAt: number | null;
+  /** Bytes of audio dropped from the recovery buffer (byte cap / age) during the current outage — reported, never silent. */
+  recoveryDroppedBytes: number;
 }
 
 // ─── Gateway ──────────────────────────────────────────────────────────────────
+
+/** Label for recognised text whose speaker the provider did not report. */
+const UNATTRIBUTED_SPEAKER_LABEL = 'Unknown speaker';
+
+/** Upper bound Stop waits for an AI turn that is already being processed. */
+const IN_FLIGHT_TURN_WAIT_MS = 20_000;
+/** Safety cap on wait→flush→wait rounds at one stop boundary. */
+const MAX_DRAIN_PASSES = 4;
 
 @WebSocketGateway({
   namespace: '/voice',
@@ -372,6 +418,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     private readonly entitlementsService: EntitlementsService,
     private readonly usageService: UsageService,
     private readonly settingsService: SettingsService,
+    @Optional() private readonly recordingTimingService?: RecordingTimingService,
   ) {}
 
   private emitError(
@@ -528,7 +575,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     this.logger.warn(
       `beforeApplicationShutdown(${signal}) — notifying ${this.sessions.size} active voice session(s) before restart`,
     );
+    for (const active of this.sessions.values()) {
+      this.logLifecycle(active, 'session_terminal', { reason: 'server_restart' satisfies SessionTerminalReason });
+    }
     this.server.emit('server:restarting', {
+      reason: 'server_restart' satisfies SessionTerminalReason,
       message: 'The server is restarting for a brief update. Please reconnect in a few seconds.',
     });
     await sleep(500);
@@ -563,27 +614,31 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     this.logger.log(`Client disconnected: ${client.id}`);
     const session = this.sessions.get(client.id);
 
-    // Same ordering requirement as handleSessionEnd: flush before
-    // cleanupSession clears the buffers it reads.
-    if (session?.isMultiSpeaker && session.pendingMultiSpeakerTurns.length > 0) {
-      await this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 }).catch(
-        (err) => this.logger.error('disconnect flush failed:', err),
-      );
-    }
+    // Same ordering requirement as handleSessionEnd: drain before cleanupSession
+    // clears the buffers it reads.
+    const drain = session ? await this.drainSessionTurns(client, session, 'disconnect') : { complete: true };
+    if (session) this.logLifecycle(session, 'session_terminal', { reason: 'client_disconnect' satisfies SessionTerminalReason, drainComplete: drain.complete });
 
     if (session && !session.isGuest) {
-      this.scheduleDisconnectSummary(client, session);
+      this.scheduleDisconnectSummary(client, session, drain.complete);
+      // Unexpected drop: close this socket's timing session as interrupted
+      // (partial). A reconnect re-registers the same logical id and resumes it.
+      void this.recordingTimingService?.closeBySocket({
+        conversationId: session.conversationId,
+        socketId: client.id,
+        status: 'interrupted',
+      });
     }
 
     this.cleanupSession(client.id);
   }
 
-  private scheduleDisconnectSummary(client: Socket, session: ActiveSession): void {
+  private scheduleDisconnectSummary(client: Socket, session: ActiveSession, drainComplete = true): void {
     const { conversationId } = session;
     this.cancelPendingDisconnectSummary(conversationId);
     const timer = setTimeout(() => {
       this.pendingDisconnectSummaries.delete(conversationId);
-      this.finalizeSessionOnExit(client, session).catch((err) =>
+      this.finalizeSessionOnExit(client, session, { drainComplete }).catch((err) =>
         this.logger.error(`Auto-summary on disconnect failed for conversation ${conversationId}:`, err),
       );
     }, this.DISCONNECT_SUMMARY_GRACE_MS);
@@ -678,18 +733,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         return;
       }
 
-      // ── Resolve field context ─────────────────────────────────────────────
-      let resolvedFieldId = payload.fieldId;
-      let resolvedFieldName = payload.fieldName;
-
-      if (!isGuest && (!resolvedFieldId || !resolvedFieldName)) {
-        const primaryField = await this.fieldsService.getUserPrimaryField(userId);
-        if (primaryField) {
-          resolvedFieldId = resolvedFieldId ?? (primaryField.field_id ?? primaryField.custom_field_id ?? primaryField.id);
-          resolvedFieldName = resolvedFieldName ?? primaryField.name;
-        }
-      }
-
       // ── Load user data once ───────────────────────────────────────────────
       let cachedAiMemory: string | null = null;
       let cachedVoiceSpeakerId: string | null = null;
@@ -710,6 +753,56 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         } catch {
           this.logger.warn(`session:start: conversationId ${conversationId} not owned by ${userId} — creating new`);
           conversationId = undefined;
+        }
+      }
+
+      // ── Resolve the ONE field this conversation lives under ──────────────
+      // Never trust a client-supplied field ID/name pair:
+      //  • resumed conversation → its persisted field_id is authoritative (history is
+      //    not silently reclassified; a different requested field is only FLAGGED so the
+      //    client can start a new conversation for a deliberate field boundary);
+      //  • new conversation     → the requested field ID if this user may use it (name
+      //    always taken from the record), else the account's primary field;
+      //  • guests               → only a built-in field matched by name, never free text.
+      const requestedFieldId =
+        typeof payload.fieldId === 'string' && payload.fieldId.trim() ? payload.fieldId.trim() : null;
+      let fieldId: string | null = null;
+      let resolvedFieldName: string | undefined;
+      let fieldSource: 'conversation' | 'requested' | 'primary' | 'none' = 'none';
+      let fieldFallback = false;
+      let fieldMismatch = false;
+
+      if (conversationId) {
+        const persistedFieldId = await this.conversationService.getConversationFieldId(conversationId);
+        fieldId = persistedFieldId;
+        if (persistedFieldId) {
+          const record = await this.fieldsService.findFieldRecordForUser(userId, persistedFieldId);
+          resolvedFieldName = record?.name;
+          fieldSource = 'conversation';
+        }
+        fieldMismatch = requestedFieldId !== null && requestedFieldId !== persistedFieldId;
+      } else if (isGuest) {
+        const builtIn = await this.fieldsService.findActiveBuiltInByName(payload.fieldName);
+        if (builtIn) {
+          fieldId = builtIn.id;
+          resolvedFieldName = builtIn.name;
+          fieldSource = 'requested';
+        }
+      } else {
+        const authorized = await this.fieldsService.resolveAuthorizedField(userId, requestedFieldId);
+        if (authorized) {
+          fieldId = authorized.id;
+          resolvedFieldName = authorized.name;
+          fieldSource = 'requested';
+        } else {
+          // Absent, stale, malformed or someone else's: same outcome for all of them.
+          fieldFallback = requestedFieldId !== null;
+          const primary = await this.fieldsService.getUserPrimaryField(userId);
+          if (primary) {
+            fieldId = primary.field_id ?? primary.custom_field_id ?? null;
+            resolvedFieldName = primary.name;
+            fieldSource = fieldId ? 'primary' : 'none';
+          }
         }
       }
 
@@ -767,7 +860,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // creating a new one — prevents accumulation of duplicate "Untitled conversation"
         // rows when the user starts and stops recording without sending any messages.
         const emptyConv = !isGuest
-          ? await this.conversationService.findRecentEmptyConversation(userId, dbMode)
+          ? await this.conversationService.findRecentEmptyConversation(userId, dbMode, fieldId)
           : null;
 
         if (emptyConv) {
@@ -777,7 +870,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           const conv = await this.conversationService.createConversation(
             userId,
             dbMode,
-            resolvedFieldId,
+            fieldId ?? undefined,
           );
           conversationId = conv.id;
         }
@@ -815,6 +908,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         userId,
         conversationId,
         fieldName: resolvedFieldName,
+        fieldId,
         isGuest,
         startedAt: Date.now(),
         tier,
@@ -836,6 +930,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         dualSpeakerHistory: [],
         pendingOtherText: '',
         pendingOwnerText: '',
+        pendingUnattributedText: '',
         utteranceDebounceMs: shouldDiarize ? 8_000 : 3_000,
         utteranceDebounceTimer: null,
         speakerRoster,
@@ -873,6 +968,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         streamSequences: new Map(),
         audioGapCount: 0,
         providerState: 'active',
+        inFlightTurns: new Set<Promise<unknown>>(),
+        acceptedTurnSeq: 0,
+        settledTurnSeq: 0,
+        metrics: createSessionMetrics(),
+        traceId: randomUUID(),
+        lastAckedSequence: null,
+        lastAckedStreamId: null,
         providerEpoch: 0,
         currentRecoveryId: null,
         recoveryAttempt: 0,
@@ -880,6 +982,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         recoveryAudioBuffer: [],
         recoveryAudioBufferBytes: 0,
         recoveryBufferOverflowStartedAt: null,
+        recoveryDroppedBytes: 0,
       };
 
       this.attachDeepgramListeners(client, session, emitter);
@@ -941,6 +1044,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }
 
       const rosterCount = speakerRoster.length;
+      this.logLifecycle(session, 'session_start', { mode, isGuest });
       this.logger.log(
         `Session started — user: ${userId} (${isGuest ? 'guest' : 'auth'}), ` +
         `conv: ${conversationId}, mode: ${mode}, roster: ${rosterCount}, ` +
@@ -956,6 +1060,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         // providerSessionEpoch above is left as-is for backward compatibility.
         providerEpoch: session.providerEpoch,
         clientSessionId: session.clientSessionId,
+        traceId: session.traceId,
+        // Field this conversation lives under. `mismatch`: the client asked for a different
+        // field than a resumed conversation's own (start a new conversation to change field);
+        // `fallback`: the requested field ID was not usable, so the primary field applies.
+        field: {
+          id: fieldId,
+          name: resolvedFieldName ?? null,
+          source: fieldSource,
+          mismatch: fieldMismatch,
+          fallback: fieldFallback,
+        },
+        // Capability negotiation: clients only send session:timing:* when this is present.
+        capabilities: { recordingTiming: this.recordingTimingService && !isGuest ? 1 : 0 },
         isGuest,
         mode,
         isDualSpeaker,
@@ -983,6 +1100,57 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     } catch (err) {
       this.logger.error('session:start failed', err);
       this.emitError(client, 'SESSION_START_FAILED', (err as Error).message, { clientMessage: 'Failed to start session. Please refresh and try again.' });
+    }
+  }
+
+  // ─── session:timing:* ───────────────────────────────────────────────────────
+  // Durable per-logical-session capture timing. Clients send `start` only after
+  // fresh microphone capture succeeded; reconnects reuse the same sessionId.
+  // `report` carries cumulative captured intervals (offsets in ms from session
+  // start) with a monotonic `seq`; `final: true` closes the session as complete.
+  // Billing/usage metering is unaffected.
+  private static readonly TIMING_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+  @SubscribeMessage('session:timing:start')
+  async handleTimingStart(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { sessionId?: string },
+  ): Promise<void> {
+    const session = this.sessions.get(client.id);
+    const sessionId = payload?.sessionId;
+    if (!session || session.isGuest || !this.recordingTimingService) return;
+    if (typeof sessionId !== 'string' || !VoiceGateway.TIMING_ID_PATTERN.test(sessionId)) return;
+    try {
+      const res = await this.recordingTimingService.startSession({
+        userId: session.userId,
+        conversationId: session.conversationId,
+        clientSessionId: sessionId,
+        socketId: client.id,
+      });
+      if (res) session.timingSessionId = sessionId;
+    } catch (err) {
+      this.logger.error(`session:timing:start failed for conversation ${session.conversationId}`, err as Error);
+    }
+  }
+
+  @SubscribeMessage('session:timing:report')
+  async handleTimingReport(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { sessionId?: string; seq?: number; intervals?: unknown; final?: boolean },
+  ): Promise<void> {
+    const session = this.sessions.get(client.id);
+    if (!session || session.isGuest || !this.recordingTimingService) return;
+    const sessionId = payload?.sessionId;
+    if (typeof sessionId !== 'string' || !VoiceGateway.TIMING_ID_PATTERN.test(sessionId)) return;
+    try {
+      await this.recordingTimingService.applyReport({
+        userId: session.userId,
+        conversationId: session.conversationId,
+        clientSessionId: sessionId,
+        report: { seq: Number(payload.seq), intervals: payload.intervals, final: payload.final === true },
+      });
+    } catch (err) {
+      this.logger.error(`session:timing:report failed for conversation ${session.conversationId}`, err as Error);
     }
   }
 
@@ -1031,7 +1199,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       `audioSource=${payload.audioSource ?? session.audioSource}`,
     );
 
+    this.logLifecycle(session, 'stream_start', { streamEpoch: payload.streamEpoch ?? 0 });
     client.emit('stream:ready', {
+      traceId: session.traceId,
       recordingId: streamId,
       streamEpoch: payload.streamEpoch ?? 0,
       expectedSequence: 0,
@@ -1056,10 +1226,28 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // While the provider connection is being replaced, hold audio in the
     // bounded recovery buffer instead of dropping it on the floor — it gets
     // replayed in order once the new connection is up (see flushRecoveryBuffer).
+    // `held` = the server has taken responsibility for this chunk (sent to the
+    // provider, or buffered for replay after recovery). Only held chunks are
+    // acknowledged, so the client never frees audio that was silently lost.
+    let held = true;
     if (session.providerState === 'recovering') {
       this.bufferAudioForRecovery(session, buffer);
     } else {
-      session.sendAudio(buffer);
+      const accepted = session.sendAudio(buffer) !== false;
+      if (!accepted) {
+        // Re-read: sendAudio's own failure signal may already have started recovery.
+        const stateNow = session.providerState as ProviderSessionState;
+        if (stateNow === 'active') {
+          // Provider socket isn't usable: keep this chunk for replay and start recovery.
+          this.bufferAudioForRecovery(session, buffer);
+          this.handleProviderDisruption(client, session, session.providerEpoch, 'transport_failure');
+        } else if (stateNow === 'recovering') {
+          // sendAudio's own failure signal already started recovery.
+          this.bufferAudioForRecovery(session, buffer);
+        } else {
+          held = false;
+        }
+      }
     }
 
     // Capture the container header for per-speaker audio reconstruction
@@ -1084,7 +1272,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           `[${client.id}] Audio gap in stream "${streamId}": ` +
           `expected=${lastSeq + 1} actual=${payload.sequence} (gaps=${session.audioGapCount})`,
         );
+        this.logLifecycle(session, 'sequence_gap', { expected: lastSeq + 1, actual: payload.sequence, gaps: session.audioGapCount });
         client.emit('audio:continuity_warning', {
+          reason: 'sequence_gap' satisfies AudioLossReason,
+          correlation: this.correlation(session),
           streamId,
           expected: lastSeq + 1,
           actual: payload.sequence,
@@ -1096,11 +1287,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.streamSequences.set(streamId, payload.sequence);
       if (!session.activeStreamId) session.activeStreamId = streamId;
 
-      client.emit('audio:ack', {
-        sequence: payload.sequence,
-        streamId,
-        clientSessionId: session.clientSessionId,
-      });
+      if (held) {
+        session.lastAckedSequence = payload.sequence;
+        session.lastAckedStreamId = streamId;
+        client.emit('audio:ack', {
+          sequence: payload.sequence,
+          streamId,
+          clientSessionId: session.clientSessionId,
+        });
+      }
     }
 
     // ── Per-speaker audio tagging ─────────────────────────────────────────
@@ -1109,6 +1304,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const spk = session.currentDominantSpeaker;
       const spkBufs = session.speakerAudioBuffers.get(spk) ?? [];
       const spkBytes = session.speakerAudioBytes.get(spk) ?? 0;
+      if (spkBytes >= this.AUDIO_BUFFER_CAP) this.noteBoundHit(session, 'speakerAudioCap');
       if (spkBytes < this.AUDIO_BUFFER_CAP) {
         spkBufs.push(buffer);
         session.speakerAudioBuffers.set(spk, spkBufs);
@@ -1118,10 +1314,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     // ── General audio buffering ───────────────────────────────────────────
     const shouldBuffer = !session.isGuest && session.audioBufferBytes < this.AUDIO_BUFFER_CAP;
+    this.maybeSampleSessionMetrics(session);
     const needsBuffer =
       shouldDiarize ||
       (!session.isDualSpeaker && !session.isMultiSpeaker && !session.singleSpeakerProfileTriggered && this.voiceVerificationService.isEnabled);
 
+    if (!shouldBuffer && needsBuffer && !session.isGuest) this.noteBoundHit(session, 'audioBufferCap');
     if (shouldBuffer && needsBuffer) {
       session.audioBuffer.push(buffer);
       session.audioBufferBytes += buffer.length;
@@ -1131,8 +1329,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (session.idleTimeoutHandle) clearTimeout(session.idleTimeoutHandle);
     session.idleTimeoutHandle = setTimeout(() => {
       this.logger.warn(`[${client.id}] Session idle for 30 min — auto-closing`);
+      this.logLifecycle(session, 'session_terminal', { reason: 'idle_timeout' satisfies SessionTerminalReason });
+      const correlation = this.correlation(session);
       this.cleanupSession(client.id);
-      client.emit('session:ended', { reason: 'idle_timeout' });
+      client.emit('session:ended', { reason: 'idle_timeout' satisfies SessionTerminalReason, correlation });
     }, this.SESSION_IDLE_TIMEOUT_MS);
   }
 
@@ -1163,7 +1363,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const timer = setTimeout(cleanup, timeoutMs);
       session.deepgramEmitter.on('finalized', onFinalized);
       try {
-        session.sendFinalize();
+        if (session.sendFinalize() === false) {
+          // The provider socket is not open: no Finalize will ever be acknowledged, so
+          // don't sit out the whole drain timeout waiting for it.
+          this.logger.warn(`Finalize not delivered (provider socket not open) trace=${session.traceId}`);
+          cleanup();
+        }
       } catch (err) {
         this.logger.warn(`sendFinalize threw: ${(err as Error).message}`);
         cleanup();
@@ -1202,7 +1407,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (session.isMultiSpeaker) {
       this.logger.log(`[${client.id}] audio:stop streamId=${streamId} drainMs=${drainMs} turnsPending=${session.pendingMultiSpeakerTurns.length}`);
       client.emit('audio:finalized', { recordingId: streamId, transcriptDetected: session.pendingMultiSpeakerTurns.length > 0 });
-      await this.flushMultiSpeakerTurns(client, session, { reason: 'audio_stop', minWords: 1 });
+      // Wait for the turn that is running, then process the final turns queued behind
+      // it — an 'already_processing' result must never be taken as completion.
+      await this.drainSessionTurns(client, session, 'audio_stop');
       return;
     }
 
@@ -1215,6 +1422,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.accumulatedTranscript = '';
     session.pendingInterimTranscript = '';
     session.transcriptConfidences = [];
+    if (session.isDualSpeaker) {
+      // The same words are also in the dual-speaker pending buffers; this path takes
+      // them as one turn, so clear them or the session-end flush would save them twice.
+      session.pendingOtherText = '';
+      session.pendingOwnerText = '';
+      session.pendingUnattributedText = '';
+    }
 
     this.logger.log(`[${client.id}] audio:stop streamId=${streamId} drainMs=${drainMs} transcriptEmpty=${!transcript}`);
     client.emit('audio:finalized', { recordingId: streamId, transcriptDetected: Boolean(transcript) });
@@ -1225,8 +1439,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     if (session.isProcessingAI) {
-      client.emit('ai:skipped', { reason: 'already_processing' });
-      return;
+      // The final words are already taken out of the buffers above, so dropping them
+      // here would lose them. Wait for the running turn (bounded) and then process
+      // them; only a turn that really never finishes yields a truthful skip.
+      const settled = await this.awaitInFlightTurns(session);
+      if (!settled || session.isProcessingAI) {
+        client.emit('ai:skipped', { reason: 'already_processing', transcript });
+        return;
+      }
     }
 
     const avgConfidence =
@@ -1316,10 +1536,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.ownerSpeakerId = session.ownerSpeakerId === 0 ? 1 : 0;
 
-    session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
-      ...turn,
-      speaker: turn.speaker === 'owner' ? 'other' : 'owner',
-    }));
+    session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
     this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
       this.logger.error(`[${client.id}] relabelSpeakers (swap) failed:`, err),
@@ -1444,7 +1661,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.ownerSpeakerId = confirmedOwnerSpeakerId;
       session.calibrationPhase = false;
 
-      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => {
+      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn): DualSpeakerTurn => {
+        if (turn.speaker === 'unknown') return turn; // never re-attributed by an owner correction
         const deepgramId = turn.speaker === 'owner'
           ? (confirmedOwnerSpeakerId === 0 ? 0 : 1)
           : (confirmedOwnerSpeakerId === 0 ? 1 : 0);
@@ -1494,6 +1712,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       segmentId?: string;
       speakerId: string;
       applyTo?: 'segment' | 'session_speaker' | 'conversation_speaker';
+      /** Provider epoch the speaker number was shown under (defaults to the current one). */
+      providerEpoch?: number;
     },
   ): Promise<void> {
     const session = this.sessions.get(client.id);
@@ -1514,6 +1734,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
+    const correctionEpoch = this.resolveCorrectionEpoch(session, payload.providerEpoch);
     try {
       await this.conversationService.correctTranscriptSpeaker({
         conversationId: session.conversationId,
@@ -1523,6 +1744,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerLabel: speaker.name,
         applyTo: payload.applyTo ?? 'session_speaker',
         recordingSessionId: session.recordingSessionId,
+        providerEpoch: correctionEpoch,
       });
     } catch (err) {
       this.logger.warn(`[${client.id}] correctTranscriptSpeaker DB error: ${(err as Error).message}`);
@@ -1533,8 +1755,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // Update in-memory state only after DB confirms
-    if (payload.deepgramSpeakerId != null) {
+    // Update in-memory state only after DB confirms — and only for the current
+    // provider connection: an older epoch's speaker number must not label the
+    // current connection's speaker with the same number.
+    if (payload.deepgramSpeakerId != null && correctionEpoch === session.providerEpoch) {
       session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
         speakerId: speaker.id,
         label: speaker.name,
@@ -1549,6 +1773,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     );
 
     client.emit('transcript:speaker_corrected', {
+      ...this.speakerScope(session, correctionEpoch),
       deepgramSpeakerId: payload.deepgramSpeakerId,
       segmentId: payload.segmentId,
       speakerId: speaker.id,
@@ -1567,6 +1792,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       deepgramSpeakerId: number;
       displayName: string;
       applyTo?: 'session_speaker' | 'conversation_speaker';
+      providerEpoch?: number;
     },
   ): Promise<void> {
     const session = this.sessions.get(client.id);
@@ -1587,6 +1813,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
+    const renameEpoch = this.resolveCorrectionEpoch(session, payload.providerEpoch);
     try {
       const applyTo = payload.applyTo ?? 'session_speaker';
       await this.conversationService.renameAnonymousSpeaker({
@@ -1595,6 +1822,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerLabel: name,
         applyTo,
         recordingSessionId: session.recordingSessionId,
+        providerEpoch: renameEpoch,
       });
     } catch (err) {
       this.logger.warn(`[${client.id}] renameAnonymousSpeaker DB error: ${(err as Error).message}`);
@@ -1605,15 +1833,17 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
-    // Update in-memory state only after DB confirms
-    session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
-      speakerId: null,
-      label: name,
-      voiceSpeakerId: null,
-      method: 'manual',
-      confidence: 1,
-    });
-    session.anonymousSpeakerLabels.set(payload.deepgramSpeakerId, name);
+    // Update in-memory state only after DB confirms (current provider connection only)
+    if (renameEpoch === session.providerEpoch) {
+      session.resolvedSpeakers.set(payload.deepgramSpeakerId, {
+        speakerId: null,
+        label: name,
+        voiceSpeakerId: null,
+        method: 'manual',
+        confidence: 1,
+      });
+      session.anonymousSpeakerLabels.set(payload.deepgramSpeakerId, name);
+    }
 
     this.logger.log(`[${client.id}] Guest renamed: deepgramId=${payload.deepgramSpeakerId} → "${name}"`);
 
@@ -1632,6 +1862,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     client.emit('transcript:speaker_corrected', {
+      ...this.speakerScope(session, renameEpoch),
       deepgramSpeakerId: payload.deepgramSpeakerId,
       speakerId: null,
       speakerLabel: name,
@@ -1647,29 +1878,36 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   async handleSessionEnd(@ConnectedSocket() client: Socket): Promise<void> {
     const session = this.sessions.get(client.id);
 
-    // Flush any pending multi-speaker turns before tearing down so they are
-    // not silently discarded when the user stops recording. Must be awaited
-    // here, before cleanupSession below clears the buffers it reads.
-    if (session?.isMultiSpeaker && session.pendingMultiSpeakerTurns.length > 0) {
-      await this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 }).catch(
-        (err) => this.logger.error('session:end flush failed:', err),
-      );
-    }
+    // Stop ordering: wait for the turn that is running, process the final text
+    // queued behind it, and wait for that too — all before cleanupSession clears the
+    // buffers and before the summary reads history. `complete:false` means persistence
+    // was not confirmed within the bound.
+    const drain = session ? await this.drainSessionTurns(client, session, 'session_end') : { complete: true };
 
     if (session && !session.isGuest) {
+      void this.recordingTimingService?.closeBySocket({
+        conversationId: session.conversationId,
+        socketId: client.id,
+        status: 'ended',
+      });
       this.cancelPendingDisconnectSummary(session.conversationId);
       // Fire-and-forget: the client disconnects its socket immediately after
       // emitting session:end (doesn't wait for any ack), so this routinely
       // finishes after the live connection is already gone — delivery is via
       // the conversation's document list + push notification, same as any
       // document generated mid-conversation after the user has moved on.
-      this.finalizeSessionOnExit(client, session).catch((err) =>
+      this.finalizeSessionOnExit(client, session, { drainComplete: drain.complete }).catch((err) =>
         this.logger.error(`Auto-summary failed for conversation ${session.conversationId}:`, err),
       );
     }
 
+    if (session) this.logLifecycle(session, 'session_terminal', { reason: 'explicit_end' satisfies SessionTerminalReason, drainComplete: drain.complete });
+    const endCorrelation = session ? this.correlation(session) : null;
     this.cleanupSession(client.id);
-    client.emit('session:ended');
+    client.emit(
+      'session:ended',
+      session ? { reason: 'explicit_end' satisfies SessionTerminalReason, drainComplete: drain.complete, correlation: endCorrelation } : undefined,
+    );
   }
 
   /**
@@ -1682,7 +1920,283 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * multi-speaker flush: that must be awaited by the caller before
    * cleanupSession clears the buffers it depends on, so it can't live here.
    */
-  private async finalizeSessionOnExit(client: Socket, session: ActiveSession): Promise<void> {
+  /**
+   * Hands the dual-speaker pending text (owner / other / unattributed) to one AI
+   * turn once it reaches `minWords`. Returns true if a turn was started. The text
+   * is claimed synchronously after the quota await so concurrent callers can't both take it.
+   */
+  private async flushDualSpeakerPending(client: Socket, session: ActiveSession, minWords: number): Promise<boolean> {
+    if (session.calibrationPhase) return false;
+
+    const wordsIn = () =>
+      `${session.pendingOwnerText} ${session.pendingOtherText} ${session.pendingUnattributedText}`
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean).length;
+    if (wordsIn() < minWords) return false;
+    if (!(await this.checkMessageQuota(client, session))) return false;
+
+    if (session.isProcessingAI || wordsIn() < minWords) return false;
+    const otherText = session.pendingOtherText.trim();
+    const ownerText = session.pendingOwnerText.trim();
+    const unattributedText = session.pendingUnattributedText.trim();
+
+    session.pendingOtherText = '';
+    session.pendingOwnerText = '';
+    session.pendingUnattributedText = '';
+    session.accumulatedTranscript = '';
+    client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
+
+    const primaryText = otherText || ownerText;
+    const contextText = otherText ? ownerText : '';
+    const speakerDetected = Boolean(otherText);
+
+    await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected, unattributedText);
+    return true;
+  }
+
+  // ── Lifecycle correlation and terminal reasons (redacted: ids and counters only) ──
+
+  private correlation(session: ActiveSession): SessionCorrelation {
+    return {
+      traceId: session.traceId ?? null,
+      recordingSessionId: session.recordingSessionId ?? null,
+      clientSessionId: session.clientSessionId ?? null,
+      streamId: session.activeStreamId ?? null,
+      providerEpoch: session.providerEpoch ?? null,
+      lastAckedSequence: session.lastAckedSequence ?? null,
+    };
+  }
+
+  /** One structured lifecycle line: event name + correlation ids + optional code/counters. Never content. */
+  private logLifecycle(session: ActiveSession, event: string, extra: Record<string, string | number | boolean | null> = {}): void {
+    const c = this.correlation(session);
+    const kv = Object.entries({ ...c, ...extra })
+      .filter(([, v]) => v !== null && v !== undefined)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(' ');
+    this.logger.log(`lifecycle event=${event} ${kv}`);
+  }
+
+  // ── Bounded in-memory state + observability ──────────────────────────────────
+
+  /** Counts a bound being reached; logs the first hit of each kind per session (ids only, no content). */
+  private noteBoundHit(session: ActiveSession, kind: BoundKind): void {
+    const m = session.metrics;
+    if (!m) return;
+    m.boundHits[kind] += 1;
+    if (!m.loggedKinds.has(kind)) {
+      m.loggedKinds.add(kind);
+      this.logger.warn(`Session bound reached: ${kind} (trace=${session.traceId}, recordingSession=${session.recordingSessionId}, epoch=${session.providerEpoch})`);
+    }
+  }
+
+  private pendingTextChars(session: ActiveSession): number {
+    let chars = (session.pendingOwnerText?.length ?? 0) + (session.pendingOtherText?.length ?? 0) + (session.pendingUnattributedText?.length ?? 0);
+    for (const t of session.pendingMultiSpeakerTurns ?? []) chars += t.text.length;
+    return chars;
+  }
+
+  /** Samples current sizes into the high-water marks. O(#speakers); throttled by callers on the audio path. */
+  private sampleSessionMetrics(session: ActiveSession): void {
+    const m = session.metrics;
+    if (!m) return;
+    let speakerAudioBytes = 0;
+    for (const bytes of session.speakerAudioBytes?.values() ?? []) speakerAudioBytes += bytes;
+    recordHighWater(m, {
+      multiHistoryTurns: session.multiSpeakerHistory?.length ?? 0,
+      dualHistoryTurns: session.dualSpeakerHistory?.length ?? 0,
+      confidenceSamples: session.transcriptConfidences?.length ?? 0,
+      pendingTurns: session.pendingMultiSpeakerTurns?.length ?? 0,
+      pendingChars: this.pendingTextChars(session),
+      audioBufferBytes: session.audioBufferBytes ?? 0,
+      speakerAudioBytes,
+      recoveryBufferBytes: session.recoveryAudioBufferBytes ?? 0,
+      recoveryBufferChunks: session.recoveryAudioBuffer?.length ?? 0,
+      inFlightTurns: session.inFlightTurns?.size ?? 0,
+    });
+    m.lastSampledAt = Date.now();
+  }
+
+  /** Throttled sample for the hot audio path. */
+  private maybeSampleSessionMetrics(session: ActiveSession): void {
+    const m = session.metrics;
+    if (!m || Date.now() - m.lastSampledAt < SESSION_BOUNDS.SAMPLE_INTERVAL_MS) return;
+    this.sampleSessionMetrics(session);
+  }
+
+  /**
+   * Keeps long-session memory bounded without losing anything that matters:
+   *  • history windows / confidence samples are in-memory CONTEXT only — the full
+   *    transcript is persisted — so the oldest entries are trimmed;
+   *  • un-persisted pending turns/text are NEVER dropped: at their bound a flush is
+   *    forced instead (skipped only while a turn is already processing, which drains
+   *    them afterwards).
+   */
+  private enforceSessionBounds(client: Socket, session: ActiveSession): void {
+    const trim = <T>(arr: T[], max: number, kind: BoundKind) => {
+      const over = arr.length - max;
+      if (over > 0) {
+        arr.splice(0, over);
+        session.metrics.trimmedHistoryTurns += kind === 'confidenceTrim' ? 0 : over;
+        this.noteBoundHit(session, kind);
+      }
+    };
+    trim(session.multiSpeakerHistory, SESSION_BOUNDS.MAX_MULTI_HISTORY_TURNS, 'multiHistoryTrim');
+    trim(session.dualSpeakerHistory, SESSION_BOUNDS.MAX_DUAL_HISTORY_TURNS, 'dualHistoryTrim');
+    trim(session.transcriptConfidences, SESSION_BOUNDS.MAX_CONFIDENCE_SAMPLES, 'confidenceTrim');
+
+    this.sampleSessionMetrics(session);
+
+    const pendingTurns = session.pendingMultiSpeakerTurns.length;
+    const pendingChars = this.pendingTextChars(session);
+    const atBound = pendingTurns >= SESSION_BOUNDS.MAX_PENDING_TURNS || pendingChars >= SESSION_BOUNDS.MAX_PENDING_CHARS;
+    if (atBound && !session.isProcessingAI) {
+      this.noteBoundHit(session, 'pendingForceFlush');
+      const flush = session.isMultiSpeaker
+        ? this.flushMultiSpeakerTurns(client, session, { reason: 'utterance_end', minWords: 1 })
+        : session.isDualSpeaker
+          ? this.flushDualSpeakerPending(client, session, 1)
+          : Promise.resolve(false);
+      flush.catch((err) => this.logger.error(`[${client.id}] bound-forced flush failed:`, err));
+    }
+  }
+
+  /** Registers an AI turn so Stop / the summary can wait for it. Removes itself when settled. */
+  private trackTurn(session: ActiveSession, run: () => Promise<void>): Promise<void> {
+    const promise = run();
+    const set = session.inFlightTurns;
+    if (!set) return promise;
+    session.acceptedTurnSeq = (session.acceptedTurnSeq ?? 0) + 1;
+    set.add(promise);
+    const done = () => {
+      set.delete(promise);
+      session.settledTurnSeq = (session.settledTurnSeq ?? 0) + 1;
+    };
+    promise.then(done, done);
+    return promise;
+  }
+
+  /**
+   * Waits (bounded) for every AI turn still being processed. Resolves true when
+   * all have settled, false if the bound was hit first — callers must treat
+   * false as "persistence not confirmed", not as completion. Never throws.
+   */
+  private async awaitInFlightTurns(session: ActiveSession, timeoutMs = IN_FLIGHT_TURN_WAIT_MS): Promise<boolean> {
+    const pending = session.inFlightTurns;
+    if (!pending || pending.size === 0) return true;
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        this.logger.warn(`Gave up waiting for ${pending.size} in-flight turn(s) after ${timeoutMs}ms`);
+        resolve();
+      }, timeoutMs);
+    });
+    try {
+      await Promise.race([Promise.allSettled([...pending]).then(() => undefined), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return !timedOut && pending.size === 0;
+  }
+
+  /** Resolves 'done' with the promise's outcome, or 'timeout' if it has not settled within `ms`. */
+  private async withDeadline(promise: Promise<unknown>, ms: number): Promise<'done' | 'timeout'> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), Math.max(0, ms)); });
+    try {
+      return await Promise.race([promise.then(() => 'done' as const, () => 'done' as const), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Whether one more turn may be spent right now (guest prompt trial / plan quota). */
+  private async canSpendTurn(client: Socket, session: ActiveSession): Promise<boolean> {
+    if (session.isGuest && session.guestSessionId) {
+      const gs = await this.guestSessionService.getStatus(session.guestSessionId);
+      return gs.canSend;
+    }
+    return this.checkMessageQuota(client, session);
+  }
+
+  /**
+   * Starts whatever final text this session still holds un-processed (multi-speaker
+   * queue, dual-speaker pending text, single-speaker accumulated transcript) as a
+   * tracked turn. Returns true if a turn was started. The queue/buffer is claimed
+   * synchronously after the quota await, so two concurrent exits can't both take it.
+   */
+  private async flushPendingTurnsForExit(client: Socket, session: ActiveSession): Promise<boolean> {
+    if (session.isMultiSpeaker) {
+      return this.flushMultiSpeakerTurns(client, session, { reason: 'session_end', minWords: 1 });
+    }
+    if (session.isDualSpeaker) {
+      return this.flushDualSpeakerPending(client, session, 1);
+    }
+
+    const transcript = (session.accumulatedTranscript ?? '').trim();
+    if (!transcript) return false;
+    if (!(await this.canSpendTurn(client, session))) return false;
+    const claimed = (session.accumulatedTranscript ?? '').trim();
+    if (!claimed || session.isProcessingAI) return false;
+    session.accumulatedTranscript = '';
+    session.transcriptConfidences = [];
+    await this.processPrompt(client, session, claimed, 'voice');
+    return true;
+  }
+
+  /**
+   * The one barrier at every stop/end boundary (audio:stop, session:end, raw
+   * disconnect). Loops: wait for the running turn → start whatever final text is
+   * still queued behind it → wait again, until nothing new starts. `complete` is
+   * true only when every turn accepted before the boundary has reached a terminal
+   * state; false means the bound was hit and persistence is NOT confirmed.
+   */
+  private async drainSessionTurns(
+    client: Socket,
+    session: ActiveSession,
+    reason: 'audio_stop' | 'session_end' | 'disconnect',
+  ): Promise<{ complete: boolean; passes: number }> {
+    const deadline = Date.now() + IN_FLIGHT_TURN_WAIT_MS;
+    for (let pass = 1; pass <= MAX_DRAIN_PASSES; pass++) {
+      if (!(await this.awaitInFlightTurns(session, Math.max(0, deadline - Date.now())))) {
+        this.logger.warn(`[${client.id}] turn drain incomplete (${reason}) accepted=${session.acceptedTurnSeq} settled=${session.settledTurnSeq}`);
+        return { complete: false, passes: pass };
+      }
+      const flush = this.flushPendingTurnsForExit(client, session).catch((err) => {
+        this.logger.error(`[${client.id}] ${reason} flush failed:`, err);
+        return false;
+      });
+      const outcome = await this.withDeadline(flush, deadline - Date.now());
+      if (outcome === 'timeout') {
+        this.logger.warn(`[${client.id}] turn drain timed out while flushing (${reason})`);
+        return { complete: false, passes: pass };
+      }
+      if (!(await flush)) {
+        return { complete: (session.inFlightTurns?.size ?? 0) === 0, passes: pass };
+      }
+    }
+    return { complete: (session.inFlightTurns?.size ?? 0) === 0, passes: MAX_DRAIN_PASSES };
+  }
+
+  private async finalizeSessionOnExit(
+    client: Socket,
+    session: ActiveSession,
+    opts: { drainComplete?: boolean } = {},
+  ): Promise<void> {
+    const settled = await this.awaitInFlightTurns(session);
+    if (opts.drainComplete === false || !settled) {
+      // A turn accepted before the stop was not confirmed persisted: a summary now
+      // would claim complete context it doesn't have. Mark it retryable instead; the
+      // next resume + stop re-claims (failed is claimable) and summarises everything.
+      this.logger.warn(`Auto-summary withheld for ${session.conversationId}: final turns not confirmed persisted`);
+      await this.conversationService
+        .setSummaryStatus(session.conversationId, 'failed', { skipReason: 'final_turns_incomplete' })
+        .catch((err) => this.logger.error('Failed to mark summary incomplete:', err));
+      return;
+    }
     this.saveSessionMemory(session).catch((err) => this.logger.error('Memory save failed:', err));
     await this.autoGenerateConversationSummary(client, session);
   }
@@ -1696,7 +2210,42 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * bypass the document quota a tier is supposed to enforce; it only
    * applies to conversations with enough actual content to summarize.
    */
+  /**
+   * Conversations whose summary this process is generating right now, and the
+   * conversations that were stopped again while that was running. A Stop that
+   * lands on an in-flight generation can't claim (it's 'pending'), but its newer
+   * turns are not in the in-flight summary's snapshot — so it asks for exactly one
+   * follow-up run, executed when the in-flight one finishes, instead of being
+   * silently dropped.
+   */
+  private readonly summariesInFlight = new Set<string>();
+  private readonly summaryRerunRequests = new Map<string, { client: Socket; session: ActiveSession }>();
+
   private async autoGenerateConversationSummary(client: Socket, session: ActiveSession): Promise<void> {
+    const id = session.conversationId;
+    if (this.summariesInFlight.has(id)) {
+      this.summaryRerunRequests.set(id, { client, session });
+      this.logger.log(`Auto-summary for ${id} already running — queued one follow-up run for newer turns`);
+      return;
+    }
+
+    this.summariesInFlight.add(id);
+    try {
+      await this.runAutoSummary(client, session);
+    } finally {
+      this.summariesInFlight.delete(id);
+      const again = this.summaryRerunRequests.get(id);
+      if (again) {
+        this.summaryRerunRequests.delete(id);
+        // Re-claims: succeeds only if something was said after the finished run's snapshot.
+        await this.autoGenerateConversationSummary(again.client, again.session).catch((err) =>
+          this.logger.error(`Follow-up auto-summary failed for conversation ${id}:`, err),
+        );
+      }
+    }
+  }
+
+  private async runAutoSummary(client: Socket, session: ActiveSession): Promise<void> {
     // Set 'pending' immediately so a client polling GET /conversations/:id
     // right after session:end sees real state instead of 'not_started' while
     // the gates below are still being evaluated — the live socket events
@@ -1937,31 +2486,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── Multi-speaker prompt processing (Gap 4) ─────────────────────────────────
 
-  /**
-   * The session captures the field once, at session:start. A user who then
-   * switches field (the app persists it as their primary field) kept getting
-   * replies — and "off-topic" refusals — for the OLD field until the socket
-   * session happened to restart. Re-read the primary field before each AI
-   * turn (throttled) so a switch takes effect on the very next prompt.
-   */
-  private async refreshSessionField(session: ActiveSession): Promise<void> {
-    if (session.isGuest) return;
-    const now = Date.now();
-    if (session.fieldCheckedAt && now - session.fieldCheckedAt < 3_000) return;
-    session.fieldCheckedAt = now;
-    try {
-      const primary = await this.fieldsService.getUserPrimaryField(session.userId);
-      const name = primary?.name;
-      if (name && name !== session.fieldName) {
-        this.logger.log(`Session field changed for user ${session.userId}: "${session.fieldName}" -> "${name}"`);
-        session.fieldName = name;
-      }
-    } catch (err) {
-      this.logger.warn(`refreshSessionField failed (keeping "${session.fieldName}"):`, err);
-    }
+  private processMultiSpeakerPrompt(client: Socket, session: ActiveSession, turns: MultiSpeakerTurn[]): Promise<void> {
+    return this.trackTurn(session, () => this.runMultiSpeakerPrompt(client, session, turns));
   }
 
-  private async processMultiSpeakerPrompt(
+  private async runMultiSpeakerPrompt(
     client: Socket,
     session: ActiveSession,
     turns: MultiSpeakerTurn[],
@@ -1969,8 +2498,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
-
-    await this.refreshSessionField(session);
 
     try {
       // Gap 9: exclude the current turns from the history context so they only
@@ -2095,13 +2622,30 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── Dual-speaker prompt processing ──────────────────────────────────────────
 
-  private async processDualSpeakerPrompt(
+  private processDualSpeakerPrompt(
     client: Socket,
     session: ActiveSession,
     otherPersonText: string,
     ownerText: string = '',
     speakerDetected = true,
+    unattributedText: string = '',
   ): Promise<void> {
+    return this.trackTurn(session, () =>
+      this.runDualSpeakerPrompt(client, session, otherPersonText, ownerText, speakerDetected, unattributedText),
+    );
+  }
+
+  private async runDualSpeakerPrompt(
+    client: Socket,
+    session: ActiveSession,
+    otherPersonText: string,
+    ownerText: string = '',
+    speakerDetected = true,
+    unattributedText: string = '',
+  ): Promise<void> {
+    // The text the AI answers: the other person's words, else (nothing attributed
+    // to anyone) the unattributed text.
+    const primaryText = otherPersonText || unattributedText;
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
@@ -2109,17 +2653,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const speakerName = session.otherSpeakerName ?? 'Guest Speaker';
     const ownerName = session.cachedOwnerName;
 
-    await this.refreshSessionField(session);
-
     try {
       const recentHistory = session.dualSpeakerHistory.slice(-40);
       const conversationContext = recentHistory
-        .map((t) => `[${t.speaker === 'owner' ? ownerName : speakerName}]: ${t.text}`)
+        .map((t) => `[${t.speaker === 'owner' ? ownerName : t.speaker === 'unknown' ? UNATTRIBUTED_SPEAKER_LABEL : speakerName}]: ${t.text}`)
         .join('\n');
 
       const userMessage = speakerDetected
         ? `Conversation so far:\n${conversationContext}\n\nOther person just said: "${otherPersonText}"\n\nGive the owner a brief insight.`
-        : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${otherPersonText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
+        : `Conversation so far:\n${conversationContext}\n\nMost recent exchange: "${primaryText}"\n\nGive the owner a brief insight based on the ongoing conversation.`;
 
       const dsDocContext = await this.conversationService.getFullDocumentContext(session.conversationId, session.userId).catch(() => null);
       const outputLanguage = session.isGuest ? 'en' : await this.settingsService.getEffectiveLanguage(session.userId);
@@ -2131,9 +2673,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
 
       client.emit('transcript:confirmed', {
-        transcript: otherPersonText,
+        transcript: primaryText,
         inputType: 'voice',
-        speaker: speakerDetected ? 'other' : 'owner',
+        speaker: speakerDetected ? 'other' : otherPersonText || ownerText ? 'owner' : 'unknown',
+        ...(unattributedText ? { unattributed: { transcript: unattributedText } } : {}),
         owner: ownerText ? { transcript: ownerText, name: ownerName } : undefined,
         otherSpeaker: speakerDetected ? { transcript: otherPersonText, name: speakerName } : undefined,
       });
@@ -2163,13 +2706,28 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               speakerLabel: 'owner',
             });
           }
-          await this.conversationService.saveMessage({
-            conversationId: session.conversationId,
-            role: 'user',
-            content: otherPersonText,
-            transcript: otherPersonText,
-            speakerLabel: 'other',
-          });
+          if (otherPersonText) {
+            await this.conversationService.saveMessage({
+              conversationId: session.conversationId,
+              role: 'user',
+              content: otherPersonText,
+              transcript: otherPersonText,
+              // With no other speaker detected, otherPersonText is really the owner's own
+              // words (the caller promotes them to the primary slot) — never label them 'other'.
+              speakerLabel: speakerDetected ? 'other' : 'owner',
+            });
+          }
+          if (unattributedText) {
+            // Persisted as its own message with an explicit 'unknown' speaker so the
+            // recognised words are never lost and never pinned on owner/other.
+            await this.conversationService.saveMessage({
+              conversationId: session.conversationId,
+              role: 'user',
+              content: unattributedText,
+              transcript: unattributedText,
+              speakerLabel: 'unknown',
+            });
+          }
           await this.conversationService.saveMessage({
             conversationId: session.conversationId,
             role: 'assistant',
@@ -2179,7 +2737,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           });
 
           this.claudeService
-            .generateConversationTitle(otherPersonText, fullText, session.fieldName, outputLanguage)
+              .generateConversationTitle(primaryText, fullText, session.fieldName, outputLanguage)
             .then(async (title) => {
               const wasSet = await this.conversationService.setTitle(session.conversationId, title);
               if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
@@ -2197,8 +2755,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             tokensUsed: inputTokens + outputTokens,
             latencyMs: Date.now() - aiStartTime,
             dualSpeaker: {
-              owner: { transcript: ownerText, name: ownerName },
-              speaker: { transcript: otherPersonText, name: speakerName },
+              owner: { transcript: speakerDetected ? ownerText : ownerText || otherPersonText, name: ownerName },
+              speaker: { transcript: speakerDetected ? otherPersonText : '', name: speakerName },
+              ...(unattributedText ? { unattributed: { transcript: unattributedText } } : {}),
             },
           });
           session.isProcessingAI = false;
@@ -2250,7 +2809,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   // ─── Core single-speaker prompt processing ───────────────────────────────────
 
-  private async processPrompt(
+  private processPrompt(
+    client: Socket,
+    session: ActiveSession,
+    userMessage: string,
+    inputType: 'voice' | 'text',
+  ): Promise<void> {
+    return this.trackTurn(session, () => this.runPrompt(client, session, userMessage, inputType));
+  }
+
+  private async runPrompt(
     client: Socket,
     session: ActiveSession,
     userMessage: string,
@@ -2259,8 +2827,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     session.isProcessingAI = true;
     const aiStartTime = Date.now();
     let aiStarted = false;
-
-    await this.refreshSessionField(session);
 
     try {
       const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 40);
@@ -2763,7 +3329,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (candidateIds.length === 0) {
       session.identifiedDeepgramSpeakers.set(deepgramSpeakerId, fallbackName);
       if (!session.otherSpeakerName) session.otherSpeakerName = fallbackName;
-      client.emit('speaker:identified', {
+      client.emit('speaker:identified', { ...this.speakerScope(session),
         deepgramSpeakerId,
         speakerName: fallbackName,
         method: 'no_registered_speakers',
@@ -2847,10 +3413,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         const previousOwner = session.ownerSpeakerId;
         session.ownerSpeakerId = deepgramSpeakerId;
 
-        session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
-          ...turn,
-          speaker: turn.speaker === 'owner' ? 'other' : 'owner',
-        }));
+        session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
         this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
           this.logger.error(`[${client.id}] relabelSpeakers (biometric correction) failed:`, err),
@@ -2882,10 +3445,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const correctedOwner = deepgramSpeakerId === 0 ? 1 : 0;
       session.ownerSpeakerId = correctedOwner;
 
-      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => ({
-        ...turn,
-        speaker: turn.speaker === 'owner' ? 'other' : 'owner',
-      }));
+      session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
       this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
         this.logger.error(`[${client.id}] relabelSpeakers (contact flip) failed:`, err),
@@ -2908,7 +3468,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       session.otherSpeakerName = resolvedName;
     }
 
-    client.emit('speaker:identified', {
+    client.emit('speaker:identified', { ...this.speakerScope(session),
       deepgramSpeakerId,
       speakerName: resolvedName,
       isOwner,
@@ -2930,6 +3490,9 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     deepgramSpeakerId: number,
   ): Promise<void> {
     if (session.isGuest) return;
+    // The speaker number below belongs to THIS provider connection; the voice-ID
+    // call is async, so pin the epoch now and compare when it returns.
+    const epoch = session.providerEpoch;
 
     // Build candidate voice IDs from session roster first.
     // When no roster was provided, fall back to all account-wide enrolled speakers
@@ -2958,7 +3521,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (candidateIds.length === 0) {
       const resolved: ResolvedSpeaker = { speakerId: null, label: anonymousLabel, voiceSpeakerId: null, method: 'diarization' };
       session.resolvedSpeakers.set(deepgramSpeakerId, resolved);
-      client.emit('speaker:identified', { deepgramSpeakerId, speakerId: null, speakerLabel: anonymousLabel, method: 'diarization' });
+      client.emit('speaker:identified', { ...this.speakerScope(session, epoch),  deepgramSpeakerId, speakerId: null, speakerLabel: anonymousLabel, method: 'diarization' });
       return;
     }
 
@@ -3007,6 +3570,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let resolvedSpeakerId: string | null = null;
     let resolvedVoiceSpeakerId: string | null = null;
     let method: 'voice_id' | 'diarization' = 'diarization';
+
+    // The provider connection was replaced while voice-ID ran: this speaker number
+    // now refers to a different connection's numbering, so applying the result
+    // could label (or rewrite) the wrong person. Drop it; the old segments keep
+    // their diarization labels and can still be corrected explicitly.
+    if (session.providerEpoch !== epoch) {
+      this.logger.warn(`[${client.id}] Dropping stale voice-ID result for speaker ${deepgramSpeakerId} (epoch ${epoch} → ${session.providerEpoch})`);
+      return;
+    }
 
     if (result.identified && result.speakerId) {
       resolvedVoiceSpeakerId = result.speakerId;
@@ -3070,7 +3642,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // ── Update in-memory turn history so the AI context uses the correct name
       // immediately — without waiting for the next transcript event to rebuild labels.
       const updateTurn = (t: MultiSpeakerTurn): MultiSpeakerTurn =>
-        t.deepgramSpeakerId === deepgramSpeakerId
+        t.deepgramSpeakerId === deepgramSpeakerId && t.providerEpoch === epoch
           ? { ...t, speakerLabel: resolvedName, speakerId: resolvedSpeakerId, identificationMethod: 'voice_id' as const }
           : t;
 
@@ -3085,6 +3657,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         speakerLabel: resolvedName,
         identificationMethod: 'voice_id',
         recordingSessionId: session.recordingSessionId,
+        providerEpoch: epoch,
       }).catch((err) =>
         this.logger.warn(`[${client.id}] retroactive segment update failed (non-fatal): ${(err as Error).message}`),
       );
@@ -3104,7 +3677,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       );
     }
 
-    client.emit('speaker:identified', {
+    client.emit('speaker:identified', { ...this.speakerScope(session, epoch),
       deepgramSpeakerId,
       speakerId: resolvedSpeakerId,
       previousLabel: anonymousLabel,
@@ -3139,17 +3712,19 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // Fallback when Deepgram returns no word-level data.
     if (!words.length) {
       if (!fallbackTranscript?.trim()) return [];
-      const spkId = session.currentDominantSpeaker ?? 0;
-      const identity = this.resolveSpeakerLabel(session, spkId);
+      // Keep the recognised text but do NOT guess who said it: attributing it to
+      // the last-seen ("dominant") speaker would present uncertain attribution
+      // as fact, and could fabricate or merge speakers.
       return [{
-        deepgramSpeakerId: spkId,
-        speakerId: identity.speakerId,
-        speakerLabel: identity.speakerLabel,
+        deepgramSpeakerId: null,
+        providerEpoch: session.providerEpoch,
+        speakerId: null,
+        speakerLabel: UNATTRIBUTED_SPEAKER_LABEL,
         text: fallbackTranscript.trim(),
         confidence,
         startMs: null,
         endMs: null,
-        identificationMethod: identity.identificationMethod,
+        identificationMethod: 'unknown',
       }];
     }
 
@@ -3175,6 +3750,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const identity = this.resolveSpeakerLabel(session, run.speakerId);
       turns.push({
         deepgramSpeakerId: run.speakerId,
+        providerEpoch: session.providerEpoch,
         speakerId: identity.speakerId,
         speakerLabel: identity.speakerLabel,
         text,
@@ -3189,6 +3765,43 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   /** Returns the current resolved identity for a Deepgram speaker ID (multi-speaker). */
+  /** Swaps owner/other when the owner assignment is corrected; unattributed text stays unattributed. */
+  private flipDualTurn(turn: DualSpeakerTurn): DualSpeakerTurn {
+    if (turn.speaker === 'unknown') return turn;
+    return { ...turn, speaker: turn.speaker === 'owner' ? 'other' : 'owner' };
+  }
+
+  /** Additive scope fields so clients can tell which provider connection a speaker number belongs to. */
+  private speakerScope(session: ActiveSession, epoch: number = session.providerEpoch) {
+    return { recordingSessionId: session.recordingSessionId, providerEpoch: epoch };
+  }
+
+  /** The epoch a client-supplied correction applies to: a valid past/current epoch, else the current one. */
+  private resolveCorrectionEpoch(session: ActiveSession, requested: unknown): number {
+    return typeof requested === 'number' && Number.isInteger(requested) && requested >= 0 && requested <= session.providerEpoch
+      ? requested
+      : session.providerEpoch;
+  }
+
+  /**
+   * A new provider connection restarts speaker numbering, so everything the
+   * session learned about "speaker N" belongs to the old connection. Drop it,
+   * so a new connection's speaker 0 can't inherit an earlier speaker 0's
+   * name, voice-ID state or audio. Persisted segments keep their own epoch.
+   */
+  private resetSpeakerStateForNewEpoch(session: ActiveSession): void {
+    session.resolvedSpeakers.clear();
+    session.identifiedDeepgramSpeakers.clear();
+    session.anonymousSpeakerLabels.clear();
+    session.speakerIdentificationTriggered.clear();
+    session.speakerIdentificationFailed.clear();
+    session.speakerIdentificationAtSeconds.clear();
+    session.speakerWordSeconds.clear();
+    session.speakerAudioBuffers.clear();
+    session.speakerAudioBytes.clear();
+    session.currentDominantSpeaker = 0;
+  }
+
   private resolveSpeakerLabel(
     session: ActiveSession,
     deepgramSpeakerId: number,
@@ -3270,6 +3883,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       confidence: t.confidence,
       identificationMethod: t.identificationMethod,
       recordingSessionId: session.recordingSessionId,
+      providerEpoch: t.providerEpoch ?? session.providerEpoch,
     }));
   }
 
@@ -3300,7 +3914,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return false;
     }
 
-    const turns = [...session.pendingMultiSpeakerTurns];
+    const turns: MultiSpeakerTurn[] = [...session.pendingMultiSpeakerTurns];
     if (turns.length === 0) {
       if (options.reason !== 'utterance_end') {
         client.emit('ai:skipped', { reason: 'empty_transcript' });
@@ -3319,12 +3933,25 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           mode: 'multiple_speaker',
           transcript: turns.map((t) => t.text).join(' '),
           segments: turns,
+          ...this.speakerScope(session),
         });
       }
       return false;
     }
 
     if (!(await this.checkMessageQuota(client, session))) return false;
+
+    // Another flush (utterance-end vs Stop) may have run while the quota check was
+    // awaited. Re-read the live queue and processing flag: from here to the call
+    // below everything is synchronous, so exactly one flush takes any given turns.
+    if (session.isProcessingAI) {
+      client.emit('ai:skipped', { reason: 'already_processing' });
+      return false;
+    }
+    const liveTurns = [...session.pendingMultiSpeakerTurns];
+    if (liveTurns.length === 0) return false;
+    turns.length = 0;
+    turns.push(...liveTurns);
 
     // Commit the drain only after threshold is confirmed
     session.pendingMultiSpeakerTurns = [];
@@ -3372,6 +3999,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       if (typeof result.confidence === 'number') {
         session.transcriptConfidences.push(result.confidence);
+        if (session.transcriptConfidences.length > SESSION_BOUNDS.MAX_CONFIDENCE_SAMPLES) {
+          session.transcriptConfidences.splice(0, session.transcriptConfidences.length - SESSION_BOUNDS.MAX_CONFIDENCE_SAMPLES);
+          this.noteBoundHit(session, 'confidenceTrim');
+        }
       }
 
       // ── Multi-speaker path ────────────────────────────────────────────
@@ -3398,6 +4029,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         session.multiSpeakerHistory.push(...turns);
         session.pendingMultiSpeakerTurns.push(...turns);
+        this.enforceSessionBounds(client, session);
         session.accumulatedTranscript = turns.map((t) => t.text).join(' ');
 
         // Trigger per-speaker identification (first attempt + retry on prior failure)
@@ -3441,6 +4073,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           confidence: result.confidence,
           transcript: session.accumulatedTranscript,
           segments: turns,
+          ...this.speakerScope(session),
         });
         return;
       }
@@ -3536,6 +4169,16 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             session.pendingOwnerText = (session.pendingOwnerText + ' ' + text).trim();
           }
         }
+        this.enforceSessionBounds(client, session);
+
+        // No word-level speaker data: the text is real, who said it is not known.
+        // Keep it as unattributed instead of dropping it or guessing owner/other.
+        const unattributedText = words.length === 0 ? (result.transcript ?? '').trim() : '';
+        if (unattributedText) {
+          session.dualSpeakerHistory.push({ speaker: 'unknown', text: unattributedText });
+          session.pendingUnattributedText = (session.pendingUnattributedText + ' ' + unattributedText).trim();
+        }
+        this.enforceSessionBounds(client, session);
 
         session.accumulatedTranscript =
           (session.accumulatedTranscript + ' ' + result.transcript).trim();
@@ -3544,6 +4187,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           transcript: session.accumulatedTranscript,
           isFinal: true,
           confidence: result.confidence,
+          ...(unattributedText ? { unattributed: unattributedText, attribution: 'unknown' } : {}),
           speakers: Object.fromEntries(
             Array.from(speakerTexts.entries()).map(([id, text]) => [
               id === ownerSpk ? 'owner' : 'other',
@@ -3618,27 +4262,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         if (session.isDualSpeaker) {
           if (session.calibrationPhase) return;
 
-          const otherText = session.pendingOtherText.trim();
-          const ownerText = session.pendingOwnerText.trim();
-
-          const combinedWords = `${ownerText} ${otherText}`
-            .trim()
-            .split(/\s+/)
-            .filter(Boolean).length;
-
-          if (combinedWords < 8) return;
-          if (!(await this.checkMessageQuota(client, session))) return;
-
-          session.pendingOtherText = '';
-          session.pendingOwnerText = '';
-          session.accumulatedTranscript = '';
-          client.emit('transcript:update', { transcript: '', isFinal: true, cleared: true });
-
-          const primaryText = otherText || ownerText;
-          const contextText = otherText ? ownerText : '';
-          const speakerDetected = Boolean(otherText);
-
-          await this.processDualSpeakerPrompt(client, session, primaryText, contextText, speakerDetected);
+          await this.flushDualSpeakerPending(client, session, 8);
           return;
         }
 
@@ -3748,9 +4372,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     );
 
     // Notify — emitted exactly once per recovery sequence, not per attempt.
+    const cause = providerDisruptionCause(reason);
+    this.logLifecycle(session, 'provider_disruption', { cause, recoveryId });
     client.emit('session:recovering', {
       recoveryId,
       reason,
+      cause,
+      correlation: this.correlation(session),
       attempt: 1,
       maxAttempts: PROVIDER_RECOVERY_MAX_ATTEMPTS,
       recoverable: true,
@@ -3779,16 +4407,32 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           return;
         }
 
+        // Replay the buffered audio through the NEW connection first. If the provider
+        // refuses a chunk this connection is useless: discard it (its emitter has no
+        // listeners, so nothing it produced is lost), keep the whole buffer intact, and
+        // let the next attempt replay from the start — never a "recovered" session that
+        // silently lost the replay.
+        const replay = this.flushRecoveryBuffer(session, sendAudio);
+        if (replay.failed) {
+          try { close(); } catch (_) {}
+          this.logLifecycle(session, 'replay_failed', { attempt, bufferedBytes: session.recoveryAudioBufferBytes, replayedBytes: replay.flushedBytes });
+          throw new Error('provider refused replay of buffered audio');
+        }
+
         session.deepgramEmitter = emitter;
         session.sendAudio = sendAudio;
         session.sendFinalize = sendFinalize;
         session.closeDeepgram = close;
         session.providerEpoch += 1;
+        this.resetSpeakerStateForNewEpoch(session);
         this.attachDeepgramListeners(client, session, emitter);
 
-        const { droppedDurationMs } = this.flushRecoveryBuffer(session);
+        const droppedDurationMs = replay.droppedDurationMs;
 
-        session.providerState = 'recovered';
+        // Back to 'active' so a *later* disruption of the new connection is
+        // recoverable too (a stale event from the replaced connection is still
+        // rejected by the epoch check above).
+        session.providerState = 'active';
         session.currentRecoveryId = null;
 
         this.logger.log(
@@ -3796,8 +4440,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           `(epoch=${session.providerEpoch}, droppedDurationMs=${droppedDurationMs})`,
         );
 
+        this.logLifecycle(session, 'provider_recovered', { recoveryId, attempt, droppedDurationMs, replayedBytes: replay.flushedBytes, droppedBytes: replay.droppedBytes });
         client.emit('session:recovered', {
           recoveryId,
+          correlation: this.correlation(session),
+          ...(droppedDurationMs > 0 ? { lossReason: 'recovery_buffer_bound' satisfies AudioLossReason, droppedAudioBytes: replay.droppedBytes } : {}),
           providerEpoch: session.providerEpoch,
           audioGapDetected: droppedDurationMs > 0,
           droppedDurationMs,
@@ -3823,6 +4470,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       severity: 'error',
       context: {
         socketId: client.id,
+        traceId: session.traceId,
         recoveryId,
         incidentId,
         providerEpoch: session.providerEpoch,
@@ -3831,9 +4479,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       },
     });
 
+    const lostAudioBytes = (session.recoveryAudioBufferBytes ?? 0) + (session.recoveryDroppedBytes ?? 0);
+    this.logLifecycle(session, 'session_terminal', { reason: 'provider_recovery_exhausted' satisfies SessionTerminalReason, cause: providerDisruptionCause(reason), incidentId, lostAudioBytes });
     client.emit('session:degraded', {
       recoveryId,
-      reason: 'provider_recovery_exhausted',
+      reason: 'provider_recovery_exhausted' satisfies SessionTerminalReason,
+      cause: providerDisruptionCause(reason),
+      // Audio that was buffered or dropped during the outage and never reached a provider.
+      ...(lostAudioBytes > 0 ? { lossReason: (session.recoveryDroppedBytes ?? 0) > 0 ? 'recovery_buffer_bound' : 'replay_failed' satisfies AudioLossReason, lostAudioBytes } : {}),
+      correlation: this.correlation(session),
       category: 'provider_recovery_failed',
       recoverable: false,
       incidentId,
@@ -3853,6 +4507,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     ) {
       const dropped = session.recoveryAudioBuffer.shift()!;
       session.recoveryAudioBufferBytes -= dropped.chunk.length;
+      session.recoveryDroppedBytes = (session.recoveryDroppedBytes ?? 0) + dropped.chunk.length;
+      this.noteBoundHit(session, 'recoveryBufferAgeEvict');
     }
 
     if (session.recoveryAudioBufferBytes + buffer.length > this.PROVIDER_RECOVERY_BUFFER_MAX_BYTES) {
@@ -3861,30 +4517,45 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       if (session.recoveryBufferOverflowStartedAt === null) {
         session.recoveryBufferOverflowStartedAt = now;
       }
+      session.recoveryDroppedBytes = (session.recoveryDroppedBytes ?? 0) + buffer.length;
+      this.noteBoundHit(session, 'recoveryBufferByteOverflow');
       return;
     }
 
     session.recoveryAudioBuffer.push({ chunk: buffer, enqueuedAt: now });
     session.recoveryAudioBufferBytes += buffer.length;
+    this.sampleSessionMetrics(session);
   }
 
-  /** Replays the bounded recovery buffer to the newly-reconnected provider and clears it. */
-  private flushRecoveryBuffer(session: ActiveSession): { flushedBytes: number; droppedDurationMs: number } {
+  /**
+   * Replays the bounded recovery buffer, in order, through `send` (the NEW provider
+   * connection's sender; defaults to the session's current one). Returns an explicit
+   * outcome: on `failed` the provider refused a chunk, nothing is cleared, and the
+   * caller must treat the replay as not having happened (retry or report loss).
+   */
+  private flushRecoveryBuffer(
+    session: ActiveSession,
+    send: (chunk: Buffer) => boolean | void = session.sendAudio,
+  ): { flushedBytes: number; droppedDurationMs: number; droppedBytes: number; failed: boolean } {
     let flushedBytes = 0;
     for (const { chunk } of session.recoveryAudioBuffer) {
-      session.sendAudio(chunk);
+      if (send(chunk) === false) {
+        return { flushedBytes, droppedDurationMs: 0, droppedBytes: session.recoveryDroppedBytes ?? 0, failed: true };
+      }
       flushedBytes += chunk.length;
     }
 
     const droppedDurationMs = session.recoveryBufferOverflowStartedAt !== null
       ? Date.now() - session.recoveryBufferOverflowStartedAt
       : 0;
+    const droppedBytes = session.recoveryDroppedBytes ?? 0;
 
     session.recoveryAudioBuffer = [];
     session.recoveryAudioBufferBytes = 0;
     session.recoveryBufferOverflowStartedAt = null;
+    session.recoveryDroppedBytes = 0;
 
-    return { flushedBytes, droppedDurationMs };
+    return { flushedBytes, droppedDurationMs, droppedBytes, failed: false };
   }
 
   private cleanupSession(socketId: string): void {
@@ -3942,6 +4613,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }
     }
 
-    this.logger.log(`Session cleaned up: ${socketId}`);
+    this.sampleSessionMetrics(session);
+    this.logger.log(
+      `Session cleaned up: ${socketId} recordingSession=${session.recordingSessionId} epoch=${session.providerEpoch} ` +
+      `turns=${session.acceptedTurnSeq ?? 0}/${session.settledTurnSeq ?? 0} metrics=${JSON.stringify(session.metrics ? snapshotMetrics(session.metrics) : null)}`,
+    );
   }
 }

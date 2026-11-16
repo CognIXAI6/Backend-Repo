@@ -171,6 +171,17 @@ describe('DeepgramService', () => {
 
     expect(() => sendFinalize()).not.toThrow();
     expect(socket.sendFinalize).not.toHaveBeenCalled();
+    expect(sendFinalize()).toBe(false); // explicit "not delivered", not a silent no-op
+  });
+
+  it('sendFinalize() reports true when delivered and false when the send throws', async () => {
+    const { socket } = createFakeSocket();
+    mockConnect.mockResolvedValue(socket);
+    const { close, sendFinalize } = await service.createLiveSession('sess-fin');
+    cleanups.push(close);
+    expect(sendFinalize()).toBe(true);
+    socket.sendFinalize.mockImplementation(() => { throw new Error('boom'); });
+    expect(sendFinalize()).toBe(false);
   });
 
   it('emits "finalized" for a Results message with from_finalize:true, even with no transcript text', async () => {
@@ -204,5 +215,89 @@ describe('DeepgramService', () => {
     handlers['message']({ type: 'Results', is_final: true, channel: { alternatives: [{ transcript: 'hello' }] } });
 
     expect(finalizedListener).not.toHaveBeenCalled();
+  });
+
+  describe('chunk disposition: sendAudio says whether the provider actually took the chunk', () => {
+    it('OPEN → true and the chunk is handed to the socket', async () => {
+      const { socket } = createFakeSocket();
+      mockConnect.mockResolvedValue(socket);
+      const { close, sendAudio } = await service.createLiveSession('sess-open');
+      cleanups.push(close);
+      const chunk = Buffer.from([1, 2, 3]);
+      expect(sendAudio(chunk)).toBe(true);
+      expect(socket.sendMedia).toHaveBeenCalledWith(chunk);
+    });
+
+    it.each([[0, 'CONNECTING'], [2, 'CLOSING'], [3, 'CLOSED']])('readyState %i (%s) without any close/error callback → false, nothing sent, no throw', async (state) => {
+      const { socket } = createFakeSocket();
+      mockConnect.mockResolvedValue(socket);
+      const { emitter, close, sendAudio } = await service.createLiveSession('sess-state');
+      cleanups.push(close);
+      const failure = jest.fn();
+      emitter.on('transportFailure', failure);
+      socket.readyState = state;
+      expect(sendAudio(Buffer.from([9]))).toBe(false);
+      expect(socket.sendMedia).not.toHaveBeenCalled();
+      expect(failure).not.toHaveBeenCalled(); // recovery is triggered by the caller acting on the false, not twice
+    });
+
+    it('a thrown send → false and a transportFailure', async () => {
+      const { socket } = createFakeSocket();
+      socket.sendMedia.mockImplementation(() => { throw new Error('socket exploded'); });
+      mockConnect.mockResolvedValue(socket);
+      const { emitter, close, sendAudio } = await service.createLiveSession('sess-throw');
+      cleanups.push(close);
+      const failure = jest.fn();
+      emitter.on('transportFailure', failure);
+      expect(sendAudio(Buffer.from([1]))).toBe(false);
+      expect(failure).toHaveBeenCalledWith(expect.objectContaining({ source: 'sendMedia' }));
+    });
+  });
+
+  describe('KeepAlive on a provider that has gone away without a close/error event', () => {
+    it.each([[2, 'CLOSING'], [3, 'CLOSED']])('readyState %i (%s) → one transportFailure, then the timer stops', async (state) => {
+      jest.useFakeTimers();
+      const { socket } = createFakeSocket();
+      mockConnect.mockResolvedValue(socket);
+      const { emitter, close } = await service.createLiveSession('sess-ka');
+      cleanups.push(close);
+      const failure = jest.fn();
+      emitter.on('transportFailure', failure);
+      socket.readyState = state;
+      jest.advanceTimersByTime(6_000);
+      expect(failure).toHaveBeenCalledTimes(1);
+      expect(failure).toHaveBeenCalledWith(expect.objectContaining({ source: 'sendKeepAlive', error: expect.objectContaining({ message: expect.stringContaining(`readyState=${state}`) }) }));
+      jest.advanceTimersByTime(60_000);
+      expect(failure).toHaveBeenCalledTimes(1);
+    });
+
+    it('a connection that dies mid-session is reported at the next KeepAlive tick', async () => {
+      jest.useFakeTimers();
+      const { socket } = createFakeSocket();
+      mockConnect.mockResolvedValue(socket);
+      const { emitter, close } = await service.createLiveSession('sess-ka2');
+      cleanups.push(close);
+      const failure = jest.fn();
+      emitter.on('transportFailure', failure);
+      jest.advanceTimersByTime(12_000); // healthy: pings sent
+      expect(socket.sendKeepAlive).toHaveBeenCalledTimes(2);
+      expect(failure).not.toHaveBeenCalled();
+      socket.readyState = 3;
+      jest.advanceTimersByTime(6_000);
+      expect(failure).toHaveBeenCalledTimes(1);
+    });
+
+    it('CONNECTING is not reported as a failure (it is still coming up)', async () => {
+      jest.useFakeTimers();
+      const { socket } = createFakeSocket();
+      mockConnect.mockResolvedValue(socket);
+      const { emitter, close } = await service.createLiveSession('sess-ka3');
+      cleanups.push(close);
+      const failure = jest.fn();
+      emitter.on('transportFailure', failure);
+      socket.readyState = 0;
+      jest.advanceTimersByTime(30_000);
+      expect(failure).not.toHaveBeenCalled();
+    });
   });
 });
