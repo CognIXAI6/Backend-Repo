@@ -100,9 +100,9 @@ export class ChatJobWorkerService {
       const [user, field, history, documentContext, images, outputLanguage] = await Promise.all([
         this.usersService.findById(userId),
         conversation.field_id ? this.fieldsService.findById(conversation.field_id) : Promise.resolve(null),
-        this.conversationService.getRecentHistoryForAI(job.conversation_id, 40),
+        this.conversationService.getRecentHistoryForAI(job.conversation_id, userId, 40),
         this.conversationService.getFullDocumentContext(job.conversation_id, userId).catch(() => null),
-        this.conversationService.getConversationImagesForAI(job.conversation_id).catch(() => []),
+        this.conversationService.getConversationImagesForAI(job.conversation_id, userId).catch(() => []),
         this.settingsService.getEffectiveLanguage(userId),
       ]);
 
@@ -156,6 +156,7 @@ export class ChatJobWorkerService {
 
       const responseMessage = await this.conversationService.saveMessage({
         conversationId: job.conversation_id,
+        userId: userId,
         role: 'assistant',
         content: responseText,
         tokensUsed: inputTokens + outputTokens,

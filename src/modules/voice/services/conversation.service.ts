@@ -149,6 +149,8 @@ export type MessageDeliverySource = 'text' | 'voice' | 'attachment' | 'regenerat
 
 export interface SaveMessageDto {
   conversationId: string;
+  /** The conversation's owner — enforced inside the write, so a conversation id alone can't be written to. */
+  userId: string;
   role: MessageRole;
   content: string;
   transcript?: string;
@@ -184,6 +186,21 @@ export class ConversationService {
     'resource_conversations',
     'generated_documents',
   ] as const;
+
+  /**
+   * Ownership predicate for child tables keyed by conversation_id: the parent conversation
+   * belongs to `userId` and is not deleted. Applied INSIDE every conversation-scoped query below,
+   * so a conversation id alone never grants access — even for internal (gateway/worker) callers.
+   */
+  private whereConversationOwnedBy(qb: Knex.QueryBuilder, table: string, userId: string): Knex.QueryBuilder {
+    return qb.whereExists(
+      this.knex('conversations')
+        .select(this.knex.raw('1'))
+        .whereRaw('conversations.id = ??.conversation_id', [table])
+        .andWhere('conversations.user_id', userId)
+        .whereNull('conversations.deleted_at'),
+    );
+  }
 
   // Inject Knex using the token your DatabaseModule provides.
   // Common tokens: 'KNEX_CONNECTION', 'KnexConnection', or Symbol('KNEX')
@@ -236,8 +253,10 @@ export class ConversationService {
     // Claim the next sequence atomically — the UPDATE's row lock means a
     // concurrent saveMessage() for the same conversation blocks until this
     // commits, so two messages can never be assigned the same sequence.
-    const [{ next_message_sequence: conversationSequence }] = await trx('conversations')
-      .where('id', dto.conversationId)
+    // Ownership is part of the claim: only the owner's conversation is written to. (Soft-deleted
+    // conversations still accept a late in-flight reply, as before — ownership is what matters here.)
+    const claimed = await trx('conversations')
+      .where({ id: dto.conversationId, user_id: dto.userId })
       .update({
         total_messages: trx.raw('total_messages + 1'),
         next_message_sequence: trx.raw('next_message_sequence + 1'),
@@ -245,6 +264,8 @@ export class ConversationService {
         updated_at: new Date(),
       })
       .returning('next_message_sequence');
+    if (claimed.length === 0) throw new NotFoundException('Conversation not found');
+    const conversationSequence = claimed[0].next_message_sequence;
 
     const [message] = await trx('conversation_messages')
       .insert({
@@ -272,6 +293,9 @@ export class ConversationService {
     segments: SaveTranscriptSegmentDto[],
   ): Promise<ConversationMessage> {
     return this.knex.transaction(async (trx) => {
+      const owned = await trx('conversations').where({ id: dto.conversationId, user_id: dto.userId }).first('id');
+      if (!owned) throw new NotFoundException('Conversation not found');
+
       const [message] = await trx('conversation_messages')
         .insert({
           conversation_id: dto.conversationId,
@@ -289,7 +313,8 @@ export class ConversationService {
       if (segments.length > 0) {
         await trx('conversation_transcript_segments').insert(
           segments.map((s) => ({
-            conversation_id: s.conversationId,
+            // always the message's own (ownership-checked) conversation — never a per-segment id
+            conversation_id: dto.conversationId,
             message_id: message.id,
             speaker_id: s.speakerId ?? null,
             deepgram_speaker_id: s.deepgramSpeakerId ?? null,
@@ -306,7 +331,7 @@ export class ConversationService {
       }
 
       await trx('conversations')
-        .where('id', dto.conversationId)
+        .where({ id: dto.conversationId, user_id: dto.userId })
         .update({
           total_messages: trx.raw('total_messages + 1'),
           last_activity_at: new Date(),
@@ -322,7 +347,7 @@ export class ConversationService {
    * Called when biometric verification overrules the initial word-count calibration.
    * A single atomic UPDATE keeps the correction consistent with in-memory state.
    */
-  async relabelSpeakers(conversationId: string): Promise<void> {
+  async relabelSpeakers(conversationId: string, userId: string): Promise<void> {
     await this.knex.raw(
       `UPDATE conversation_messages
           SET speaker_label = CASE
@@ -331,8 +356,10 @@ export class ConversationService {
             ELSE speaker_label
           END
         WHERE conversation_id = ?
-          AND speaker_label IN ('owner', 'other')`,
-      [conversationId],
+          AND speaker_label IN ('owner', 'other')
+          AND EXISTS (SELECT 1 FROM conversations c
+                       WHERE c.id = conversation_messages.conversation_id AND c.user_id = ? AND c.deleted_at IS NULL)`,
+      [conversationId, userId],
     );
   }
 
@@ -342,8 +369,8 @@ export class ConversationService {
    * user actually clicked into, not whatever title the generated document
    * itself picked (the two commonly differ in wording).
    */
-  async getConversationTitle(conversationId: string): Promise<string | null> {
-    const row = await this.knex('conversations').where('id', conversationId).first('title');
+  async getConversationTitle(conversationId: string, userId: string): Promise<string | null> {
+    const row = await this.knex('conversations').where({ id: conversationId, user_id: userId }).whereNull('deleted_at').first('title');
     return row?.title ?? null;
   }
 
@@ -353,9 +380,10 @@ export class ConversationService {
    * previously generated title. Returns whether the update actually happened
    * so the caller can emit a real-time event to the client.
    */
-  async setTitle(conversationId: string, title: string): Promise<boolean> {
+  async setTitle(conversationId: string, userId: string, title: string): Promise<boolean> {
     const updated = await this.knex('conversations')
-      .where('id', conversationId)
+      .where({ id: conversationId, user_id: userId })
+      .whereNull('deleted_at')
       .whereNull('title')
       .update({ title, updated_at: new Date() });
     // Knex update() returns the number of rows affected.
@@ -382,9 +410,9 @@ export class ConversationService {
     return (await q.orderBy('created_at', 'desc').first()) ?? null;
   }
 
-  /** The field a conversation was created under (null = none). Callers must have checked ownership. */
-  async getConversationFieldId(conversationId: string): Promise<string | null> {
-    const row = await this.knex('conversations').where('id', conversationId).first('field_id');
+  /** The field a conversation was created under (null = none, and also null if it isn't `userId`'s conversation). */
+  async getConversationFieldId(conversationId: string, userId: string): Promise<string | null> {
+    const row = await this.knex('conversations').where({ id: conversationId, user_id: userId }).whereNull('deleted_at').first('field_id');
     return row?.field_id ?? null;
   }
 
@@ -511,12 +539,14 @@ export class ConversationService {
    * part; a 'pending' claim older than the stale window is treated as a
    * crashed run and may be re-claimed.
    */
-  async claimSummaryGeneration(conversationId: string, staleAfterMs = 10 * 60 * 1000): Promise<boolean> {
+  async claimSummaryGeneration(conversationId: string, userId: string, staleAfterMs = 10 * 60 * 1000): Promise<boolean> {
     const staleBefore = new Date(Date.now() - staleAfterMs);
     const result = await this.knex.raw(
       `UPDATE conversations
           SET summary_status = 'pending', updated_at = NOW()
         WHERE id = ?
+          AND user_id = ?
+          AND deleted_at IS NULL
           AND (
             summary_status IN ('not_started', 'failed', 'skipped')
             OR (summary_status = 'pending' AND updated_at < ?)
@@ -529,7 +559,7 @@ export class ConversationService {
                              WHERE p.conversation_id = conversations.id),
                            '-infinity'::timestamptz)))
           )`,
-      [conversationId, staleBefore],
+      [conversationId, userId, staleBefore],
     );
     return (result?.rowCount ?? 0) > 0;
   }
@@ -539,23 +569,27 @@ export class ConversationService {
    * oldest first. The cutoff is resolved inside SQL so microsecond timestamps
    * are compared exactly; the "X is ready" document messages are excluded.
    */
-  async getUnsummarizedMessages(conversationId: string): Promise<ConversationMessage[]> {
+  async getUnsummarizedMessages(conversationId: string, userId: string): Promise<ConversationMessage[]> {
     const result = await this.knex.raw(
       `SELECT m.* FROM conversation_messages m
         WHERE m.conversation_id = ?
+          AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = m.conversation_id AND c.user_id = ? AND c.deleted_at IS NULL)
           AND m.document_id IS NULL
           AND m.created_at > COALESCE(
                 (SELECT MAX(p.covers_to) FROM conversation_summary_parts p WHERE p.conversation_id = ?),
                 '-infinity'::timestamptz)
         ORDER BY m.created_at ASC`,
-      [conversationId, conversationId],
+      [conversationId, userId, conversationId],
     );
     return (result?.rows ?? []) as ConversationMessage[];
   }
 
-  async getSummaryParts(conversationId: string): Promise<ConversationSummaryPart[]> {
-    return this.knex('conversation_summary_parts')
-      .where('conversation_id', conversationId)
+  async getSummaryParts(conversationId: string, userId: string): Promise<ConversationSummaryPart[]> {
+    return this.whereConversationOwnedBy(
+      this.knex('conversation_summary_parts').where('conversation_id', conversationId),
+      'conversation_summary_parts',
+      userId,
+    )
       .orderBy('covers_from', 'asc')
       .select('*');
   }
@@ -563,28 +597,34 @@ export class ConversationService {
   /** Records a summarised stretch; covers_from/to are copied from the messages' own timestamps. */
   async addSummaryPart(
     conversationId: string,
+    userId: string,
     part: { title: string; topic: string | null; sections: Array<{ heading: string; content: string }> },
     firstMessageId: string,
     lastMessageId: string,
   ): Promise<void> {
-    await this.knex.raw(
+    // Only for the owner's conversation, and the covered range is read from messages of THAT
+    // conversation: an id from elsewhere yields NULL (rejected by NOT NULL), never a foreign timestamp.
+    const result = await this.knex.raw(
       `INSERT INTO conversation_summary_parts (conversation_id, title, topic, sections, covers_from, covers_to)
-       VALUES (?, ?, ?, ?::jsonb,
-               (SELECT created_at FROM conversation_messages WHERE id = ?),
-               (SELECT created_at FROM conversation_messages WHERE id = ?))`,
-      [conversationId, part.title, part.topic, JSON.stringify(part.sections), firstMessageId, lastMessageId],
+       SELECT c.id, ?, ?, ?::jsonb,
+              (SELECT created_at FROM conversation_messages WHERE id = ? AND conversation_id = c.id),
+              (SELECT created_at FROM conversation_messages WHERE id = ? AND conversation_id = c.id)
+         FROM conversations c
+        WHERE c.id = ? AND c.user_id = ? AND c.deleted_at IS NULL`,
+      [part.title, part.topic, JSON.stringify(part.sections), firstMessageId, lastMessageId, conversationId, userId],
     );
+    if ((result?.rowCount ?? 0) === 0) throw new NotFoundException('Conversation not found');
   }
 
   /**
    * Records the coarse outcome of the summary email (see summary-email-status.util.ts).
    * `pending` (or an immediate `skipped`) opens a new attempt for a summary document; a final
    * accepted/failed status only applies if that attempt is still the current one, so a slow older attempt can't overwrite a newer
-   * one. Never stores a recipient, provider response or content. Callers: the gateway,
-   * which has already established the session's ownership of the conversation.
+   * one. Never stores a recipient, provider response or content. Only applies to `userId`'s own conversation.
    */
   async setSummaryEmailStatus(
     conversationId: string,
+    userId: string,
     outcome: { status: SummaryEmailStatus; reason?: SummaryEmailReason | null; documentId: string | null },
   ): Promise<boolean> {
     const update = {
@@ -593,7 +633,7 @@ export class ConversationService {
       summary_email_updated_at: new Date(),
       summary_email_document_id: outcome.documentId,
     };
-    const q = this.knex('conversations').where('id', conversationId);
+    const q = this.knex('conversations').where({ id: conversationId, user_id: userId }).whereNull('deleted_at');
     if (outcome.status === 'accepted_by_provider' || outcome.status === 'failed') {
       q.andWhere((b) => {
         b.whereNull('summary_email_document_id');
@@ -605,6 +645,7 @@ export class ConversationService {
 
   async setSummaryStatus(
     conversationId: string,
+    userId: string,
     status: SummaryStatus,
     opts: { skipReason?: string | null; documentId?: string | null } = {},
   ): Promise<void> {
@@ -612,7 +653,8 @@ export class ConversationService {
     if ('skipReason' in opts) update.summary_skip_reason = opts.skipReason ?? null;
     if ('documentId' in opts) update.summary_document_id = opts.documentId ?? null;
 
-    await this.knex('conversations').where('id', conversationId).update(update);
+    // Only the owner's (non-deleted) conversation; anything else updates nothing.
+    await this.knex('conversations').where({ id: conversationId, user_id: userId }).whereNull('deleted_at').update(update);
   }
 
   // ── Get messages only ───────────────────────────────────────────────────────
@@ -686,16 +728,6 @@ export class ConversationService {
     });
   }
 
-  /**
-   * Lightweight alternative to getConversationMessages for internal gateway
-   * use — skips the ownership re-check (trust established at session:start),
-   * same pattern as getRecentHistoryForAI. Returns full rows (speaker_label,
-   * transcript included), unlike getRecentHistoryForAI's role-only shape.
-   */
-  async getConversationMessagesInternal(conversationId: string): Promise<ConversationMessage[]> {
-    return this.fetchMessagesWithDocuments(conversationId);
-  }
-
   // ── Get history array for Claude context ────────────────────────────────────
 
   async getConversationHistory(
@@ -707,23 +739,25 @@ export class ConversationService {
   }
 
   /**
-   * Lightweight alternative for internal gateway use.
-   * Skips the ownership re-check (trust established at session:start) and
-   * caps to the most recent `limit` messages so Claude context doesn't grow
-   * unbounded in long conversations.
+   * Lightweight alternative for internal gateway use: caps to the most recent `limit` messages so
+   * Claude context doesn't grow unbounded. Ownership is enforced inside the query (not trusted from the caller).
    */
   async getRecentHistoryForAI(
     conversationId: string,
+    userId: string,
     limit = 40,
   ): Promise<Array<{ role: 'user' | 'assistant'; content: string }>> {
-    const messages = await this.knex('conversation_messages')
-      .where('conversation_id', conversationId)
+    const messages = await this.whereConversationOwnedBy(
+      this.knex('conversation_messages').where('conversation_id', conversationId),
+      'conversation_messages',
+      userId,
+    )
       .orderBy('created_at', 'desc')
       .limit(limit)
       .select('role', 'content');
 
     // Reverse so oldest-first order is preserved for Claude
-    return messages.reverse().map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+    return (messages as Array<{ role: string; content: string }>).reverse().map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
   }
 
   // ── Rename ──────────────────────────────────────────────────────────────────
@@ -762,8 +796,12 @@ export class ConversationService {
 
   // ── Multi-speaker transcript segments ───────────────────────────────────────
 
-  async saveTranscriptSegments(segments: SaveTranscriptSegmentDto[]): Promise<void> {
+  async saveTranscriptSegments(segments: SaveTranscriptSegmentDto[], userId: string): Promise<void> {
     if (!segments.length) return;
+    // Every distinct conversation these segments name must belong to `userId`.
+    for (const conversationId of new Set(segments.map((s) => s.conversationId))) {
+      await this.assertOwnership(conversationId, userId);
+    }
     await this.knex('conversation_transcript_segments').insert(
       segments.map((s) => ({
         conversation_id: s.conversationId,
@@ -805,6 +843,7 @@ export class ConversationService {
 
   async correctTranscriptSpeaker(input: {
     conversationId: string;
+    userId: string;
     deepgramSpeakerId?: number;
     segmentId?: string;
     speakerId: string;
@@ -813,9 +852,10 @@ export class ConversationService {
     recordingSessionId?: string | null;
     providerEpoch?: number | null;
   }): Promise<void> {
-    const query = this.knex('conversation_transcript_segments').where(
-      'conversation_id',
-      input.conversationId,
+    const query = this.whereConversationOwnedBy(
+      this.knex('conversation_transcript_segments').where('conversation_id', input.conversationId),
+      'conversation_transcript_segments',
+      input.userId,
     );
 
     if (input.applyTo === 'segment') {
@@ -842,6 +882,7 @@ export class ConversationService {
 
   async renameAnonymousSpeaker(input: {
     conversationId: string;
+    userId: string;
     deepgramSpeakerId: number;
     speakerLabel: string;
     applyTo: 'session_speaker' | 'conversation_speaker';
@@ -851,7 +892,7 @@ export class ConversationService {
     if (!this.hasProviderScope(input)) {
       throw new Error('Rename by speaker number requires a recording session and provider epoch');
     }
-    const query = this.knex('conversation_transcript_segments')
+    const query = this.whereConversationOwnedBy(this.knex('conversation_transcript_segments'), 'conversation_transcript_segments', input.userId)
       .where('conversation_id', input.conversationId)
       // Only anonymous rows: never rename segments already tied to a real identity.
       .whereNull('speaker_id');
@@ -874,6 +915,7 @@ export class ConversationService {
    */
   async updateTranscriptSpeakerByDeepgramId(input: {
     conversationId: string;
+    userId: string;
     deepgramSpeakerId: number;
     speakerId: string | null;
     speakerLabel: string;
@@ -883,7 +925,7 @@ export class ConversationService {
   }): Promise<number> {
     if (!this.hasProviderScope(input)) return 0;
 
-    const query = this.knex('conversation_transcript_segments')
+    const query = this.whereConversationOwnedBy(this.knex('conversation_transcript_segments'), 'conversation_transcript_segments', input.userId)
       .where('conversation_id', input.conversationId)
       .andWhere('is_corrected', false)
       .andWhere((b) => {
@@ -923,6 +965,7 @@ export class ConversationService {
     fileUrl: string | null;
     contentMarkdown: string;
   }): Promise<{ id: string; filename: string; charCount: number }> {
+    await this.assertOwnership(data.conversationId, data.userId);
     const charCount = data.contentMarkdown.length;
     const [doc] = await this.knex('conversation_documents')
       .insert({
@@ -937,26 +980,6 @@ export class ConversationService {
       .returning(['id', 'filename', 'char_count']);
 
     return { id: doc.id, filename: doc.filename, charCount: doc.char_count };
-  }
-
-  /**
-   * Returns all documents attached to a specific conversation, formatted as a
-   * Markdown block ready to inject into the AI system prompt.
-   * Returns null when no documents are attached.
-   */
-  async getConversationDocumentContext(conversationId: string): Promise<string | null> {
-    const docs = await this.knex('conversation_documents')
-      .where('conversation_id', conversationId)
-      .orderBy('created_at', 'asc')
-      .select('filename', 'content_markdown');
-
-    if (!docs.length) return null;
-
-    return docs
-      .map((d: { filename: string; content_markdown: string }) =>
-        `=== ATTACHED DOCUMENT: ${d.filename} ===\n\n${d.content_markdown}\n\n=== END OF DOCUMENT ===`,
-      )
-      .join('\n\n');
   }
 
   /**
@@ -1027,9 +1050,8 @@ export class ConversationService {
     return parts.length > 0 ? parts.join('\n\n') : null;
   }
 
-  async listConversationDocuments(conversationId: string): Promise<{ id: string; filename: string; mimeType: string; charCount: number; createdAt: Date }[]> {
-    return this.knex('conversation_documents')
-      .where('conversation_id', conversationId)
+  async listConversationDocuments(conversationId: string, userId: string): Promise<{ id: string; filename: string; mimeType: string; charCount: number; createdAt: Date }[]> {
+    return this.whereConversationOwnedBy(this.knex('conversation_documents').where('conversation_id', conversationId), 'conversation_documents', userId)
       .orderBy('created_at', 'asc')
       .select('id', 'filename', 'mime_type as mimeType', 'char_count as charCount', 'created_at as createdAt');
   }
@@ -1041,6 +1063,7 @@ export class ConversationService {
    * Using display_name as the natural key — one record per named speaker per conversation.
    */
   async upsertConversationParticipant(dto: UpsertParticipantDto): Promise<ConversationParticipant> {
+    await this.assertOwnership(dto.conversationId, dto.userId);
     const existing = await this.knex('conversation_participants')
       .where('conversation_id', dto.conversationId)
       .whereRaw('LOWER(display_name) = ?', [dto.displayName.toLowerCase()])
@@ -1075,9 +1098,8 @@ export class ConversationService {
   }
 
   /** Returns all participants for a conversation, ordered by creation time. */
-  async getConversationParticipants(conversationId: string): Promise<ConversationParticipant[]> {
-    return this.knex('conversation_participants')
-      .where('conversation_id', conversationId)
+  async getConversationParticipants(conversationId: string, userId: string): Promise<ConversationParticipant[]> {
+    return this.whereConversationOwnedBy(this.knex('conversation_participants').where('conversation_id', conversationId), 'conversation_participants', userId)
       .orderBy('created_at', 'asc');
   }
 
@@ -1085,6 +1107,7 @@ export class ConversationService {
 
   /** Saves an uploaded image for vision injection on every subsequent AI call. */
   async saveConversationImage(dto: SaveConversationImageDto): Promise<ConversationImage> {
+    await this.assertOwnership(dto.conversationId, dto.userId);
     const [row] = await this.knex('conversation_images')
       .insert({
         conversation_id: dto.conversationId,
@@ -1103,16 +1126,14 @@ export class ConversationService {
    * Returns all images attached to a conversation, so they stay in context for
    * the lifetime of the conversation — the same treatment as attached documents.
    */
-  async getConversationImagesForAI(conversationId: string): Promise<ConversationImage[]> {
-    return this.knex('conversation_images')
-      .where('conversation_id', conversationId)
+  async getConversationImagesForAI(conversationId: string, userId: string): Promise<ConversationImage[]> {
+    return this.whereConversationOwnedBy(this.knex('conversation_images').where('conversation_id', conversationId), 'conversation_images', userId)
       .orderBy('created_at', 'asc');
   }
 
   /** Lists all images ever attached to a conversation (for display purposes). */
-  async listConversationImages(conversationId: string): Promise<Pick<ConversationImage, 'id' | 'filename' | 'mime_type' | 'file_url' | 'sent_to_ai' | 'created_at'>[]> {
-    return this.knex('conversation_images')
-      .where('conversation_id', conversationId)
+  async listConversationImages(conversationId: string, userId: string): Promise<Pick<ConversationImage, 'id' | 'filename' | 'mime_type' | 'file_url' | 'sent_to_ai' | 'created_at'>[]> {
+    return this.whereConversationOwnedBy(this.knex('conversation_images').where('conversation_id', conversationId), 'conversation_images', userId)
       .orderBy('created_at', 'asc')
       .select('id', 'filename', 'mime_type', 'file_url', 'sent_to_ai', 'created_at');
   }

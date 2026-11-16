@@ -1,3 +1,4 @@
+import { FieldsService } from '../fields/fields.service';
 import { ConflictException, ForbiddenException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { Knex } from 'knex';
 import { ConversationService } from '../voice/services/conversation.service';
@@ -40,9 +41,16 @@ export class ChatMessageService {
     private readonly conversationService: ConversationService,
     private readonly entitlementsService: EntitlementsService,
     private readonly usageService: UsageService,
+    private readonly fieldsService: FieldsService,
   ) {}
 
   async submitMessage(userId: string, dto: SubmitMessageDto): Promise<SubmitMessageResult> {
+    // Ownership FIRST: a conversation id (or a clientMessageId inside it) must never be probed,
+    // looked up, or used to skip quota accounting for a conversation that isn't the caller's.
+    if (dto.conversationId) {
+      await this.conversationService.assertOwnership(dto.conversationId, userId);
+    }
+
     const existingByClientId = dto.conversationId
       ? await this.knex('conversation_messages')
           .where({ conversation_id: dto.conversationId, client_message_id: dto.clientMessageId })
@@ -63,10 +71,11 @@ export class ChatMessageService {
     }
 
     let conversationId = dto.conversationId;
-    if (conversationId) {
-      await this.conversationService.assertOwnership(conversationId, userId);
-    } else {
-      const conversation = await this.conversationService.createConversation(userId, 'single', dto.fieldId);
+    if (!conversationId) {
+      // A client-supplied field id is only honoured if this user may use it; otherwise (absent,
+      // stale, someone else's) the account's primary field applies — same policy as voice sessions.
+      const fieldId = await this.resolveNewConversationFieldId(userId, dto.fieldId);
+      const conversation = await this.conversationService.createConversation(userId, 'single', fieldId ?? undefined);
       conversationId = conversation.id;
     }
 
@@ -99,6 +108,7 @@ export class ChatMessageService {
       const message = await this.conversationService.saveMessage(
         {
           conversationId: conversationId!,
+          userId,
           role: 'user',
           content: dto.text,
           clientMessageId: dto.clientMessageId,
@@ -124,6 +134,13 @@ export class ChatMessageService {
         conversationSequence: message.conversation_sequence!,
       };
     });
+  }
+
+  private async resolveNewConversationFieldId(userId: string, requestedFieldId?: string): Promise<string | null> {
+    const authorized = await this.fieldsService.resolveAuthorizedField(userId, requestedFieldId);
+    if (authorized) return authorized.id;
+    const primary = await this.fieldsService.getUserPrimaryField(userId);
+    return primary ? (primary.field_id ?? primary.custom_field_id ?? null) : null;
   }
 
   async getJobStatus(userId: string, jobId: string): Promise<JobStatusResult> {

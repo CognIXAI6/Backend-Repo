@@ -13,6 +13,7 @@ import {
   HttpCode,
   HttpStatus,
   BadRequestException,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ConversationService } from '@/modules/voice/services/conversation.service';
@@ -73,7 +74,7 @@ export class ConversationsController {
   @Get(':id')
   async getConversation(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
   ) {
     return this.conversationService.getConversation(conversationId, userId);
   }
@@ -81,7 +82,7 @@ export class ConversationsController {
   @Get(':id/messages')
   async getMessages(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
     @Query('afterSequence') afterSequence?: string,
   ) {
     if (afterSequence !== undefined) {
@@ -97,7 +98,7 @@ export class ConversationsController {
   @Get(':id/resources')
   async getResources(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
   ) {
     await this.conversationService.assertOwnership(conversationId, userId);
     return this.resourcesService.getResourcesForConversation(userId, conversationId);
@@ -106,7 +107,7 @@ export class ConversationsController {
   @Patch(':id')
   async rename(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
     @Body('title') title: string,
   ) {
     return this.conversationService.renameConversation(conversationId, userId, title);
@@ -123,7 +124,7 @@ export class ConversationsController {
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: CONVERSATION_DOC_SIZE_LIMIT } }))
   async attachDocument(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
     @UploadedFile() file: Express.Multer.File,
     @Body('instruction') instruction?: string,
   ) {
@@ -161,6 +162,7 @@ export class ConversationsController {
 
       await this.conversationService.saveMessage({
         conversationId,
+        userId,
         role: 'assistant',
         content: announcement,
       });
@@ -197,6 +199,7 @@ export class ConversationsController {
 
     await this.conversationService.saveMessage({
       conversationId,
+      userId,
       role: 'assistant',
       content: announcement,
     });
@@ -213,10 +216,10 @@ export class ConversationsController {
   @Get(':id/documents')
   async listDocuments(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
   ) {
     await this.conversationService.assertOwnership(conversationId, userId);
-    return this.conversationService.listConversationDocuments(conversationId);
+    return this.conversationService.listConversationDocuments(conversationId, userId);
   }
 
   /**
@@ -229,7 +232,7 @@ export class ConversationsController {
   @Post(':id/links')
   async attachLink(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
     @Body('url') url: string,
   ) {
     if (!url?.trim()) throw new BadRequestException('Please provide a URL.');
@@ -255,6 +258,7 @@ export class ConversationsController {
 
     await this.conversationService.saveMessage({
       conversationId,
+      userId,
       role: 'assistant',
       content: announcement,
     });
@@ -281,7 +285,7 @@ export class ConversationsController {
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: CONVERSATION_IMG_SIZE_LIMIT } }))
   async attachImage(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
     @UploadedFile() file: Express.Multer.File,
     @Body('instruction') instruction?: string,
   ) {
@@ -325,6 +329,7 @@ export class ConversationsController {
 
     await this.conversationService.saveMessage({
       conversationId,
+      userId,
       role: 'assistant',
       content: announcement,
     });
@@ -344,10 +349,10 @@ export class ConversationsController {
   @Get(':id/images')
   async listImages(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
   ) {
     await this.conversationService.assertOwnership(conversationId, userId);
-    return this.conversationService.listConversationImages(conversationId);
+    return this.conversationService.listConversationImages(conversationId, userId);
   }
 
   /**
@@ -370,7 +375,7 @@ export class ConversationsController {
   @HttpCode(HttpStatus.OK)
   async delete(
     @CurrentUser('id') userId: string,
-    @Param('id') conversationId: string,
+    @Param('id', ParseUUIDPipe) conversationId: string,
   ) {
     await this.conversationService.deleteConversation(conversationId, userId);
     return { message: 'Conversation deleted' };

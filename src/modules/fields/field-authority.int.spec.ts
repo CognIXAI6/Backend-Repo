@@ -132,11 +132,11 @@ d('field authority (real Postgres)', () => {
       const authorized = await fields.resolveAuthorizedField(alice, law);
       const conv = await conversations.createConversation(alice, 'single', authorized!.id);
       expect(conv.field_id).toBe(law);
-      expect(await conversations.getConversationFieldId(conv.id)).toBe(law);
+      expect(await conversations.getConversationFieldId(conv.id, alice)).toBe(law);
     });
     it('a conversation created with no field reads back null', async () => {
       const conv = await conversations.createConversation(alice, 'single');
-      expect(await conversations.getConversationFieldId(conv.id)).toBeNull();
+      expect(await conversations.getConversationFieldId(conv.id, alice)).toBeNull();
     });
   });
 });

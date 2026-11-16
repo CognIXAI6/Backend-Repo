@@ -64,8 +64,8 @@ d('summary email outcome (real Postgres)', () => {
     it('detail and history list rows carry the same summaryEmail object; the pre-existing fields are unchanged', async () => {
       const c = await newConversation();
       const doc = await newDoc();
-      await conversations.setSummaryEmailStatus(c, { status: 'pending', documentId: doc });
-      await conversations.setSummaryEmailStatus(c, { status: 'accepted_by_provider', documentId: doc });
+      await conversations.setSummaryEmailStatus(c, userId, { status: 'pending', documentId: doc });
+      await conversations.setSummaryEmailStatus(c, userId, { status: 'accepted_by_provider', documentId: doc });
       const detail: any = await conversations.getConversation(c, userId);
       const list: any = (await conversations.getHistory(userId, 1, 50)).data.find((x: any) => x.id === c);
       expect(detail.summaryEmail).toMatchObject({ status: 'accepted_by_provider', reason: null, documentId: doc });
@@ -75,7 +75,7 @@ d('summary email outcome (real Postgres)', () => {
 
     it('an abandoned pending attempt reads as unknown, not pending forever', async () => {
       const c = await newConversation();
-      await conversations.setSummaryEmailStatus(c, { status: 'pending', documentId: null });
+      await conversations.setSummaryEmailStatus(c, userId, { status: 'pending', documentId: null });
       expect((await emailOf(c)).status).toBe('pending');
       await knex('conversations').where('id', c).update({ summary_email_updated_at: new Date(Date.now() - SUMMARY_EMAIL_PENDING_STALE_MS - 60_000) });
       expect(await emailOf(c)).toMatchObject({ status: 'unknown', reason: 'stale_pending' });
@@ -83,7 +83,7 @@ d('summary email outcome (real Postgres)', () => {
 
     it('is only readable by the conversation owner', async () => {
       const c = await newConversation();
-      await conversations.setSummaryEmailStatus(c, { status: 'failed', reason: 'provider_rejected', documentId: null });
+      await conversations.setSummaryEmailStatus(c, userId, { status: 'failed', reason: 'provider_rejected', documentId: null });
       await expect(conversations.getConversation(c, otherUserId)).rejects.toBeInstanceOf(NotFoundException);
       expect((await conversations.getHistory(otherUserId, 1, 50)).data.some((x: any) => x.id === c)).toBe(false);
     });
@@ -93,18 +93,18 @@ d('summary email outcome (real Postgres)', () => {
     it('a slow older attempt cannot overwrite a newer attempt\'s outcome', async () => {
       const c = await newConversation();
       const [docOld, docNew] = [await newDoc(), await newDoc()];
-      await conversations.setSummaryEmailStatus(c, { status: 'pending', documentId: docOld });
-      await conversations.setSummaryEmailStatus(c, { status: 'pending', documentId: docNew }); // resumed conversation: a newer summary
-      expect(await conversations.setSummaryEmailStatus(c, { status: 'failed', reason: 'unknown_error', documentId: docOld })).toBe(false);
+      await conversations.setSummaryEmailStatus(c, userId, { status: 'pending', documentId: docOld });
+      await conversations.setSummaryEmailStatus(c, userId, { status: 'pending', documentId: docNew }); // resumed conversation: a newer summary
+      expect(await conversations.setSummaryEmailStatus(c, userId, { status: 'failed', reason: 'unknown_error', documentId: docOld })).toBe(false);
       expect(await emailOf(c)).toMatchObject({ status: 'pending', documentId: docNew });
-      expect(await conversations.setSummaryEmailStatus(c, { status: 'accepted_by_provider', documentId: docNew })).toBe(true);
+      expect(await conversations.setSummaryEmailStatus(c, userId, { status: 'accepted_by_provider', documentId: docNew })).toBe(true);
       expect((await emailOf(c)).status).toBe('accepted_by_provider');
     });
 
     it('a skipped outcome (no recipient) starts a fresh attempt regardless of the previous one', async () => {
       const c = await newConversation();
-      await conversations.setSummaryEmailStatus(c, { status: 'accepted_by_provider', documentId: await newDoc() });
-      expect(await conversations.setSummaryEmailStatus(c, { status: 'skipped', reason: 'no_recipient', documentId: await newDoc() })).toBe(true);
+      await conversations.setSummaryEmailStatus(c, userId, { status: 'accepted_by_provider', documentId: await newDoc() });
+      expect(await conversations.setSummaryEmailStatus(c, userId, { status: 'skipped', reason: 'no_recipient', documentId: await newDoc() })).toBe(true);
       expect(await emailOf(c)).toMatchObject({ status: 'skipped', reason: 'no_recipient' });
     });
   });

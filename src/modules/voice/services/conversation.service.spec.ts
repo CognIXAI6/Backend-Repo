@@ -60,7 +60,7 @@ describe('ConversationService.buildCleanupCandidatesQuery', () => {
 
 describe('ConversationService.setSummaryStatus', () => {
   function createFakeUpdateChain() {
-    const chain: any = { where: jest.fn().mockReturnThis(), update: jest.fn().mockResolvedValue(1) };
+    const chain: any = { where: jest.fn().mockReturnThis(), whereNull: jest.fn().mockReturnThis(), update: jest.fn().mockResolvedValue(1) };
     return chain;
   }
 
@@ -69,10 +69,10 @@ describe('ConversationService.setSummaryStatus', () => {
     const knexLike: any = jest.fn(() => chain);
     const service = new ConversationService(knexLike, createFakeConfigService());
 
-    await service.setSummaryStatus('conv-1', 'pending');
+    await service.setSummaryStatus('conv-1', 'user-1', 'pending');
 
     expect(knexLike).toHaveBeenCalledWith('conversations');
-    expect(chain.where).toHaveBeenCalledWith('id', 'conv-1');
+    expect(chain.where).toHaveBeenCalledWith({ id: 'conv-1', user_id: 'user-1' }); // ownership is part of the query
     const update = chain.update.mock.calls[0][0];
     expect(update.summary_status).toBe('pending');
     expect(update).not.toHaveProperty('summary_skip_reason');
@@ -84,7 +84,7 @@ describe('ConversationService.setSummaryStatus', () => {
     const knexLike: any = jest.fn(() => chain);
     const service = new ConversationService(knexLike, createFakeConfigService());
 
-    await service.setSummaryStatus('conv-1', 'skipped', { skipReason: 'too_short' });
+    await service.setSummaryStatus('conv-1', 'user-1', 'skipped', { skipReason: 'too_short' });
 
     expect(chain.update.mock.calls[0][0]).toEqual(
       expect.objectContaining({ summary_status: 'skipped', summary_skip_reason: 'too_short' }),
@@ -96,7 +96,7 @@ describe('ConversationService.setSummaryStatus', () => {
     const knexLike: any = jest.fn(() => chain);
     const service = new ConversationService(knexLike, createFakeConfigService());
 
-    await service.setSummaryStatus('conv-1', 'ready', { documentId: 'doc-1' });
+    await service.setSummaryStatus('conv-1', 'user-1', 'ready', { documentId: 'doc-1' });
 
     expect(chain.update.mock.calls[0][0]).toEqual(
       expect.objectContaining({ summary_status: 'ready', summary_document_id: 'doc-1' }),
@@ -150,6 +150,7 @@ describe('ConversationService.saveMessage', () => {
     const service = new ConversationService(knexLike, createFakeConfigService());
     const message = await service.saveMessage({
       conversationId: 'conv-1',
+      userId: 'user-1',
       role: 'user',
       content: 'hello',
     });
@@ -171,7 +172,7 @@ describe('ConversationService.saveMessage', () => {
     const service = new ConversationService(knexLike, createFakeConfigService());
 
     await expect(
-      service.saveMessage({ conversationId: 'conv-1', role: 'user', content: 'hello' }),
+      service.saveMessage({ conversationId: 'conv-1', userId: 'user-1', role: 'user', content: 'hello' }),
     ).rejects.toThrow('counter update failed');
   });
 });

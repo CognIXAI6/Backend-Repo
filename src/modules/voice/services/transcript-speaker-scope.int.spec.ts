@@ -54,7 +54,7 @@ d('transcript speaker scoping (real Postgres)', () => {
       { conversationId: c, deepgramSpeakerId: 1, speakerLabel: 'Guest 2', transcript: 'b', identificationMethod: 'diarization', recordingSessionId: '11111111-1111-1111-1111-111111111111', providerEpoch: 0 },
       { conversationId: c, deepgramSpeakerId: 0, speakerLabel: 'Guest 1', transcript: 'c', identificationMethod: 'diarization', recordingSessionId: '11111111-1111-1111-1111-111111111111', providerEpoch: 0 },
       { conversationId: c, deepgramSpeakerId: null, speakerLabel: 'Unknown speaker', transcript: 'd', identificationMethod: 'unknown', recordingSessionId: '11111111-1111-1111-1111-111111111111', providerEpoch: 1 },
-    ]);
+    ], userId);
     const all = (await rows(c)).map((r: any) => [r.transcript, r.deepgram_speaker_id, r.provider_epoch, r.speaker_label]);
     expect(all).toEqual([['a', 0, 0, 'Guest 1'], ['b', 1, 0, 'Guest 2'], ['c', 0, 0, 'Guest 1'], ['d', null, 1, 'Unknown speaker']]);
   });
@@ -64,7 +64,7 @@ d('transcript speaker scoping (real Postgres)', () => {
     await seg(c, { epoch: 0, spk: 0, label: 'Alice', speakerId: aliceId, method: 'voice_id', text: 'alice-old' });
     await seg(c, { epoch: 1, spk: 0, label: 'Guest 1', text: 'bob-new' });
     const n = await svc.updateTranscriptSpeakerByDeepgramId({
-      conversationId: c, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', identificationMethod: 'voice_id', ...scope({ providerEpoch: 1 }),
+      conversationId: c, userId, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', identificationMethod: 'voice_id', ...scope({ providerEpoch: 1 }),
     });
     expect(n).toBe(1);
     const r: any[] = await rows(c);
@@ -76,7 +76,7 @@ d('transcript speaker scoping (real Postgres)', () => {
     const c = await conv();
     await seg(c, { rec: '22222222-2222-2222-2222-222222222222', epoch: 0, label: 'Alice', speakerId: aliceId, method: 'voice_id', text: 'earlier-recording' });
     await seg(c, { text: 'this-recording' });
-    await svc.updateTranscriptSpeakerByDeepgramId({ conversationId: c, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', identificationMethod: 'voice_id', ...scope() });
+    await svc.updateTranscriptSpeakerByDeepgramId({ conversationId: c, userId, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', identificationMethod: 'voice_id', ...scope() });
     const r: any[] = await rows(c);
     expect(r.find((x) => x.transcript === 'earlier-recording')).toMatchObject({ speaker_label: 'Alice' });
     expect(r.find((x) => x.transcript === 'this-recording')).toMatchObject({ speaker_label: 'Bob' });
@@ -87,7 +87,7 @@ d('transcript speaker scoping (real Postgres)', () => {
     await seg(c, { label: 'Alice', speakerId: aliceId, method: 'voice_id', text: 'confirmed-alice' });
     await seg(c, { label: 'Carol', speakerId: aliceId, method: 'manual', corrected: true, text: 'manual' });
     await seg(c, { text: 'anonymous' });
-    const n = await svc.updateTranscriptSpeakerByDeepgramId({ conversationId: c, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', identificationMethod: 'voice_id', ...scope() });
+    const n = await svc.updateTranscriptSpeakerByDeepgramId({ conversationId: c, userId, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', identificationMethod: 'voice_id', ...scope() });
     expect(n).toBe(1);
     const r: any[] = await rows(c);
     expect(r.find((x) => x.transcript === 'confirmed-alice')).toMatchObject({ speaker_label: 'Alice', speaker_id: aliceId });
@@ -98,7 +98,7 @@ d('transcript speaker scoping (real Postgres)', () => {
   it('re-confirming the SAME identity is allowed (idempotent)', async () => {
     const c = await conv();
     await seg(c, { label: 'Alice', speakerId: aliceId, method: 'voice_id', text: 'x' });
-    const n = await svc.updateTranscriptSpeakerByDeepgramId({ conversationId: c, deepgramSpeakerId: 0, speakerId: aliceId, speakerLabel: 'Alice', identificationMethod: 'voice_id', ...scope() });
+    const n = await svc.updateTranscriptSpeakerByDeepgramId({ conversationId: c, userId, deepgramSpeakerId: 0, speakerId: aliceId, speakerLabel: 'Alice', identificationMethod: 'voice_id', ...scope() });
     expect(n).toBe(1);
   });
 
@@ -106,7 +106,7 @@ d('transcript speaker scoping (real Postgres)', () => {
     const c = await conv();
     await seg(c, { epoch: null, text: 'legacy' });
     await seg(c, { text: 'scoped' });
-    const base = { conversationId: c, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', identificationMethod: 'voice_id' as const };
+    const base = { conversationId: c, userId, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', identificationMethod: 'voice_id' as const };
     expect(await svc.updateTranscriptSpeakerByDeepgramId({ ...base })).toBe(0);
     expect(await svc.updateTranscriptSpeakerByDeepgramId({ ...base, recordingSessionId: '11111111-1111-1111-1111-111111111111' })).toBe(0);
     expect(await svc.updateTranscriptSpeakerByDeepgramId({ ...base, providerEpoch: 0 })).toBe(0);
@@ -122,7 +122,7 @@ d('transcript speaker scoping (real Postgres)', () => {
     await seg(c, { epoch: 0, label: 'Alice', speakerId: aliceId, method: 'voice_id', text: 'e0' });
     await seg(c, { epoch: 1, text: 'e1' });
     for (const applyTo of ['session_speaker', 'conversation_speaker'] as const) {
-      await svc.correctTranscriptSpeaker({ conversationId: c, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', applyTo, ...scope({ providerEpoch: 1 }) });
+      await svc.correctTranscriptSpeaker({ conversationId: c, userId, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', applyTo, ...scope({ providerEpoch: 1 }) });
     }
     const r: any[] = await rows(c);
     expect(r.find((x) => x.transcript === 'e0')).toMatchObject({ speaker_label: 'Alice' });
@@ -132,11 +132,11 @@ d('transcript speaker scoping (real Postgres)', () => {
   it('manual correction without scope is rejected (not widened); a single-segment correction still works unscoped', async () => {
     const c = await conv();
     await seg(c, { text: 'one' });
-    await expect(svc.correctTranscriptSpeaker({ conversationId: c, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', applyTo: 'session_speaker' })).rejects.toThrow(/provider epoch/);
-    await expect(svc.correctTranscriptSpeaker({ conversationId: c, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', applyTo: 'conversation_speaker', recordingSessionId: '11111111-1111-1111-1111-111111111111' })).rejects.toThrow();
-    await expect(svc.correctTranscriptSpeaker({ conversationId: c, speakerId: bobId, speakerLabel: 'Bob', applyTo: 'segment' })).rejects.toThrow(/segmentId/);
+    await expect(svc.correctTranscriptSpeaker({ conversationId: c, userId, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', applyTo: 'session_speaker' })).rejects.toThrow(/provider epoch/);
+    await expect(svc.correctTranscriptSpeaker({ conversationId: c, userId, deepgramSpeakerId: 0, speakerId: bobId, speakerLabel: 'Bob', applyTo: 'conversation_speaker', recordingSessionId: '11111111-1111-1111-1111-111111111111' })).rejects.toThrow();
+    await expect(svc.correctTranscriptSpeaker({ conversationId: c, userId, speakerId: bobId, speakerLabel: 'Bob', applyTo: 'segment' })).rejects.toThrow(/segmentId/);
     const [{ id }] = await rows(c);
-    await svc.correctTranscriptSpeaker({ conversationId: c, segmentId: id, speakerId: bobId, speakerLabel: 'Bob', applyTo: 'segment' });
+    await svc.correctTranscriptSpeaker({ conversationId: c, userId, segmentId: id, speakerId: bobId, speakerLabel: 'Bob', applyTo: 'segment' });
     expect(((await rows(c)) as any[])[0]).toMatchObject({ speaker_label: 'Bob', is_corrected: true });
   });
 
@@ -145,11 +145,11 @@ d('transcript speaker scoping (real Postgres)', () => {
     await seg(c, { label: 'Alice', speakerId: aliceId, method: 'voice_id', text: 'identified' });
     await seg(c, { text: 'anon-in-scope' });
     await seg(c, { epoch: 1, text: 'anon-other-epoch' });
-    await svc.renameAnonymousSpeaker({ conversationId: c, deepgramSpeakerId: 0, speakerLabel: 'Dana', applyTo: 'session_speaker', ...scope() });
+    await svc.renameAnonymousSpeaker({ conversationId: c, userId, deepgramSpeakerId: 0, speakerLabel: 'Dana', applyTo: 'session_speaker', ...scope() });
     const r: any[] = await rows(c);
     expect(r.find((x) => x.transcript === 'identified')).toMatchObject({ speaker_label: 'Alice' });
     expect(r.find((x) => x.transcript === 'anon-in-scope')).toMatchObject({ speaker_label: 'Dana' });
     expect(r.find((x) => x.transcript === 'anon-other-epoch')).toMatchObject({ speaker_label: 'Guest 1' });
-    await expect(svc.renameAnonymousSpeaker({ conversationId: c, deepgramSpeakerId: 0, speakerLabel: 'X', applyTo: 'conversation_speaker' })).rejects.toThrow();
+    await expect(svc.renameAnonymousSpeaker({ conversationId: c, userId, deepgramSpeakerId: 0, speakerLabel: 'X', applyTo: 'conversation_speaker' })).rejects.toThrow();
   });
 });

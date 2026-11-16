@@ -783,7 +783,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       let fieldMismatch = false;
 
       if (conversationId) {
-        const persistedFieldId = await this.conversationService.getConversationFieldId(conversationId);
+        const persistedFieldId = await this.conversationService.getConversationFieldId(conversationId, userId);
         fieldId = persistedFieldId;
         if (persistedFieldId) {
           const record = await this.fieldsService.findFieldRecordForUser(userId, persistedFieldId);
@@ -1005,7 +1005,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       let restoredParticipants: ConversationParticipant[] = [];
       if (!isGuest) {
         restoredParticipants = await this.conversationService
-          .getConversationParticipants(conversationId)
+          .getConversationParticipants(conversationId, userId)
           .catch((err) => {
             this.logger.warn(`[${client.id}] Failed to load conversation participants: ${describeError(err)}`);
             return [];
@@ -1545,7 +1545,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
-    this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
+    this.conversationService.relabelSpeakers(session.conversationId, session.userId).catch((err) =>
       this.logger.error(`[${client.id}] relabelSpeakers (swap) failed:`, err),
     );
 
@@ -1745,6 +1745,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     try {
       await this.conversationService.correctTranscriptSpeaker({
         conversationId: session.conversationId,
+        userId: session.userId,
         deepgramSpeakerId: payload.deepgramSpeakerId,
         segmentId: payload.segmentId,
         speakerId: speaker.id,
@@ -1825,6 +1826,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const applyTo = payload.applyTo ?? 'session_speaker';
       await this.conversationService.renameAnonymousSpeaker({
         conversationId: session.conversationId,
+        userId: session.userId,
         deepgramSpeakerId: payload.deepgramSpeakerId,
         speakerLabel: name,
         applyTo,
@@ -2200,7 +2202,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // next resume + stop re-claims (failed is claimable) and summarises everything.
       this.logger.warn(`Auto-summary withheld for ${session.conversationId}: final turns not confirmed persisted`);
       await this.conversationService
-        .setSummaryStatus(session.conversationId, 'failed', { skipReason: 'final_turns_incomplete' })
+        .setSummaryStatus(session.conversationId, session.userId, 'failed', { skipReason: 'final_turns_incomplete' })
         .catch((err) => this.logger.error('Failed to mark summary incomplete:', err));
       return;
     }
@@ -2262,7 +2264,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // The claim also sets summary_status='pending'. It's atomic, so overlapping
     // triggers (drop + reconnect + stop) collapse into one summary and one email.
     const claimed = await this.conversationService
-      .claimSummaryGeneration(session.conversationId)
+      .claimSummaryGeneration(session.conversationId, session.userId)
       .catch((err) => {
         this.logger.warn(`Failed to claim summary for ${session.conversationId}:`, err);
         return false;
@@ -2275,14 +2277,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const entitlements = session.entitlements;
     if (!entitlements || entitlements.maxDocumentsPerMonth <= 0 || entitlements.allowedDocumentDepths.length === 0) {
       // tier doesn't include document generation — this is a bonus, not an explicit request
-      await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'tier_no_documents' });
+      await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'skipped', { skipReason: 'tier_no_documents' });
       return;
     }
 
     // Only what was said since the last summarised part — a resumed
     // conversation gets a new part appended to the earlier ones instead of a
     // from-scratch re-summary of everything.
-    const newMessages = await this.conversationService.getUnsummarizedMessages(session.conversationId);
+    const newMessages = await this.conversationService.getUnsummarizedMessages(session.conversationId, session.userId);
     // Complete context: nothing is dropped. Short conversations go to the model in one
     // call; longer ones are condensed in ordered chunks and summarised from all the notes;
     // past the hard bound the summary fails truthfully (see buildInsightSummary).
@@ -2290,11 +2292,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (plan.kind === 'empty') {
       // Nothing new to summarise. If an earlier part exists, the conversation's
       // summary is still current — restore 'ready' rather than 'skipped'.
-      const priorParts = await this.conversationService.getSummaryParts(session.conversationId);
+      const priorParts = await this.conversationService.getSummaryParts(session.conversationId, session.userId);
       if (priorParts.length > 0) {
-        await this.conversationService.setSummaryStatus(session.conversationId, 'ready');
+        await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'ready');
       } else {
-        await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'too_short' });
+        await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'skipped', { skipReason: 'too_short' });
       }
       return; // nothing was said — genuinely nothing to summarize
     }
@@ -2306,7 +2308,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     const docStatus = await this.usageService.getStatus(session.userId, 'documents', entitlements.maxDocumentsPerMonth);
     if (!docStatus.canUse) {
-      await this.conversationService.setSummaryStatus(session.conversationId, 'skipped', { skipReason: 'quota_exceeded' });
+      await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'skipped', { skipReason: 'quota_exceeded' });
       return; // monthly document cap already hit
     }
 
@@ -2316,7 +2318,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (!built.ok) {
       // Truthful failure: no summary is written (or recorded as covering anything), the stored
       // messages are untouched, and the next resume + stop re-claims (failed is claimable).
-      await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: built.reason });
+      await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'failed', { skipReason: built.reason });
       client.emit('document:failed', { title: 'Conversation summary', reason: SUMMARY_FAILURE_MESSAGES[built.reason], reasonCode: built.reason, auto: true });
       return;
     }
@@ -2338,8 +2340,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     let combined: { title: string; topic: string; sections: Array<{ heading: string; content: string }> };
     try {
-      const priorParts = await this.conversationService.getSummaryParts(session.conversationId);
-      const conversationTitle = await this.conversationService.getConversationTitle(session.conversationId);
+      const priorParts = await this.conversationService.getSummaryParts(session.conversationId, session.userId);
+      const conversationTitle = await this.conversationService.getConversationTitle(session.conversationId, session.userId);
       combined = buildCombinedSummary(
         [
           ...priorParts,
@@ -2348,7 +2350,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         conversationTitle,
       );
     } catch (err) {
-      await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
+      await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'failed', { skipReason: 'generation_error' });
       throw err;
     }
 
@@ -2369,15 +2371,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       // Recorded only after the document exists, so a failed upload leaves
       // this stretch unsummarised for the next attempt instead of "covered".
-      await this.conversationService.addSummaryPart(
-        session.conversationId,
+      await this.conversationService.addSummaryPart(session.conversationId, session.userId,
         { title: summary.title, topic: summary.topic, sections: summary.sections },
         newMessages[0].id,
         newMessages[newMessages.length - 1].id,
       );
 
       await this.usageService.tryConsume(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
-      await this.conversationService.setSummaryStatus(session.conversationId, 'ready', { documentId: result.docId });
+      await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'ready', { documentId: result.docId });
 
       // Persisted, not just live-emitted — the manual "generate a document"
       // chat flow already does this (see processPrompt's onDone), and this
@@ -2390,6 +2391,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // just unreachable from the conversation history a user actually looks at.
       await this.conversationService.saveMessage({
         conversationId: session.conversationId,
+        userId: session.userId,
         role: 'assistant',
         content: `${combined.title} is ready.`,
         documentId: result.docId,
@@ -2421,7 +2423,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       this.logger.log(`Auto-summary generated for conversation ${session.conversationId} (doc ${result.docId})`);
     } catch (err) {
-      await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
+      await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'failed', { skipReason: 'generation_error' });
       client.emit('document:failed', { title: combined.title, reason: "We couldn't generate your conversation summary.", auto: true });
       throw err;
     }
@@ -2517,7 +2519,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // never affect the email or the summary's readiness, so it is swallowed (and logged coarsely).
     const record = async (status: 'pending' | 'accepted_by_provider' | 'failed' | 'skipped', reason: SummaryEmailReason | null = null) => {
       try {
-        await this.conversationService.setSummaryEmailStatus(session.conversationId, { status, reason, documentId });
+        await this.conversationService.setSummaryEmailStatus(session.conversationId, session.userId, { status, reason, documentId });
       } catch (err) {
         this.logger.warn(`Could not record summary email outcome (trace=${session.traceId}): ${describeError(err)}`);
       }
@@ -2538,7 +2540,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     await record('pending');
     let stage: 'attachment' | 'send' = 'attachment';
     try {
-      const conversationTitle = (await this.conversationService.getConversationTitle(session.conversationId)) ?? summary.title;
+      const conversationTitle = (await this.conversationService.getConversationTitle(session.conversationId, session.userId)) ?? summary.title;
       const pdfBuffer = await this.documentService.buildSummaryPdfBuffer(summary.title, summary.sections);
       const filename = `${summary.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'conversation-summary'}.pdf`;
 
@@ -2656,6 +2658,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       await this.conversationService.saveMessageWithTranscriptSegments(
         {
           conversationId: session.conversationId,
+          userId: session.userId,
           role: 'user',
           content: userContent,
           transcript: rawTranscript,
@@ -2689,6 +2692,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         onDone: async (fullText, inputTokens, outputTokens) => {
           await this.conversationService.saveMessage({
             conversationId: session.conversationId,
+            userId: session.userId,
             role: 'assistant',
             content: fullText,
             tokensUsed: inputTokens + outputTokens,
@@ -2698,7 +2702,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           this.claudeService
             .generateConversationTitle(rawTranscript, fullText, session.fieldName, outputLanguage)
             .then(async (title) => {
-              const wasSet = await this.conversationService.setTitle(session.conversationId, title);
+              const wasSet = await this.conversationService.setTitle(session.conversationId, session.userId, title);
               if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
             })
             .catch((err) => this.logger.error('Multi-speaker title generation failed:', err));
@@ -2814,6 +2818,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           if (ownerText) {
             await this.conversationService.saveMessage({
               conversationId: session.conversationId,
+              userId: session.userId,
               role: 'user',
               content: ownerText,
               transcript: ownerText,
@@ -2823,6 +2828,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           if (otherPersonText) {
             await this.conversationService.saveMessage({
               conversationId: session.conversationId,
+              userId: session.userId,
               role: 'user',
               content: otherPersonText,
               transcript: otherPersonText,
@@ -2836,6 +2842,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             // recognised words are never lost and never pinned on owner/other.
             await this.conversationService.saveMessage({
               conversationId: session.conversationId,
+              userId: session.userId,
               role: 'user',
               content: unattributedText,
               transcript: unattributedText,
@@ -2844,6 +2851,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           }
           await this.conversationService.saveMessage({
             conversationId: session.conversationId,
+            userId: session.userId,
             role: 'assistant',
             content: fullText,
             tokensUsed: inputTokens + outputTokens,
@@ -2853,7 +2861,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           this.claudeService
               .generateConversationTitle(primaryText, fullText, session.fieldName, outputLanguage)
             .then(async (title) => {
-              const wasSet = await this.conversationService.setTitle(session.conversationId, title);
+              const wasSet = await this.conversationService.setTitle(session.conversationId, session.userId, title);
               if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
             })
             .catch((err) => this.logger.error('Dual-speaker title generation failed:', err));
@@ -2897,8 +2905,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   private async saveSessionMemory(session: ActiveSession): Promise<void> {
     try {
-      const history = await this.conversationService.getRecentHistoryForAI(
-        session.conversationId,
+      const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, session.userId,
         80,
       );
       if (history.length < 2) return;
@@ -2943,7 +2950,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let aiStarted = false;
 
     try {
-      const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, 40);
+      const history = await this.conversationService.getRecentHistoryForAI(session.conversationId, session.userId, 40);
 
       if (inputType === 'voice' && history.length >= 4) {
         const relevant = await this.claudeService.checkTopicRelevance(userMessage, history, session.fieldName);
@@ -2957,6 +2964,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       await this.conversationService.saveMessage({
         conversationId: session.conversationId,
+        userId: session.userId,
         role: 'user',
         content: userMessage,
         transcript: inputType === 'voice' ? userMessage : undefined,
@@ -3053,7 +3061,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // blocks on every AI call so the AI can still answer questions about an
       // image several messages after it was uploaded.
       const conversationImages = await this.conversationService
-        .getConversationImagesForAI(session.conversationId)
+        .getConversationImagesForAI(session.conversationId, session.userId)
         .catch(() => [] as DbConversationImage[]);
 
       const visionImages: ClaudeConversationImage[] = conversationImages.map((img) => ({
@@ -3126,6 +3134,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
             await this.conversationService.saveMessage({
               conversationId: session.conversationId,
+              userId: session.userId,
               role: 'assistant',
               content: responseText,
               tokensUsed: inputTokens + outputTokens,
@@ -3137,7 +3146,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
             this.claudeService
               .generateConversationTitle(userMessage, responseText, session.fieldName, outputLanguage)
               .then(async (title) => {
-                const wasSet = await this.conversationService.setTitle(session.conversationId, title);
+                const wasSet = await this.conversationService.setTitle(session.conversationId, session.userId, title);
                 if (wasSet) client.emit('conversation:titled', { conversationId: session.conversationId, title });
               })
               .catch((err) => this.logger.error('Title generation failed:', err));
@@ -3528,7 +3537,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
         session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
-        this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
+        this.conversationService.relabelSpeakers(session.conversationId, session.userId).catch((err) =>
           this.logger.error(`[${client.id}] relabelSpeakers (biometric correction) failed:`, err),
         );
 
@@ -3560,7 +3569,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       session.dualSpeakerHistory = session.dualSpeakerHistory.map((turn) => this.flipDualTurn(turn));
 
-      this.conversationService.relabelSpeakers(session.conversationId).catch((err) =>
+      this.conversationService.relabelSpeakers(session.conversationId, session.userId).catch((err) =>
         this.logger.error(`[${client.id}] relabelSpeakers (contact flip) failed:`, err),
       );
 
@@ -3764,6 +3773,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // ── Retroactively update segment rows saved before identification ─────
       this.conversationService.updateTranscriptSpeakerByDeepgramId({
         conversationId: session.conversationId,
+        userId: session.userId,
         deepgramSpeakerId,
         speakerId: resolvedSpeakerId,
         speakerLabel: resolvedName,

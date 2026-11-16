@@ -569,7 +569,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       t.claudeService.generateConversationSummaryDocument.mockResolvedValue({ title: 'Single', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
       return { ...t, client: createFakeClient('sock-1'), session: createFakeSession({ entitlements: entitlementsLocal }) };
     };
-    const statusCalls = (cs: any) => cs.setSummaryStatus.mock.calls.map((c: any[]) => [c[1], c[2]?.skipReason ?? null]);
+    const statusCalls = (cs: any) => cs.setSummaryStatus.mock.calls.map((c: any[]) => [c[2], c[3]?.skipReason ?? null]);
 
     it('a conversation past the old 80-message / 12,000-character limits is summarised from ALL of it: ordered chunks, then one write-up from every chunk\'s notes', async () => {
       const turns = longConversation(300, 200); // 300 messages, 60k chars
@@ -585,7 +585,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
 
       // the recorded coverage is the WHOLE range, and the stored transcript section has both ends
-      expect(conversationService.addSummaryPart).toHaveBeenCalledWith(session.conversationId, expect.anything(), 'm0', 'm299');
+      expect(conversationService.addSummaryPart).toHaveBeenCalledWith(session.conversationId, session.userId, expect.anything(), 'm0', 'm299');
       const sections = documentService.generateAndUpload.mock.calls[0][0].sections;
       const transcript = sections.find((x: any) => x.heading === 'Transcript').content;
       expect(transcript).toContain('m1:');
@@ -678,7 +678,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
   describe('summary email outcome (coarse status only)', () => {
     const ADDRESS = 'owner.sentinel@example.com';
     const summary = { title: 'Budget Review', sections: [{ heading: 'Summary', content: 'PRIVATE-SUMMARY-CONTENT' }] };
-    const calls = (cs: any) => cs.setSummaryEmailStatus.mock.calls.map((c: any[]) => [c[1].status, c[1].reason ?? null]);
+    const calls = (cs: any) => cs.setSummaryEmailStatus.mock.calls.map((c: any[]) => [c[2].status, c[2].reason ?? null]);
 
     it('accepted by the provider: pending is recorded first, then accepted_by_provider — and nothing identifying is stored', async () => {
       const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
@@ -689,7 +689,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       const stored = JSON.stringify(conversationService.setSummaryEmailStatus.mock.calls);
       expect(stored).not.toContain(ADDRESS);
       expect(stored).not.toContain('PRIVATE-SUMMARY-CONTENT');
-      expect(conversationService.setSummaryEmailStatus.mock.calls[0][1].documentId).toBe('doc-1');
+      expect(conversationService.setSummaryEmailStatus.mock.calls[0][2].documentId).toBe('doc-1');
     });
 
     it.each([
@@ -806,7 +806,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         [{ role: 'user', content: 'first stretch' }],
         [{ role: 'user', content: 'said after the first snapshot' }],
       ]);
-      expect(conversationService.addSummaryPart.mock.calls.map((c: any[]) => [c[2], c[3]])).toEqual([['m1', 'm1'], ['m2', 'm2']]);
+      expect(conversationService.addSummaryPart.mock.calls.map((c: any[]) => [c[3], c[4]])).toEqual([['m1', 'm1'], ['m2', 'm2']]);
     });
 
     it('a failed in-flight run still lets the queued follow-up proceed', async () => {
@@ -875,8 +875,8 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       await gateway.autoGenerateConversationSummary(client, session);
 
-      expect(conversationService.claimSummaryGeneration).toHaveBeenCalledWith(session.conversationId);
-      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'tier_no_documents' });
+      expect(conversationService.claimSummaryGeneration).toHaveBeenCalledWith(session.conversationId, session.userId);
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'skipped', { skipReason: 'tier_no_documents' });
       expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
       expect(documentService.generateAndUpload).not.toHaveBeenCalled();
     });
@@ -889,7 +889,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       await gateway.autoGenerateConversationSummary(client, session);
 
-      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'too_short' });
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'skipped', { skipReason: 'too_short' });
     });
 
     it('still generates a real document for a short conversation instead of skipping it', async () => {
@@ -908,9 +908,9 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       await gateway.autoGenerateConversationSummary(client, session);
 
-      expect(conversationService.setSummaryStatus).not.toHaveBeenCalledWith(session.conversationId, 'skipped', expect.anything());
+      expect(conversationService.setSummaryStatus).not.toHaveBeenCalledWith(session.conversationId, session.userId, 'skipped', expect.anything());
       expect(documentService.generateAndUpload).toHaveBeenCalled();
-      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready', { documentId: 'doc-2' });
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'ready', { documentId: 'doc-2' });
     });
 
     it('omits Action Points entirely when the model omits Follow-up Actions, instead of a placeholder section', async () => {
@@ -951,7 +951,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       await gateway.autoGenerateConversationSummary(client, session);
 
-      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'quota_exceeded' });
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'skipped', { skipReason: 'quota_exceeded' });
     });
 
     it('marks failed with generation_error when the model returns nothing usable', async () => {
@@ -966,7 +966,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       await gateway.autoGenerateConversationSummary(client, session);
 
-      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'failed', { skipReason: 'generation_error' });
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'failed', { skipReason: 'generation_error' });
     });
 
     it('splices a code-built Transcript section after Summary and moves Action Points / Next Steps to the end, landing at exactly 4 sections', async () => {
@@ -1001,7 +1001,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       expect(uploadCall.sections[3].content).toBe('- Do the thing');
 
       expect(usageService.tryConsume).toHaveBeenCalledWith(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
-      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready', { documentId: 'doc-1' });
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'ready', { documentId: 'doc-1' });
       expect(client.emit).toHaveBeenCalledWith('document:ready', expect.objectContaining({ docId: 'doc-1', auto: true }));
 
       // Regression coverage for a real bug: the auto-summary's "ready"
@@ -1061,6 +1061,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         ]);
         expect(conversationService.addSummaryPart).toHaveBeenCalledWith(
           session.conversationId,
+          session.userId,
           expect.objectContaining({ title: 'Q4 Planning' }),
           'm0',
           'm0',
@@ -1076,7 +1077,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
         await gateway.autoGenerateConversationSummary(client, session);
 
-        expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready');
+        expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'ready');
         expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
       });
     });
@@ -1168,7 +1169,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         await expect(gateway.autoGenerateConversationSummary(client, session)).resolves.toBeUndefined();
         await new Promise((r) => setImmediate(r));
 
-        expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'ready', { documentId: 'doc-1' });
+        expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'ready', { documentId: 'doc-1' });
       });
     });
 
@@ -1189,7 +1190,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       await expect(gateway.autoGenerateConversationSummary(client, session)).rejects.toThrow('upload failed');
 
-      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'failed', { skipReason: 'generation_error' });
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'failed', { skipReason: 'generation_error' });
       expect(client.emit).toHaveBeenCalledWith('document:failed', expect.objectContaining({ auto: true }));
     });
   });
@@ -1219,8 +1220,8 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         jest.useRealTimers();
       }
 
-      expect(conversationService.claimSummaryGeneration).toHaveBeenCalledWith(session.conversationId);
-      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, 'skipped', { skipReason: 'tier_no_documents' });
+      expect(conversationService.claimSummaryGeneration).toHaveBeenCalledWith(session.conversationId, session.userId);
+      expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'skipped', { skipReason: 'tier_no_documents' });
       expect(gateway.sessions.has(client.id)).toBe(false);
     });
 
@@ -2217,7 +2218,7 @@ describe('VoiceGateway final-turn persistence barrier', () => {
     await jest.advanceTimersByTimeAsync(21_000);
     expect(finalize).toHaveBeenCalledWith(client, session, { drainComplete: false });
     expect(auto).not.toHaveBeenCalled();
-    expect(conversationService.setSummaryStatus).toHaveBeenCalledWith(session.conversationId, 'failed', { skipReason: 'final_turns_incomplete' });
+    expect(conversationService.setSummaryStatus).toHaveBeenCalledWith(session.conversationId, session.userId, 'failed', { skipReason: 'final_turns_incomplete' });
     expect(finalize).toHaveBeenCalled();
   });
 
