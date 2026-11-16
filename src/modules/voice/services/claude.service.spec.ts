@@ -334,3 +334,64 @@ describe('ClaudeService.generateConversationTitle', () => {
     await expect(service.generateConversationTitle('some user prompt', 'ai response')).rejects.toThrow();
   });
 });
+
+
+describe('ClaudeService summary generation — no silent truncation', () => {
+  const textResponse = (text: string) => ({ content: [{ type: 'text', text }] });
+  const doc = JSON.stringify({ title: 'T', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
+  const withClient = (create: jest.Mock) => {
+    const service = createService() as any;
+    service.client = { messages: { create } };
+    return service;
+  };
+
+  it('sends the WHOLE transcript — the beginning and the end both reach the model (the old code cut at 12,000 characters)', async () => {
+    const create = jest.fn().mockResolvedValue(textResponse(doc));
+    const service = withClient(create);
+    const turns = [
+      { role: 'user', content: 'OPENING-MARKER ' + 'a'.repeat(15_000) },
+      { role: 'assistant', content: 'b'.repeat(15_000) + ' CLOSING-MARKER' },
+    ];
+    expect(await service.generateConversationSummaryDocument(turns, 'Law')).toMatchObject({ title: 'T' });
+    const sent: string = create.mock.calls[0][0].messages[0].content;
+    expect(sent.length).toBeGreaterThan(30_000);
+    expect(sent).toContain('OPENING-MARKER');
+    expect(sent).toContain('CLOSING-MARKER');
+  });
+
+  it('refuses an input beyond the hard limit instead of truncating it (no model call)', async () => {
+    const create = jest.fn();
+    const service = withClient(create);
+    const result = await service.generateConversationSummaryDocument([{ role: 'user', content: 'x'.repeat(81_000) }]);
+    expect(result).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('writes the final summary from ordered notes, labelled as parts of one conversation', async () => {
+    const create = jest.fn().mockResolvedValue(textResponse(doc));
+    const service = withClient(create);
+    await service.generateConversationSummaryFromNotes(['- first topic', '- middle topic', '- last topic'], 'Law');
+    const call = create.mock.calls[0][0];
+    expect(call.messages[0].content).toMatch(/Part 1 of 3:\n- first topic[\s\S]*Part 2 of 3:\n- middle topic[\s\S]*Part 3 of 3:\n- last topic/);
+    expect(call.system).toMatch(/beginning, the middle and the end/);
+    expect(await service.generateConversationSummaryFromNotes([])).toBeNull();
+  });
+
+  describe('summarizeConversationChunk', () => {
+    it('asks for notes on one numbered part and caps the notes at maxChars', async () => {
+      const create = jest.fn().mockResolvedValue(textResponse('- ' + 'n'.repeat(5_000)));
+      const service = withClient(create);
+      const notes = await service.summarizeConversationChunk([{ role: 'user', content: 'hello' }], { index: 2, total: 5 }, undefined, 2_400);
+      expect(notes).toHaveLength(2_400);
+      expect(create.mock.calls[0][0].system).toMatch(/part 2 of 5/);
+      expect(create.mock.calls[0][0].messages[0].content).toContain('Part 2 of 5');
+    });
+
+    it('returns null (never throws) for a non-text answer, an empty answer, or a failed call', async () => {
+      expect(await withClient(jest.fn().mockResolvedValue({ content: [{ type: 'tool_use' }] })).summarizeConversationChunk([{ role: 'user', content: 'x' }], { index: 1, total: 2 }, undefined, 100)).toBeNull();
+      expect(await withClient(jest.fn().mockResolvedValue(textResponse('   '))).summarizeConversationChunk([{ role: 'user', content: 'x' }], { index: 1, total: 2 }, undefined, 100)).toBeNull();
+      expect(await withClient(jest.fn().mockRejectedValue(new Error('rate limited for a@b.com'))).summarizeConversationChunk([{ role: 'user', content: 'x' }], { index: 1, total: 2 }, undefined, 100)).toBeNull();
+      expect(await withClient(jest.fn()).summarizeConversationChunk([], { index: 1, total: 1 }, undefined, 100)).toBeNull();
+    });
+  });
+});

@@ -556,6 +556,125 @@ describe('VoiceGateway auto-generated conversation summary', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
+  describe('complete summary context (nothing dropped, truthful failure)', () => {
+    const entitlementsLocal = { maxDocumentsPerMonth: 10, allowedDocumentDepths: ['brief'] };
+    const longConversation = (n: number, len: number) =>
+      Array.from({ length: n }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `m${i + 1}:`.padEnd(len, 'x') }));
+    const setup = (turns: Array<Record<string, unknown>>) => {
+      const t = createSummaryGateway();
+      withHistory(t.conversationService, turns);
+      t.documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/d' });
+      (t.claudeService as any).summarizeConversationChunk = jest.fn(async (_turns: any[], pos: { index: number }) => `notes-${pos.index}`);
+      (t.claudeService as any).generateConversationSummaryFromNotes = jest.fn().mockResolvedValue({ title: 'Whole', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
+      t.claudeService.generateConversationSummaryDocument.mockResolvedValue({ title: 'Single', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
+      return { ...t, client: createFakeClient('sock-1'), session: createFakeSession({ entitlements: entitlementsLocal }) };
+    };
+    const statusCalls = (cs: any) => cs.setSummaryStatus.mock.calls.map((c: any[]) => [c[1], c[2]?.skipReason ?? null]);
+
+    it('a conversation past the old 80-message / 12,000-character limits is summarised from ALL of it: ordered chunks, then one write-up from every chunk\'s notes', async () => {
+      const turns = longConversation(300, 200); // 300 messages, 60k chars
+      const { gateway, conversationService, claudeService, documentService, client, session } = setup(turns);
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      const chunkCalls = (claudeService as any).summarizeConversationChunk.mock.calls;
+      expect(chunkCalls.length).toBeGreaterThan(4);
+      expect(chunkCalls.map((c: any[]) => c[1])).toEqual(chunkCalls.map((_: unknown, i: number) => ({ index: i + 1, total: chunkCalls.length })));
+      const sent = chunkCalls.flatMap((c: any[]) => c[0].map((t: any) => t.content));
+      expect(sent).toEqual(turns.map((t) => t.content)); // every message, in order — beginning to end
+      expect((claudeService as any).generateConversationSummaryFromNotes.mock.calls[0][0]).toEqual(chunkCalls.map((_: unknown, i: number) => `notes-${i + 1}`));
+      expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
+
+      // the recorded coverage is the WHOLE range, and the stored transcript section has both ends
+      expect(conversationService.addSummaryPart).toHaveBeenCalledWith(session.conversationId, expect.anything(), 'm0', 'm299');
+      const sections = documentService.generateAndUpload.mock.calls[0][0].sections;
+      const transcript = sections.find((x: any) => x.heading === 'Transcript').content;
+      expect(transcript).toContain('m1:');
+      expect(transcript).toContain('m300:');
+      expect(statusCalls(conversationService).at(-1)).toEqual(['ready', null]);
+    });
+
+    it('a mid-size conversation (200 short messages) is one call with every message — the old 80-message cut is gone', async () => {
+      const turns = longConversation(200, 100);
+      const { gateway, claudeService, client, session } = setup(turns);
+      await gateway.autoGenerateConversationSummary(client, session);
+      expect(claudeService.generateConversationSummaryDocument).toHaveBeenCalledTimes(1);
+      expect(claudeService.generateConversationSummaryDocument.mock.calls[0][0]).toHaveLength(200);
+      expect((claudeService as any).summarizeConversationChunk).not.toHaveBeenCalled();
+    });
+
+    it('past the hard bound: no model work, no summary, nothing recorded as covered — a truthful failure with a reason code', async () => {
+      const turns = longConversation(2_000, 200); // 400k chars
+      const { gateway, conversationService, claudeService, documentService, client, session } = setup(turns);
+      await gateway.autoGenerateConversationSummary(client, session);
+
+      expect((claudeService as any).summarizeConversationChunk).not.toHaveBeenCalled();
+      expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
+      expect(documentService.generateAndUpload).not.toHaveBeenCalled();
+      expect(conversationService.addSummaryPart).not.toHaveBeenCalled();
+      expect(statusCalls(conversationService).at(-1)).toEqual(['failed', 'context_too_large']);
+      expect(client.emit).toHaveBeenCalledWith('document:failed', expect.objectContaining({ reasonCode: 'context_too_large', auto: true }));
+      // the source conversation is untouched
+      expect(conversationService.saveMessage).not.toHaveBeenCalled();
+    });
+
+    it('if any chunk cannot be condensed the whole summary fails — it never writes one that skips that part', async () => {
+      const { gateway, conversationService, claudeService, documentService, client, session } = setup(longConversation(300, 200));
+      (claudeService as any).summarizeConversationChunk = jest.fn(async (_t: any[], pos: { index: number }) => (pos.index === 3 ? null : `notes-${pos.index}`));
+      await gateway.autoGenerateConversationSummary(client, session);
+      expect((claudeService as any).summarizeConversationChunk).toHaveBeenCalledTimes(3); // stops at the failure
+      expect((claudeService as any).generateConversationSummaryFromNotes).not.toHaveBeenCalled();
+      expect(documentService.generateAndUpload).not.toHaveBeenCalled();
+      expect(conversationService.addSummaryPart).not.toHaveBeenCalled();
+      expect(statusCalls(conversationService).at(-1)).toEqual(['failed', 'generation_error']);
+    });
+
+    it('a failing final write-up fails the summary and records no coverage', async () => {
+      const { gateway, conversationService, claudeService, client, session } = setup(longConversation(300, 200));
+      (claudeService as any).generateConversationSummaryFromNotes = jest.fn().mockResolvedValue(null);
+      await gateway.autoGenerateConversationSummary(client, session);
+      expect(conversationService.addSummaryPart).not.toHaveBeenCalled();
+      expect(statusCalls(conversationService).at(-1)).toEqual(['failed', 'generation_error']);
+    });
+
+    describe('bounded model work', () => {
+      afterEach(() => jest.useRealTimers());
+
+      it('a model step that never answers times out (90s) instead of hanging the summary', async () => {
+        jest.useFakeTimers();
+        const { gateway, conversationService, claudeService, client, session } = setup(longConversation(300, 200));
+        (claudeService as any).summarizeConversationChunk = jest.fn(() => new Promise(() => undefined));
+        const running = gateway.autoGenerateConversationSummary(client, session);
+        await jest.advanceTimersByTimeAsync(91_000);
+        await running;
+        expect(statusCalls(conversationService).at(-1)).toEqual(['failed', 'generation_timeout']);
+        expect(conversationService.addSummaryPart).not.toHaveBeenCalled();
+      });
+
+      it('the whole job has a total budget (6 min) even when every step is individually within its own limit', async () => {
+        jest.useFakeTimers();
+        const { gateway, conversationService, claudeService, client, session } = setup(longConversation(300, 200));
+        (claudeService as any).summarizeConversationChunk = jest.fn(async (_t: any[], pos: { index: number }) => {
+          await new Promise((r) => setTimeout(r, 80_000)); // slow but under the 90s step limit
+          return `notes-${pos.index}`;
+        });
+        const running = gateway.autoGenerateConversationSummary(client, session);
+        await jest.advanceTimersByTimeAsync(7 * 60_000);
+        await running;
+        expect((claudeService as any).summarizeConversationChunk.mock.calls.length).toBeLessThan(8);
+        expect(statusCalls(conversationService).at(-1)).toEqual(['failed', 'generation_timeout']);
+      });
+    });
+
+    it('the lifecycle log for the summary carries counts only — never message text', async () => {
+      const log = jest.spyOn(Logger.prototype, 'log');
+      const { gateway, client, session } = setup(longConversation(300, 200));
+      await gateway.autoGenerateConversationSummary(client, session);
+      const line = log.mock.calls.map((c) => String(c[0])).find((l) => l.includes('event=summary_context')) as string;
+      expect(line).toMatch(/outcome=ok kind=chunked messages=300 chars=60000 chunks=\d+/);
+      expect(line).not.toMatch(/m1:x|xxxx/);
+    });
+  });
+
   describe('summary email outcome (coarse status only)', () => {
     const ADDRESS = 'owner.sentinel@example.com';
     const summary = { title: 'Budget Review', sections: [{ heading: 'Summary', content: 'PRIVATE-SUMMARY-CONTENT' }] };

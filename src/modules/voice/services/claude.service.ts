@@ -133,6 +133,9 @@ const GENERATE_DOCUMENT_TOOL: Anthropic.Tool = {
 
 @Injectable()
 export class ClaudeService implements OnModuleInit {
+  /** A summary request larger than this is refused, never truncated (callers keep inputs well under it). */
+  static readonly SUMMARY_INPUT_HARD_LIMIT_CHARS = 80_000;
+
   private readonly logger = new Logger(ClaudeService.name);
   private client: Anthropic;
   private tavilyClient: ReturnType<typeof tavily> | null = null;
@@ -986,8 +989,77 @@ No intro sentence. No headers. Just bullets.`;
 
     const transcript = conversationHistory
       .map((m) => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`)
-      .join('\n')
-      .slice(0, 12000); // bounds token cost on very long conversations
+      .join('\n');
+    return this.requestSummaryDocument(`Transcript:\n${transcript}`, 'transcript', fieldName);
+  }
+
+  /**
+   * Writes the final summary from ORDERED notes of consecutive parts of one long
+   * conversation (see summary-context.util.ts) — so the beginning, middle and end are all
+   * represented. Same output contract as generateConversationSummaryDocument.
+   */
+  async generateConversationSummaryFromNotes(
+    notes: string[],
+    fieldName?: string,
+  ): Promise<{ title: string; topic: string; sections: Array<{ heading: string; content: string }> } | null> {
+    if (notes.length === 0) return null;
+    const body = notes.map((n, i) => `Part ${i + 1} of ${notes.length}:\n${n}`).join('\n\n');
+    return this.requestSummaryDocument(
+      `Chronological notes from ${notes.length} consecutive parts of one conversation (earliest first):\n${body}`,
+      'notes',
+      fieldName,
+    );
+  }
+
+  /**
+   * Condenses ONE ordered chunk of a long conversation into faithful notes. Returns null
+   * (never throws) on anything unusable — the caller then fails the summary truthfully
+   * instead of writing one that silently skips this part.
+   */
+  async summarizeConversationChunk(
+    turns: ConversationTurn[],
+    position: { index: number; total: number },
+    fieldName: string | undefined,
+    maxChars: number,
+  ): Promise<string | null> {
+    if (turns.length === 0) return null;
+    const transcript = turns.map((m) => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`).join('\n');
+    try {
+      const response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 700,
+        system:
+          `You condense one part of a longer conversation with an AI assistant${fieldName ? ` specialising in ${fieldName}` : ''} into faithful notes ` +
+          `that will later be combined with notes from the other parts. This is part ${position.index} of ${position.total}. ` +
+          `Write "- " bullet lines in the order things were said: topics, decisions, figures, names, open questions, commitments. ` +
+          `Be concise (under ${Math.round(maxChars / 7)} words). Base everything strictly on the text; never invent facts, names or numbers. ` +
+          `Output only the bullet lines.`,
+        messages: [{ role: 'user', content: `Part ${position.index} of ${position.total}:\n${transcript}` }],
+      });
+      const block = response.content[0];
+      if (block.type !== 'text') return null;
+      const notes = block.text.trim();
+      return notes ? notes.slice(0, maxChars) : null;
+    } catch (err) {
+      this.logger.warn(`summarizeConversationChunk failed: ${describeError(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Shared JSON-summary request. NOTE: there is deliberately no character cut here — the
+   * caller (summary-context.util.ts) guarantees the input fits, and an oversized input is
+   * refused rather than silently truncated.
+   */
+  private async requestSummaryDocument(
+    userContent: string,
+    kind: 'transcript' | 'notes',
+    fieldName?: string,
+  ): Promise<{ title: string; topic: string; sections: Array<{ heading: string; content: string }> } | null> {
+    if (userContent.length > ClaudeService.SUMMARY_INPUT_HARD_LIMIT_CHARS) {
+      this.logger.warn(`generateConversationSummaryDocument: input too large (${userContent.length} chars) — refusing instead of truncating`);
+      return null;
+    }
 
     const system = `You write a structured recap of a just-finished conversation with an AI assistant${fieldName ? ` specialising in ${fieldName}` : ''}. Output ONLY valid JSON, nothing else — no markdown fences, no commentary before or after:
 {"title": "<= 8 words, specific to what was actually discussed", "topic": "one sentence topic", "sections": [{"heading": "Summary", "content": "..."}, {"heading": "Key Insights", "content": "..."}, {"heading": "Follow-up Actions", "content": "..."}]}
@@ -997,14 +1069,14 @@ Rules:
 - "Key Insights" is OPTIONAL — include it ONLY when there are genuine non-obvious takeaways or conclusions reached, as "- " bullet lines within the content string, ordered by when each was raised (earliest first). If the conversation was too short/shallow for real insights, OMIT this section from the "sections" array entirely — do not include it with a placeholder like "Nothing notable surfaced."
 - "Follow-up Actions" is OPTIONAL — include it ONLY when there are concrete, actionable next steps genuinely implied by the conversation, as "- " bullet lines, ordered by when they came up (earliest first). If none, OMIT this section from the "sections" array entirely — do not include it with a placeholder like "No specific follow-up actions were identified."
 - A short or purely informational conversation (a quick question and answer, small talk, a single lookup) is expected to produce ONLY a "Summary" section — that is a correct, complete result, not a failure.
-- Base everything strictly on the transcript below. Never invent facts, names, or numbers not present in it.`;
+- Base everything strictly on the ${kind === 'notes' ? 'notes' : 'transcript'} below. Never invent facts, names, or numbers not present in it.${kind === 'notes' ? ' The notes cover the whole conversation in order: represent the beginning, the middle and the end, not only the most recent part.' : ''}`;
 
     try {
       const response = await this.client.messages.create({
         model: this.model,
         max_tokens: 1200,
         system,
-        messages: [{ role: 'user', content: `Transcript:\n${transcript}` }],
+        messages: [{ role: 'user', content: userContent }],
       });
 
       const block = response.content[0];
@@ -1020,7 +1092,7 @@ Rules:
 
       return { title: parsed.title, topic: parsed.topic ?? '', sections: parsed.sections };
     } catch (err) {
-      this.logger.warn(`generateConversationSummaryDocument failed: ${(err as Error).message}`);
+      this.logger.warn(`generateConversationSummaryDocument failed: ${describeError(err)}`);
       return null;
     }
   }

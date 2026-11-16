@@ -39,6 +39,7 @@ import { UsageService } from '@/modules/entitlements/usage.service';
 import { RecordingTimingService } from './services/recording-timing.service';
 import { countWords, describeError } from '@/common/utils/log-safe.util';
 import { SummaryEmailReason, classifyEmailError } from './utils/summary-email-status.util';
+import { ContextCoverage, ContextPlan, SUMMARY_CONTEXT_BOUNDS, planSummaryContext, raceDeadline } from './utils/summary-context.util';
 import {
   AudioLossReason,
   SessionCorrelation,
@@ -279,6 +280,13 @@ const UNATTRIBUTED_SPEAKER_LABEL = 'Unknown speaker';
 
 /** Upper bound Stop waits for an AI turn that is already being processed. */
 const IN_FLIGHT_TURN_WAIT_MS = 20_000;
+type SummaryFailureReason = 'context_too_large' | 'generation_timeout' | 'generation_error';
+const SUMMARY_FAILURE_MESSAGES: Record<SummaryFailureReason, string> = {
+  context_too_large: 'This conversation is too long to summarise automatically.',
+  generation_timeout: 'Summary generation took too long. It will be retried the next time you stop this conversation.',
+  generation_error: "We couldn't generate your conversation summary.",
+};
+
 /** Safety cap on wait→flush→wait rounds at one stop boundary. */
 const MAX_DRAIN_PASSES = 4;
 
@@ -2275,11 +2283,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // conversation gets a new part appended to the earlier ones instead of a
     // from-scratch re-summary of everything.
     const newMessages = await this.conversationService.getUnsummarizedMessages(session.conversationId);
-    const history = newMessages
-      .filter((m) => (m.content ?? '').trim())
-      .slice(-80)
-      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
-    if (history.length === 0) {
+    // Complete context: nothing is dropped. Short conversations go to the model in one
+    // call; longer ones are condensed in ordered chunks and summarised from all the notes;
+    // past the hard bound the summary fails truthfully (see buildInsightSummary).
+    const plan = planSummaryContext(newMessages.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content })));
+    if (plan.kind === 'empty') {
       // Nothing new to summarise. If an earlier part exists, the conversation's
       // summary is still current — restore 'ready' rather than 'skipped'.
       const priorParts = await this.conversationService.getSummaryParts(session.conversationId);
@@ -2304,11 +2312,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     const transcript = this.buildVerbatimTranscript(newMessages, session);
 
-    const summary = await this.claudeService.generateConversationSummaryDocument(history, session.fieldName);
-    if (!summary) {
-      await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: 'generation_error' });
+    const built = await this.buildInsightSummary(session, plan);
+    if (!built.ok) {
+      // Truthful failure: no summary is written (or recorded as covering anything), the stored
+      // messages are untouched, and the next resume + stop re-claims (failed is claimable).
+      await this.conversationService.setSummaryStatus(session.conversationId, 'failed', { skipReason: built.reason });
+      client.emit('document:failed', { title: 'Conversation summary', reason: SUMMARY_FAILURE_MESSAGES[built.reason], reasonCode: built.reason, auto: true });
       return;
     }
+    const summary = built.summary;
 
     // Code-built from the stored transcript, not model output — guarantees
     // the "word for word, who said what" section can't be paraphrased or
@@ -2413,6 +2425,79 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       client.emit('document:failed', { title: combined.title, reason: "We couldn't generate your conversation summary.", auto: true });
       throw err;
     }
+  }
+
+  /**
+   * Turns the planned context into the structured summary using bounded model work:
+   * every step has a timeout, the whole job has a total budget, and any step that fails
+   * fails the whole summary — it never writes one that skips a part of the conversation.
+   * Logs counts only (no content).
+   */
+  private async buildInsightSummary(
+    session: ActiveSession,
+    plan: ContextPlan,
+  ): Promise<
+    | { ok: true; summary: { title: string; topic: string; sections: Array<{ heading: string; content: string }> }; coverage: ContextCoverage }
+    | { ok: false; reason: SummaryFailureReason }
+  > {
+    const startedAt = Date.now();
+    const finish = (outcome: string, extra: Record<string, number> = {}) =>
+      this.logLifecycle(session, 'summary_context', {
+        outcome,
+        kind: plan.kind,
+        messages: plan.coverage.messageCount,
+        chars: plan.coverage.charCount,
+        chunks: plan.coverage.chunkCount,
+        elapsedMs: Date.now() - startedAt,
+        ...extra,
+      });
+
+    if (plan.kind === 'too_large') {
+      finish('context_too_large', { maxChars: plan.maxChars });
+      return { ok: false, reason: 'context_too_large' };
+    }
+    if (plan.kind === 'empty') return { ok: false, reason: 'generation_error' };
+
+    const step = async <T>(fn: () => Promise<T | null>): Promise<T | 'timeout' | null> => {
+      const remaining = SUMMARY_CONTEXT_BOUNDS.TOTAL_TIMEOUT_MS - (Date.now() - startedAt);
+      if (remaining <= 0) return 'timeout';
+      try {
+        const r = await raceDeadline(fn(), Math.min(SUMMARY_CONTEXT_BOUNDS.STEP_TIMEOUT_MS, remaining));
+        return r.timedOut ? 'timeout' : r.value;
+      } catch {
+        return null;
+      }
+    };
+    const fail = (reason: SummaryFailureReason) => {
+      finish(reason);
+      return { ok: false as const, reason };
+    };
+
+    let summary: { title: string; topic: string; sections: Array<{ heading: string; content: string }> } | 'timeout' | null;
+    if (plan.kind === 'single') {
+      summary = await step(() => this.claudeService.generateConversationSummaryDocument(plan.turns, session.fieldName));
+    } else {
+      const notes: string[] = [];
+      for (const chunk of plan.chunks) {
+        const result = await step(() =>
+          this.claudeService.summarizeConversationChunk(
+            chunk.turns,
+            { index: chunk.index, total: plan.chunks.length },
+            session.fieldName,
+            SUMMARY_CONTEXT_BOUNDS.NOTES_MAX_CHARS,
+          ),
+        );
+        if (result === 'timeout') return fail('generation_timeout');
+        if (!result) return fail('generation_error');
+        notes.push(result);
+      }
+      summary = await step(() => this.claudeService.generateConversationSummaryFromNotes(notes, session.fieldName));
+    }
+
+    if (summary === 'timeout') return fail('generation_timeout');
+    if (!summary) return fail('generation_error');
+    finish('ok');
+    return { ok: true, summary, coverage: plan.coverage };
   }
 
   /**
