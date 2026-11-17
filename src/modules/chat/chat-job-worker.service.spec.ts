@@ -27,7 +27,9 @@ function createFakeConversationService() {
   return {
     getRecentHistoryForAI: jest.fn().mockResolvedValue([]),
     getFullDocumentContext: jest.fn().mockResolvedValue(null),
-    getConversationImagesForAI: jest.fn().mockResolvedValue([]),
+    getPendingImagesForAI: jest.fn().mockResolvedValue([]),
+    getAnalysedImageNames: jest.fn().mockResolvedValue([]),
+    markImagesSentToAi: jest.fn().mockResolvedValue(0),
     saveMessage: jest.fn().mockResolvedValue({ id: 'resp-msg-1' }),
   } as any;
 }
@@ -160,5 +162,47 @@ describe('ChatJobWorkerService.processJob — conversation field context', () =>
     const { claudeService, fieldsService } = await run({ ...baseConversation, field_id: null }, null);
     expect(fieldsService.findFieldRecordForUser).not.toHaveBeenCalled();
     expect(claudeService.buildSystemPrompt.mock.calls[0][0]).toBeUndefined();
+  });
+});
+
+
+describe('ChatJobWorkerService.processJob — images are analysed once', () => {
+  const dbImage = (id: string, filename: string) => ({ id, filename, mime_type: 'image/png', image_base64: `B64-${id}` });
+  const run = async (opts: { pending: any[]; prior: string[]; fail?: boolean }) => {
+    const { knexLike } = createFakeKnex({ job: baseJob, requestMessage: baseRequestMessage, conversation: baseConversation });
+    const conversationService = createFakeConversationService();
+    conversationService.getPendingImagesForAI.mockResolvedValue(opts.pending);
+    conversationService.getAnalysedImageNames.mockResolvedValue(opts.prior);
+    const claudeService: any = {
+      buildSystemPrompt: jest.fn().mockReturnValue('system prompt'),
+      streamResponse: jest.fn((_m: string, _h: unknown, _s: string, cb: any) => {
+        if (opts.fail) cb.onError(new Error('model down')); else cb.onDone('Insights.', 1, 1);
+        return Promise.resolve();
+      }),
+    };
+    const { usersService, fieldsService, settingsService, configService } = createFakeAncillaryServices();
+    const worker = new ChatJobWorkerService(knexLike, conversationService, claudeService, usersService, fieldsService, settingsService, configService);
+    await (worker as any).processJob('job-1');
+    return { claudeService, conversationService };
+  };
+
+  it('attaches only the pending image, names the earlier one, and marks the new one analysed after the response is saved', async () => {
+    const { claudeService, conversationService } = await run({ pending: [dbImage('img-B', 'payment.png')], prior: ['invitation.jpg'] });
+    const options = claudeService.streamResponse.mock.calls[0][4];
+    expect(options.images).toEqual([{ mimeType: 'image/png', imageBase64: 'B64-img-B', filename: 'payment.png' }]);
+    expect(options.priorImageNames).toEqual(['invitation.jpg']);
+    expect(conversationService.saveMessage).toHaveBeenCalled();
+    expect(conversationService.markImagesSentToAi).toHaveBeenCalledWith('conv-1', 'user-1', ['img-B']);
+  });
+
+  it('a failed model call leaves the image pending (it is retried with the job) — never marked analysed', async () => {
+    const { conversationService } = await run({ pending: [dbImage('img-B', 'payment.png')], prior: [], fail: true });
+    expect(conversationService.markImagesSentToAi).not.toHaveBeenCalled();
+  });
+
+  it('no pending images → nothing attached or marked', async () => {
+    const { claudeService, conversationService } = await run({ pending: [], prior: ['invitation.jpg'] });
+    expect(claudeService.streamResponse.mock.calls[0][4].images).toEqual([]);
+    expect(conversationService.markImagesSentToAi).not.toHaveBeenCalled();
   });
 });

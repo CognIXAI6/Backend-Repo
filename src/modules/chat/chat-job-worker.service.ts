@@ -12,6 +12,7 @@ import { FieldsService } from '../fields/fields.service';
 import { SettingsService } from '../settings/settings.service';
 import { computeBackoffDelayMs } from '../voice/utils/backoff.util';
 import { buildEmptyResponseFallback } from '../voice/constants/fallback-messages.constant';
+import { describeError } from '@/common/utils/log-safe.util';
 
 /**
  * Minimal polling worker for ai_response_jobs, created for the durable chat
@@ -104,9 +105,11 @@ export class ChatJobWorkerService {
         conversation.field_id ? this.fieldsService.findFieldRecordForUser(userId, conversation.field_id) : Promise.resolve(null),
         this.conversationService.getRecentHistoryForAI(job.conversation_id, userId, 40),
         this.conversationService.getFullDocumentContext(job.conversation_id, userId).catch(() => null),
-        this.conversationService.getConversationImagesForAI(job.conversation_id, userId).catch(() => []),
+        this.conversationService.getPendingImagesForAI(job.conversation_id, userId).catch(() => []),
         this.settingsService.getEffectiveLanguage(userId),
       ]);
+      // Images are analysed once (see ConversationService.getPendingImagesForAI); earlier ones are named only.
+      const priorImageNames: string[] = await this.conversationService.getAnalysedImageNames(job.conversation_id, userId).catch(() => []);
 
       const visionImages: ClaudeConversationImage[] = images.map((img) => ({
         mimeType: img.mime_type as ClaudeConversationImage['mimeType'],
@@ -151,7 +154,7 @@ export class ChatJobWorkerService {
               },
               onError: (err) => reject(err),
             },
-            { enableWebSearch: false, enableDocumentGeneration: false, images: visionImages },
+            { enableWebSearch: false, enableDocumentGeneration: false, images: visionImages, priorImageNames: priorImageNames.length > 0 ? priorImageNames : undefined },
           )
           .catch(reject);
       });
@@ -165,6 +168,13 @@ export class ChatJobWorkerService {
         latencyMs: Date.now() - startedAt,
         deliverySource: 'text',
       });
+
+      // The response that analysed these images is saved: don't re-attach them to later turns.
+      if (images.length > 0) {
+        await this.conversationService
+          .markImagesSentToAi(job.conversation_id, userId, images.map((img) => img.id))
+          .catch((err) => this.logger.warn(`Could not mark images analysed: ${describeError(err)}`));
+      }
 
       await this.knex('ai_response_jobs')
         .where('id', jobId)

@@ -1125,12 +1125,43 @@ export class ConversationService {
   }
 
   /**
-   * Returns all images attached to a conversation, so they stay in context for
-   * the lifetime of the conversation — the same treatment as attached documents.
+   * The images that have NOT yet been sent to the model (`sent_to_ai = false`), oldest first, capped.
+   * Each uploaded image is analysed on the next AI call and then marked sent (see markImagesSentToAi) —
+   * it is not re-attached to every later call. Re-sending every earlier image made a new upload get
+   * "merged" with the previous ones: the model saw all of them next to a prompt about "the attached file".
+   * (Images beyond the cap simply stay pending for the following call.)
    */
-  async getConversationImagesForAI(conversationId: string, userId: string): Promise<ConversationImage[]> {
-    return this.whereConversationOwnedBy(this.knex('conversation_images').where('conversation_id', conversationId), 'conversation_images', userId)
-      .orderBy('created_at', 'asc');
+  async getPendingImagesForAI(conversationId: string, userId: string, limit = 6): Promise<ConversationImage[]> {
+    return this.whereConversationOwnedBy(
+      this.knex('conversation_images').where({ conversation_id: conversationId, sent_to_ai: false }),
+      'conversation_images',
+      userId,
+    )
+      .orderBy('created_at', 'asc')
+      .limit(limit);
+  }
+
+  /** File names of images already analysed in this conversation (names only — never re-attached). */
+  async getAnalysedImageNames(conversationId: string, userId: string, limit = 20): Promise<string[]> {
+    const rows = await this.whereConversationOwnedBy(
+      this.knex('conversation_images').where({ conversation_id: conversationId, sent_to_ai: true }),
+      'conversation_images',
+      userId,
+    )
+      .orderBy('created_at', 'desc')
+      .limit(limit)
+      .select('filename');
+    return (rows as Array<{ filename: string }>).map((r) => r.filename).reverse();
+  }
+
+  /** Marks images as analysed once an AI response that included them has completed. Owner's images only. */
+  async markImagesSentToAi(conversationId: string, userId: string, imageIds: string[]): Promise<number> {
+    if (imageIds.length === 0) return 0;
+    return this.whereConversationOwnedBy(
+      this.knex('conversation_images').where('conversation_id', conversationId).whereIn('id', imageIds),
+      'conversation_images',
+      userId,
+    ).update({ sent_to_ai: true });
   }
 
   /** Lists all images ever attached to a conversation (for display purposes). */

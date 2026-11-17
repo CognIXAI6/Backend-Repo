@@ -133,6 +133,11 @@ const GENERATE_DOCUMENT_TOOL: Anthropic.Tool = {
 
 @Injectable()
 export class ClaudeService implements OnModuleInit {
+  /** A file name made safe to quote in a prompt: no control characters/quotes, capped. */
+  static safeFileLabel(name: string | null | undefined): string {
+    return String(name ?? 'file').replace(/[\u0000-\u001f\u007f"]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || 'file';
+  }
+
   /** A summary request larger than this is refused, never truncated (callers keep inputs well under it). */
   static readonly SUMMARY_INPUT_HARD_LIMIT_CHARS = 80_000;
 
@@ -182,8 +187,10 @@ export class ClaudeService implements OnModuleInit {
       enableWebSearch?: boolean;
       enableDocumentGeneration?: boolean;
       maxTokens?: number;
-      /** Images attached to the conversation, included on every call. */
+      /** Images being analysed on THIS call (newly attached, not yet sent) — each is labelled by file name. */
       images?: ConversationImage[];
+      /** File names of images already analysed earlier in this conversation; listed as text only, never re-attached. */
+      priorImageNames?: string[];
       /**
        * Set when web search is offered (enableWebSearch: true) but this
        * user/turn can't actually use it right now — plan exclusion or
@@ -227,7 +234,10 @@ export class ClaudeService implements OnModuleInit {
     const safeUserMessage = userMessage.trim() ? userMessage : '…';
     const userContent: Anthropic.ContentBlockParam[] = [];
     if (options.images?.length) {
-      for (const img of options.images) {
+      const total = options.images.length;
+      options.images.forEach((img, idx) => {
+        // Label every image so the model can tell separate files apart and answer about each on its own.
+        userContent.push({ type: 'text', text: `Attached file ${idx + 1} of ${total}: "${ClaudeService.safeFileLabel(img.filename)}"` });
         userContent.push({
           type: 'image',
           source: {
@@ -236,7 +246,12 @@ export class ClaudeService implements OnModuleInit {
             data: img.imageBase64,
           },
         } as Anthropic.ImageBlockParam);
-      }
+      });
+    }
+    if (options.priorImageNames?.length) {
+      // Names only: the earlier images were analysed in earlier turns (their insights are in the history above).
+      const names = options.priorImageNames.map((n) => `"${ClaudeService.safeFileLabel(n)}"`).join(', ');
+      userContent.push({ type: 'text', text: `(Files attached earlier in this conversation and already analysed — not re-attached: ${names}.)` });
     }
     userContent.push({ type: 'text', text: safeUserMessage });
 
@@ -627,6 +642,12 @@ Always use this date as ground truth when asked about the current date, time, da
 - No introductions, no conclusions, no filler phrases
 - No paragraphs — bullets only
 - If referencing a verse, article, or document: one bullet with a markdown link [Title](URL), no quoting
+
+## ATTACHED FILES — ONE AT A TIME
+- Treat every attached image or document as its own separate item, even when several have been shared in this conversation.
+- When asked about a newly attached file, give insights about THAT file only. Never combine it with earlier attachments.
+- Only compare or combine files when the user explicitly asks you to.
+- If you cannot tell which file a question is about, ask which one the user means.
 
 ## HANDLING UNCLEAR OR AMBIGUOUS INPUT — MANDATORY
 If you cannot understand what the user asked, you MUST still respond. NEVER return an empty or silent response.

@@ -63,7 +63,7 @@ d('conversation ownership (real Postgres)', () => {
       expect(await svc.getConversationParticipants(conv, owner)).toHaveLength(1);
       expect(await svc.listConversationDocuments(conv, owner)).toHaveLength(1);
       expect(await svc.listConversationImages(conv, owner)).toHaveLength(1);
-      expect(await svc.getConversationImagesForAI(conv, owner)).toHaveLength(1);
+      expect(await svc.getPendingImagesForAI(conv, owner)).toHaveLength(1);
 
       // …another user sees nothing, and nothing says whether the id exists
       expect(await svc.getConversationFieldId(conv, other)).toBeNull();
@@ -74,7 +74,9 @@ d('conversation ownership (real Postgres)', () => {
       expect(await svc.getConversationParticipants(conv, other)).toEqual([]);
       expect(await svc.listConversationDocuments(conv, other)).toEqual([]);
       expect(await svc.listConversationImages(conv, other)).toEqual([]);
-      expect(await svc.getConversationImagesForAI(conv, other)).toEqual([]);
+      expect(await svc.getPendingImagesForAI(conv, other)).toEqual([]);
+      expect(await svc.getAnalysedImageNames(conv, other)).toEqual([]);
+      expect(await svc.markImagesSentToAi(conv, other, [])).toBe(0);
       expect(await svc.getConversationFieldId('00000000-0000-0000-0000-000000000000', other)).toBeNull(); // same as a nonexistent id
     });
   });

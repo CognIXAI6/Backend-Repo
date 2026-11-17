@@ -3204,14 +3204,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         outputLanguage,
       );
 
-      // Load all images attached to this conversation — passed as image content
-      // blocks on every AI call so the AI can still answer questions about an
-      // image several messages after it was uploaded.
-      const conversationImages = await this.conversationService
-        .getConversationImagesForAI(session.conversationId, session.userId)
-        .catch(() => [] as DbConversationImage[]);
+      // Images are analysed ONCE: only those not yet sent are attached to this call (each labelled by
+      // file name), then marked sent after the response completes. Earlier ones are listed by name only,
+      // so a new upload is never merged with a previous one.
+      const [pendingImages, priorImageNames] = await Promise.all([
+        this.conversationService
+          .getPendingImagesForAI(session.conversationId, session.userId)
+          .catch(() => [] as DbConversationImage[]),
+        this.conversationService
+          .getAnalysedImageNames(session.conversationId, session.userId)
+          .catch(() => [] as string[]),
+      ]);
+      const pendingImageIds = pendingImages.map((img) => img.id);
 
-      const visionImages: ClaudeConversationImage[] = conversationImages.map((img) => ({
+      const visionImages: ClaudeConversationImage[] = pendingImages.map((img) => ({
         mimeType: img.mime_type as ClaudeConversationImage['mimeType'],
         imageBase64: img.image_base64,
         filename: img.filename,
@@ -3253,6 +3259,12 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           },
 
           onDone: async (fullText: string, inputTokens: number, outputTokens: number, webSearchCalls = 0) => {
+          // The images attached to THIS call have now been analysed — don't re-attach them to later calls.
+          if (pendingImageIds.length > 0) {
+            this.conversationService
+              .markImagesSentToAi(session.conversationId, session.userId, pendingImageIds)
+              .catch((err) => this.logger.warn(`Could not mark images analysed (trace=${session.traceId}): ${describeError(err)}`));
+          }
             // Safety net: if Claude returned nothing (rare but possible with very garbled
             // or ambiguous input), synthesise a clarification response so the user is
             // never left staring at a blank screen. Emit it as a token first so the
@@ -3436,6 +3448,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           enableDocumentGeneration: documentGenerationEnabled,
           // Include every image attached to this conversation on every call.
           images: visionImages.length > 0 ? visionImages : undefined,
+          priorImageNames: priorImageNames.length > 0 ? priorImageNames : undefined,
         },
       );
     } catch (err) {

@@ -504,7 +504,9 @@ describe('VoiceGateway processPrompt — blocked web search signal', () => {
       getRecentHistoryForAI: jest.fn().mockResolvedValue([]),
       saveMessage: jest.fn().mockResolvedValue(undefined),
       getFullDocumentContext: jest.fn().mockResolvedValue(null),
-      getConversationImagesForAI: jest.fn().mockResolvedValue([]),
+      getPendingImagesForAI: jest.fn().mockResolvedValue([]),
+      getAnalysedImageNames: jest.fn().mockResolvedValue([]),
+      markImagesSentToAi: jest.fn().mockResolvedValue(0),
       setTitle: jest.fn().mockResolvedValue(false),
     };
     const usageService = {
@@ -3234,5 +3236,62 @@ describe('VoiceGateway turns:settled (the reliable completion signal for audio:s
     const { gateway, client } = build({ accumulatedTranscript: '' });
     await gateway.handleAudioStop(client);
     expect(Object.keys(settled(client)[0]).sort()).toEqual(['acceptedTurns', 'complete', 'correlation', 'reason', 'recordingId', 'settledTurns']);
+  });
+});
+
+
+describe('VoiceGateway image handling: each upload is analysed once, never merged with an earlier one', () => {
+  beforeEach(() => ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined)));
+  afterEach(() => jest.restoreAllMocks());
+
+  const dbImage = (id: string, filename: string) => ({ id, filename, mime_type: 'image/jpeg', image_base64: `B64-${id}` });
+  const build = (pending: any[], prior: string[]) => {
+    const conversationService: any = {
+      getPendingImagesForAI: jest.fn().mockResolvedValue(pending),
+      getAnalysedImageNames: jest.fn().mockResolvedValue(prior),
+      markImagesSentToAi: jest.fn().mockResolvedValue(pending.length),
+      getRecentHistoryForAI: jest.fn().mockResolvedValue([]),
+      getFullDocumentContext: jest.fn().mockResolvedValue(null),
+      saveMessage: jest.fn().mockResolvedValue({ id: 'm' }),
+      getConversationTitle: jest.fn().mockResolvedValue(null),
+      setTitle: jest.fn().mockResolvedValue(false),
+    };
+    let streamOptions: any;
+    let finish: (() => Promise<void>) | undefined;
+    const claudeService: any = {
+      buildSystemPrompt: jest.fn().mockReturnValue('SYSTEM'),
+      generateConversationTitle: jest.fn().mockResolvedValue('t'),
+      streamResponse: jest.fn(async (_m: string, _h: unknown, _s: string, cb: any, opts: any) => { streamOptions = opts; finish = async () => { await cb.onDone('Insights.', 5, 5, 0); }; }),
+    };
+    const noop = {} as any;
+    const gateway: any = new VoiceGateway(noop, claudeService, conversationService, noop, noop, noop, noop, noop, noop, { log: jest.fn() } as any, noop, noop, noop, noop, noop, noop, noop, { getEffectiveLanguage: jest.fn().mockResolvedValue('en') } as any);
+    const client = createFakeClient('sock-i');
+    const session: any = createFakeSession({ isGuest: true, conversationId: 'c1', userId: 'u1', traceId: 'trace-img' });
+    return { gateway, client, session, conversationService, getOptions: () => streamOptions, finish: () => finish!() };
+  };
+
+  it('only the not-yet-sent image goes to the model; the earlier one is named, not re-attached', async () => {
+    const t = build([dbImage('img-B', 'payment.png')], ['invitation.jpg']);
+    await t.gateway.runPrompt(t.client, t.session, 'Review the attached file "payment.png" and share the most relevant insights.', 'text');
+    const opts = t.getOptions();
+    expect(opts.images).toEqual([{ mimeType: 'image/jpeg', imageBase64: 'B64-img-B', filename: 'payment.png' }]);
+    expect(opts.priorImageNames).toEqual(['invitation.jpg']);
+    expect(t.conversationService.getPendingImagesForAI).toHaveBeenCalledWith('c1', 'u1');
+  });
+
+  it('the image is marked analysed only once the AI response completes — a failed turn leaves it pending for the next try', async () => {
+    const t = build([dbImage('img-B', 'payment.png')], []);
+    await t.gateway.runPrompt(t.client, t.session, 'Review the attached file', 'text');
+    expect(t.conversationService.markImagesSentToAi).not.toHaveBeenCalled(); // not done yet
+    await t.finish();
+    expect(t.conversationService.markImagesSentToAi).toHaveBeenCalledWith('c1', 'u1', ['img-B']);
+  });
+
+  it('with no new image: nothing attached, nothing to mark', async () => {
+    const t = build([], ['invitation.jpg', 'payment.png']);
+    await t.gateway.runPrompt(t.client, t.session, 'What was the amount?', 'text');
+    expect(t.getOptions().images).toBeUndefined();
+    await t.finish();
+    expect(t.conversationService.markImagesSentToAi).not.toHaveBeenCalled();
   });
 });
