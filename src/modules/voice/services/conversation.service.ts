@@ -83,6 +83,8 @@ export interface TranscriptSegment {
   confidence: number | null;
   identification_method: string;
   provider_epoch?: number | null;
+  /** Alias of recording_session_id under the name web/mobile parse for speaker scoping. */
+  provider_session_epoch?: string | null;
   is_corrected: boolean;
   recording_session_id: string | null;
   created_at: Date;
@@ -511,7 +513,7 @@ export class ConversationService {
       this.knex('conversation_transcript_segments')
         .where('conversation_id', conversationId)
         .orderByRaw('created_at ASC, COALESCE(start_ms, 999999999) ASC')
-        .select('*'),
+        .select('*', this.knex.raw('recording_session_id AS provider_session_epoch')),
     ]);
 
     const { timing, messageDateBounds } = await fetchTimingDetail(this.knex, conversation);
@@ -952,7 +954,7 @@ export class ConversationService {
     return this.knex('conversation_transcript_segments')
       .where('conversation_id', conversationId)
       .orderByRaw('created_at ASC, COALESCE(start_ms, 999999999) ASC')
-      .select('*');
+      .select('*', this.knex.raw('recording_session_id AS provider_session_epoch'));
   }
 
   // ── Conversation documents (in-context file attachments) ───────────────────

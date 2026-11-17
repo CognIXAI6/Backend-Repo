@@ -89,6 +89,8 @@ interface MultiSpeakerTurn {
   deepgramSpeakerId: number | null;
   /** Provider connection the speaker number belongs to (numbering can restart on reconnect). */
   providerEpoch?: number;
+  /** Same value as the recording session id, under the name web/mobile parse for speaker scoping. */
+  providerSessionEpoch?: string;
   speakerId: string | null;
   speakerLabel: string;
   text: string;
@@ -1447,14 +1449,38 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return;
     }
 
+    // `audio:finalized` (emitted below, early) only says the provider finished flushing — it is NOT
+    // a persistence signal. `turns:settled` is: it is sent once, after every turn accepted before
+    // this stop has reached a terminal state (or the drain bound was hit — `complete:false`).
+    let drainComplete = true;
+    try {
+      drainComplete = await this.processAudioStop(client, session, streamId, drainMs);
+    } finally {
+      // No further waiting here: the drain above already waited (bounded). Anything still in flight now
+      // means the bound was hit, so the stop is reported incomplete rather than waited on a second time.
+      const complete = drainComplete && (session.inFlightTurns?.size ?? 0) === 0;
+      this.logLifecycle(session, 'turns_settled', { reason: 'audio_stop', complete, accepted: session.acceptedTurnSeq, settled: session.settledTurnSeq });
+      client.emit('turns:settled', {
+        reason: 'audio_stop',
+        complete,
+        recordingId: streamId,
+        acceptedTurns: session.acceptedTurnSeq ?? 0,
+        settledTurns: session.settledTurnSeq ?? 0,
+        correlation: this.correlation(session),
+      });
+    }
+  }
+
+  /** The body of audio:stop after the provider drain. Returns whether the final-turn drain completed. */
+  private async processAudioStop(client: Socket, session: ActiveSession, streamId: string | null, drainMs: number): Promise<boolean> {
     // Multi-speaker: flush pending turns (minWords=1 so stop never silently discards).
     if (session.isMultiSpeaker) {
       this.logger.log(`[${client.id}] audio:stop streamId=${streamId} drainMs=${drainMs} turnsPending=${session.pendingMultiSpeakerTurns.length}`);
       client.emit('audio:finalized', { recordingId: streamId, transcriptDetected: session.pendingMultiSpeakerTurns.length > 0 });
       // Wait for the turn that is running, then process the final turns queued behind
       // it — an 'already_processing' result must never be taken as completion.
-      await this.drainSessionTurns(client, session, 'audio_stop');
-      return;
+      const drain = await this.drainSessionTurns(client, session, 'audio_stop');
+      return drain.complete;
     }
 
     // Single / dual-speaker path
@@ -1479,7 +1505,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
     if (!transcript) {
       client.emit('ai:skipped', { reason: 'empty_transcript' });
-      return;
+      return true;
     }
 
     if (session.isProcessingAI) {
@@ -1489,7 +1515,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const settled = await this.awaitInFlightTurns(session);
       if (!settled || session.isProcessingAI) {
         client.emit('ai:skipped', { reason: 'already_processing', transcript });
-        return;
+        return false; // the running turn never finished: not settled
       }
     }
 
@@ -1502,7 +1528,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (!quality.pass) {
       this.logger.log(`Transcript filtered [${quality.reason}]: words=${countWords(transcript)} (conf=${avgConfidence.toFixed(2)})`);
       client.emit('ai:skipped', { reason: quality.reason, transcript });
-      return;
+      return true;
     }
 
     if (session.isGuest && session.guestSessionId) {
@@ -1513,13 +1539,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           used: gs.used,
           limit: gs.limit,
         });
-        return;
+        return true;
       }
     } else if (!(await this.checkMessageQuota(client, session))) {
-      return;
+      return true;
     }
 
     await this.processPrompt(client, session, transcript, 'voice');
+    return true;
   }
 
   // ─── text:send ──────────────────────────────────────────────────────────────
@@ -3879,6 +3906,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return [{
         deepgramSpeakerId: null,
         providerEpoch: session.providerEpoch,
+        providerSessionEpoch: session.recordingSessionId,
         speakerId: null,
         speakerLabel: UNATTRIBUTED_SPEAKER_LABEL,
         text: fallbackTranscript.trim(),
@@ -3912,6 +3940,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       turns.push({
         deepgramSpeakerId: run.speakerId,
         providerEpoch: session.providerEpoch,
+        providerSessionEpoch: session.recordingSessionId,
         speakerId: identity.speakerId,
         speakerLabel: identity.speakerLabel,
         text,
@@ -3934,7 +3963,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   /** Additive scope fields so clients can tell which provider connection a speaker number belongs to. */
   private speakerScope(session: ActiveSession, epoch: number = session.providerEpoch) {
-    return { recordingSessionId: session.recordingSessionId, providerEpoch: epoch };
+    // `providerSessionEpoch` is the same value as `recordingSessionId` (the identity of this
+    // recording session's provider-connection family), under the name clients already parse;
+    // `providerEpoch` is the numeric connection counter within it.
+    return { recordingSessionId: session.recordingSessionId, providerSessionEpoch: session.recordingSessionId, providerEpoch: epoch };
   }
 
   /** The epoch a client-supplied correction applies to: a valid past/current epoch, else the current one. */

@@ -35,7 +35,7 @@ function createFakeConversationService() {
 function createFakeAncillaryServices() {
   return {
     usersService: { findById: jest.fn().mockResolvedValue({ ai_memory: 'some memory' }) } as any,
-    fieldsService: { findById: jest.fn().mockResolvedValue({ name: 'General Knowledge' }) } as any,
+    fieldsService: { findFieldRecordForUser: jest.fn().mockResolvedValue({ id: 'f1', name: 'General Knowledge', isCustom: false }) } as any,
     settingsService: { getEffectiveLanguage: jest.fn().mockResolvedValue('en') } as any,
     configService: { get: jest.fn((key: string) => (key === 'chat.maxAttempts' ? 3 : undefined)) } as any,
   };
@@ -121,5 +121,44 @@ describe('ChatJobWorkerService.processJob', () => {
     expect(aiJobsChain.update).toHaveBeenCalledWith(
       expect.objectContaining({ status: 'failed' }),
     );
+  });
+});
+
+
+describe('ChatJobWorkerService.processJob — conversation field context', () => {
+  const run = async (conversation: Record<string, unknown>, fieldRecord: { id: string; name: string; isCustom: boolean } | null) => {
+    const { knexLike } = createFakeKnex({ job: baseJob, requestMessage: baseRequestMessage, conversation });
+    const conversationService = createFakeConversationService();
+    const claudeService: any = {
+      buildSystemPrompt: jest.fn().mockReturnValue('system prompt'),
+      streamResponse: jest.fn((_m: string, _h: unknown, _s: string, cb: any) => { cb.onDone('ok', 1, 1); return Promise.resolve(); }),
+    };
+    const { usersService, fieldsService, settingsService, configService } = createFakeAncillaryServices();
+    fieldsService.findFieldRecordForUser.mockResolvedValue(fieldRecord);
+    const worker = new ChatJobWorkerService(knexLike, conversationService, claudeService, usersService, fieldsService, settingsService, configService);
+    await (worker as any).processJob('job-1');
+    return { claudeService, fieldsService };
+  };
+
+  it("a custom-field conversation keeps its field in the queued response — resolved for the conversation's OWNER, like live voice", async () => {
+    const { claudeService, fieldsService } = await run({ ...baseConversation, field_id: 'custom-field-1' }, { id: 'custom-field-1', name: 'My Practice', isCustom: true });
+    expect(fieldsService.findFieldRecordForUser).toHaveBeenCalledWith('user-1', 'custom-field-1');
+    expect(claudeService.buildSystemPrompt.mock.calls[0][0]).toBe('My Practice');
+  });
+
+  it('a built-in field still works', async () => {
+    const { claudeService } = await run({ ...baseConversation, field_id: 'f-law' }, { id: 'f-law', name: 'Law', isCustom: false });
+    expect(claudeService.buildSystemPrompt.mock.calls[0][0]).toBe('Law');
+  });
+
+  it("a field that is not resolvable for the owner (someone else's custom field, deleted) contributes no field context", async () => {
+    const { claudeService } = await run({ ...baseConversation, field_id: 'foreign-custom' }, null);
+    expect(claudeService.buildSystemPrompt.mock.calls[0][0]).toBeUndefined();
+  });
+
+  it('no field on the conversation → no lookup at all', async () => {
+    const { claudeService, fieldsService } = await run({ ...baseConversation, field_id: null }, null);
+    expect(fieldsService.findFieldRecordForUser).not.toHaveBeenCalled();
+    expect(claudeService.buildSystemPrompt.mock.calls[0][0]).toBeUndefined();
   });
 });

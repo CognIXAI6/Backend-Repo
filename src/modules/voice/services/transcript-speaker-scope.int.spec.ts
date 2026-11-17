@@ -152,4 +152,16 @@ d('transcript speaker scoping (real Postgres)', () => {
     expect(r.find((x) => x.transcript === 'anon-other-epoch')).toMatchObject({ speaker_label: 'Guest 1' });
     await expect(svc.renameAnonymousSpeaker({ conversationId: c, userId, deepgramSpeakerId: 0, speakerLabel: 'X', applyTo: 'conversation_speaker' })).rejects.toThrow();
   });
+
+  it('stored segments expose provider_session_epoch (the same value as recording_session_id) on detail and on the segment list; null when there is none', async () => {
+    const c = await conv();
+    const rec = '11111111-1111-1111-1111-111111111111';
+    await seg(c, { rec, epoch: 1, text: 'scoped' });
+    await knex('conversation_transcript_segments').insert({ conversation_id: c, speaker_label: 'Old', transcript: 'legacy', identification_method: 'unknown' });
+    const list: any[] = await svc.getTranscriptSegments(c, userId);
+    expect(list.find((r) => r.transcript === 'scoped')).toMatchObject({ recording_session_id: rec, provider_session_epoch: rec, provider_epoch: 1 });
+    expect(list.find((r) => r.transcript === 'legacy')).toMatchObject({ recording_session_id: null, provider_session_epoch: null });
+    const detail: any = await svc.getConversation(c, userId);
+    expect(detail.transcriptSegments.find((r: any) => r.transcript === 'scoped').provider_session_epoch).toBe(rec);
+  });
 });

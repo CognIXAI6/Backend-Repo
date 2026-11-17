@@ -99,7 +99,9 @@ export class ChatJobWorkerService {
 
       const [user, field, history, documentContext, images, outputLanguage] = await Promise.all([
         this.usersService.findById(userId),
-        conversation.field_id ? this.fieldsService.findById(conversation.field_id) : Promise.resolve(null),
+        // Same canonical resolution as live voice sessions: a built-in field OR the user's own custom
+        // field (the old built-in-only lookup lost the context of any custom-field conversation).
+        conversation.field_id ? this.fieldsService.findFieldRecordForUser(userId, conversation.field_id) : Promise.resolve(null),
         this.conversationService.getRecentHistoryForAI(job.conversation_id, userId, 40),
         this.conversationService.getFullDocumentContext(job.conversation_id, userId).catch(() => null),
         this.conversationService.getConversationImagesForAI(job.conversation_id, userId).catch(() => []),

@@ -3021,3 +3021,122 @@ describe('VoiceGateway explicit audio loss during provider recovery', () => {
     expect(JSON.stringify(loss)).not.toMatch(/Buffer|data/);
   });
 });
+
+
+describe('VoiceGateway speaker-scope aliases', () => {
+  beforeEach(() => ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined)));
+  afterEach(() => jest.restoreAllMocks());
+
+  it('every scope carries providerSessionEpoch (== recordingSessionId, the value session:ready already sends under that name) plus the numeric providerEpoch', () => {
+    const { gateway } = createGateway();
+    const session: any = createFakeSession({ recordingSessionId: 'rec-77', providerEpoch: 2 });
+    expect(gateway.speakerScope(session)).toEqual({ recordingSessionId: 'rec-77', providerSessionEpoch: 'rec-77', providerEpoch: 2 });
+    expect(gateway.speakerScope(session, 0)).toEqual({ recordingSessionId: 'rec-77', providerSessionEpoch: 'rec-77', providerEpoch: 0 });
+  });
+
+  it('multi-speaker turns (the segments in transcript/ai events) carry both scope fields, including unattributed ones', () => {
+    const { gateway } = createGateway();
+    const session: any = createFakeSession({ isMultiSpeaker: true, recordingSessionId: 'rec-77', providerEpoch: 1 });
+    const [turn] = gateway.buildMultiSpeakerTurns(session, [{ word: 'hi', speaker: 0, start: 0, end: 0.2 }], 0.9, 'hi');
+    expect(turn).toMatchObject({ providerSessionEpoch: 'rec-77', providerEpoch: 1 });
+    const [unattributed] = gateway.buildMultiSpeakerTurns(session, [], 0.5, 'some words');
+    expect(unattributed).toMatchObject({ deepgramSpeakerId: null, providerSessionEpoch: 'rec-77', providerEpoch: 1 });
+  });
+
+  it('live speaker events (identified / corrected) include the alias', async () => {
+    const conversationService = { correctTranscriptSpeaker: jest.fn().mockResolvedValue(undefined) };
+    const speakersService = { getSpeakerById: jest.fn().mockResolvedValue({ id: 's1', name: 'Bob', voice_speaker_id: 'v', is_owner: false }) };
+    const noop = {} as any;
+    const gateway: any = new VoiceGateway(noop, noop, conversationService as any, noop, noop, noop, noop, noop, noop, noop, noop, noop, speakersService as any, noop, noop, noop, noop, noop);
+    const client = createFakeClient('sock-a');
+    gateway.sessions.set(client.id, createFakeSession({ isMultiSpeaker: true, recordingSessionId: 'rec-9', providerEpoch: 1, userId: 'u1' }));
+    await gateway.handleCorrectSpeaker(client, { deepgramSpeakerId: 0, speakerId: 's1' });
+    expect(client.emit).toHaveBeenCalledWith('transcript:speaker_corrected', expect.objectContaining({ recordingSessionId: 'rec-9', providerSessionEpoch: 'rec-9', providerEpoch: 1 }));
+  });
+});
+
+describe('VoiceGateway turns:settled (the reliable completion signal for audio:stop)', () => {
+  beforeEach(() => ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined)));
+  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
+
+  const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((r) => { resolve = r; }); return { promise, resolve }; };
+  const turn = (text: string) => ({ deepgramSpeakerId: 0, speakerId: null, speakerLabel: 'Guest 1', text, confidence: 1, startMs: null, endMs: null, identificationMethod: 'diarization' as const });
+  const names = (client: any) => client.emit.mock.calls.map((c: any[]) => c[0]);
+  const settled = (client: any) => client.emit.mock.calls.filter((c: any[]) => c[0] === 'turns:settled').map((c: any[]) => c[1]);
+
+  const build = (over: Record<string, unknown> = {}) => {
+    const noop = {} as any;
+    const gateway: any = new VoiceGateway(noop, noop, noop, noop, noop, noop, noop, noop, noop, { log: jest.fn() } as any, noop, noop, noop, noop, noop, noop, noop, noop);
+    const client = createFakeClient('sock-s');
+    const session: any = createFakeSession({ isGuest: true, activeStreamId: 'rec-1', traceId: 'trace-s', ...over });
+    gateway.sessions.set(client.id, session);
+    jest.spyOn(gateway, 'finalizeAndDrain').mockResolvedValue(undefined);
+    jest.spyOn(gateway, 'checkMessageQuota').mockResolvedValue(true);
+    return { gateway, client, session };
+  };
+
+  it('multi-speaker: audio:finalized comes first and is NOT completion — turns:settled arrives only after the final turn has committed', async () => {
+    const { gateway, client, session } = build({ isMultiSpeaker: true, pendingMultiSpeakerTurns: [turn('the very last thing said before stop')] });
+    const commit = deferred();
+    jest.spyOn(gateway, 'runMultiSpeakerPrompt').mockImplementation(async (c: any, sess: any) => { sess.isProcessingAI = true; await commit.promise; sess.isProcessingAI = false; c.emit('ai:done', { response: 'ok' }); });
+
+    const stopping = gateway.handleAudioStop(client);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(names(client)).toContain('audio:finalized');
+    expect(settled(client)).toHaveLength(0); // the turn is still persisting: not settled
+
+    commit.resolve();
+    await stopping;
+    const order = names(client).filter((n: string) => ['audio:finalized', 'ai:done', 'turns:settled'].includes(n));
+    expect(order).toEqual(['audio:finalized', 'ai:done', 'turns:settled']);
+    expect(settled(client)).toEqual([expect.objectContaining({ reason: 'audio_stop', complete: true, recordingId: 'rec-1', acceptedTurns: 1, settledTurns: 1, correlation: expect.objectContaining({ traceId: 'trace-s' }) })]);
+    expect(session.inFlightTurns.size).toBe(0);
+  });
+
+  it('single-speaker: settled after the turn is processed (and after ai:skipped for a rejected/empty one)', async () => {
+    const { gateway, client } = build({ accumulatedTranscript: 'we should wait for the numbers before deciding anything' });
+    (gateway as any).guestSessionService = { getStatus: jest.fn().mockResolvedValue({ canSend: true }) };
+    jest.spyOn(gateway, 'isTranscriptMeaningful').mockReturnValue({ pass: true });
+    const turnGate = deferred();
+    jest.spyOn(gateway, 'runPrompt').mockImplementation(async (c: any, sess: any) => { sess.isProcessingAI = true; await turnGate.promise; sess.isProcessingAI = false; c.emit('ai:done', { response: 'ok' }); });
+    const stopping = gateway.handleAudioStop(client);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settled(client)).toHaveLength(0);
+    turnGate.resolve();
+    await stopping;
+    expect(names(client).filter((n: string) => ['ai:done', 'turns:settled'].includes(n))).toEqual(['ai:done', 'turns:settled']);
+    expect(settled(client)[0]).toMatchObject({ complete: true });
+
+    const empty = build({ accumulatedTranscript: '' });
+    await empty.gateway.handleAudioStop(empty.client);
+    expect(names(empty.client).filter((n: string) => ['ai:skipped', 'turns:settled'].includes(n))).toEqual(['ai:skipped', 'turns:settled']);
+    expect(settled(empty.client)[0]).toMatchObject({ complete: true }); // nothing was pending: deterministically settled
+  });
+
+  it('a turn that never commits yields complete:false after the bound — never a false "settled"', async () => {
+    jest.useFakeTimers();
+    const { gateway, client, session } = build({ isMultiSpeaker: true });
+    gateway.trackTurn(session, () => new Promise<void>(() => undefined));
+    const stopping = gateway.handleAudioStop(client);
+    await jest.advanceTimersByTimeAsync(45_000);
+    await stopping;
+    expect(settled(client)).toEqual([expect.objectContaining({ complete: false, acceptedTurns: 1, settledTurns: 0 })]);
+  });
+
+  it('a duplicate audio:stop settles once; a stale stop (a newer recording started) emits nothing', async () => {
+    const { gateway, client } = build({ accumulatedTranscript: '' });
+    await Promise.all([gateway.handleAudioStop(client), gateway.handleAudioStop(client)]);
+    expect(settled(client)).toHaveLength(1);
+
+    const stale = build({ accumulatedTranscript: '' });
+    (stale.gateway.finalizeAndDrain as jest.Mock).mockImplementation(async () => { stale.session.activeStreamId = 'rec-2'; }); // a new stream starts mid-drain
+    await stale.gateway.handleAudioStop(stale.client);
+    expect(settled(stale.client)).toHaveLength(0);
+  });
+
+  it('carries counts and ids only', async () => {
+    const { gateway, client } = build({ accumulatedTranscript: '' });
+    await gateway.handleAudioStop(client);
+    expect(Object.keys(settled(client)[0]).sort()).toEqual(['acceptedTurns', 'complete', 'correlation', 'reason', 'recordingId', 'settledTurns']);
+  });
+});
