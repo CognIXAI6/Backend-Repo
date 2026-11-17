@@ -1,7 +1,9 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { Logger } from '@nestjs/common';
 import { createSessionMetrics } from './utils/session-metrics.util';
 import { EventEmitter } from 'events';
-import { VoiceGateway } from './voice.gateway';
+import { SHUTDOWN_DRAIN_MS, SHUTDOWN_NOTICE_MS, SHUTDOWN_RETRY_AFTER_MS, VoiceGateway } from './voice.gateway';
 
 function createFakeSession(overrides: Record<string, unknown> = {}) {
   return {
@@ -298,37 +300,128 @@ describe('VoiceGateway.prepareAudioForUpload — mobile raw PCM vs web container
   });
 });
 
-describe('VoiceGateway beforeApplicationShutdown', () => {
-  beforeEach(() => {
-    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
-    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-  });
-  afterEach(() => jest.restoreAllMocks());
+describe('VoiceGateway beforeApplicationShutdown (graceful restart window)', () => {
+  beforeEach(() => ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined)));
+  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
 
-  it('broadcasts server:restarting to every connected client when sessions are active', async () => {
-    const { gateway } = createGateway();
+  const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((r) => { resolve = r; }); return { promise, resolve }; };
+  const turn = (text: string) => ({ deepgramSpeakerId: 0, speakerId: null, speakerLabel: 'Guest 1', text, confidence: 1, startMs: null, endMs: null, identificationMethod: 'diarization' as const });
+  const logs = () => (Logger.prototype.log as jest.Mock).mock.calls.map((c) => String(c[0]));
+
+  const build = (timing?: any) => {
+    const noop = {} as any;
+    const gateway: any = new VoiceGateway(noop, noop, noop, noop, noop, noop, noop, noop, noop, { log: jest.fn() } as any, noop, noop, noop, noop, noop, noop, noop, noop, timing);
     gateway.server = { emit: jest.fn() };
-    gateway.sessions.set('sock-1', createFakeSession());
-    gateway.sessions.set('sock-2', createFakeSession());
+    return gateway;
+  };
+  /** Runs shutdown on fake timers; returns when it settles and how much fake time it took. */
+  const shutdownTook = async (gateway: any) => {
+    const t0 = Date.now();
+    let done = false;
+    const p = gateway.beforeApplicationShutdown('SIGTERM').then(() => { done = true; });
+    let elapsed = 0;
+    while (!done && elapsed < 20_000) { await jest.advanceTimersByTimeAsync(100); elapsed += 100; }
+    await p;
+    return Date.now() - t0;
+  };
 
-    const start = Date.now();
-    await gateway.beforeApplicationShutdown('SIGTERM');
-    const elapsedMs = Date.now() - start;
-
-    expect(gateway.server.emit).toHaveBeenCalledWith(
-      'server:restarting',
-      expect.objectContaining({ message: expect.any(String) }),
-    );
-    expect(elapsedMs).toBeGreaterThanOrEqual(450); // the grace sleep actually ran
+  it('announces the restart with the grace window, a retry hint and the server boot id', async () => {
+    jest.useFakeTimers();
+    const gateway = build();
+    gateway.sessions.set('sock-1', createFakeSession({ isGuest: true }));
+    await shutdownTook(gateway);
+    expect(gateway.server.emit).toHaveBeenCalledWith('server:restarting', expect.objectContaining({
+      reason: 'server_restart', graceMs: SHUTDOWN_NOTICE_MS, retryAfterMs: SHUTDOWN_RETRY_AFTER_MS, serverBootId: gateway.bootId, message: expect.any(String),
+    }));
   });
 
-  it('does nothing when there are no active sessions', async () => {
-    const { gateway } = createGateway();
-    gateway.server = { emit: jest.fn() };
+  it('keeps connections open for the full notice window (so clients can move into their reconnect path) — and no longer than needed', async () => {
+    jest.useFakeTimers();
+    const gateway = build();
+    gateway.sessions.set('sock-1', createFakeSession({ isGuest: true }));
+    const took = await shutdownTook(gateway);
+    expect(took).toBeGreaterThanOrEqual(SHUTDOWN_NOTICE_MS);
+    expect(took).toBeLessThanOrEqual(SHUTDOWN_NOTICE_MS + 200); // nothing to drain: costs only the notice window
+  });
 
+  it('persists final turns during the window: a queued multi-speaker turn is processed and an in-flight one is awaited', async () => {
+    jest.useFakeTimers();
+    const gateway = build();
+    const session: any = createFakeSession({ isGuest: true, isMultiSpeaker: true, pendingMultiSpeakerTurns: [turn('last words before the restart')] });
+    gateway.sessions.set('sock-1', session);
+    jest.spyOn(gateway, 'checkMessageQuota').mockResolvedValue(true);
+    const processed: string[] = [];
+    jest.spyOn(gateway, 'runMultiSpeakerPrompt').mockImplementation(async (_c: any, sess: any, turns: any[]) => { sess.isProcessingAI = true; await new Promise((r) => setTimeout(r, 400)); processed.push(...turns.map((t) => t.text)); sess.isProcessingAI = false; });
+    const inFlight = deferred();
+    gateway.trackTurn(session, () => inFlight.promise);
+    setTimeout(() => inFlight.resolve(), 600);
+
+    const took = await shutdownTook(gateway);
+    expect(processed).toEqual(['last words before the restart']);
+    expect(session.inFlightTurns.size).toBe(0);
+    expect(took).toBeLessThanOrEqual(SHUTDOWN_NOTICE_MS + 200); // drain ran inside the notice window, not after it
+    expect(logs().find((l) => l.includes('event=gateway_shutdown_done'))).toMatch(/drained=1 incomplete=0/);
+  });
+
+  it('a turn that never finishes cannot hold the process: shutdown ends at the bound and reports it incomplete', async () => {
+    jest.useFakeTimers();
+    const gateway = build();
+    const session: any = createFakeSession({ isGuest: true });
+    gateway.sessions.set('sock-1', session);
+    gateway.trackTurn(session, () => new Promise<void>(() => undefined));
+    const took = await shutdownTook(gateway);
+    expect(took).toBeLessThanOrEqual(SHUTDOWN_DRAIN_MS + 300);
+    expect(logs().find((l) => l.includes('event=gateway_shutdown_done'))).toMatch(/drained=0 incomplete=1/);
+  });
+
+  it('timing sessions are marked interrupted (a restart is not a clean end); guests have none', async () => {
+    jest.useFakeTimers();
+    const timing = { closeBySocket: jest.fn().mockResolvedValue(undefined) };
+    const gateway = build(timing);
+    gateway.sessions.set('sock-1', createFakeSession({ isGuest: false, conversationId: 'c1' }));
+    gateway.sessions.set('sock-2', createFakeSession({ isGuest: true, conversationId: 'c2' }));
+    await shutdownTook(gateway);
+    expect(timing.closeBySocket).toHaveBeenCalledTimes(1);
+    expect(timing.closeBySocket).toHaveBeenCalledWith({ conversationId: 'c1', socketId: 'sock-1', status: 'interrupted' });
+  });
+
+  it('a session:start arriving during shutdown is refused with the restart notice instead of starting on a dying process', async () => {
+    jest.useFakeTimers();
+    const gateway = build();
+    gateway.sessions.set('sock-1', createFakeSession({ isGuest: true }));
+    const shutting = gateway.beforeApplicationShutdown('SIGTERM');
+    await jest.advanceTimersByTimeAsync(10);
+    const late = createFakeClient('sock-late');
+    await gateway.handleSessionStart(late, { accessToken: 'jwt', mode: 'single' });
+    expect(late.emit).toHaveBeenCalledWith('server:restarting', expect.objectContaining({ retryAfterMs: SHUTDOWN_RETRY_AFTER_MS }));
+    expect(late.emit).not.toHaveBeenCalledWith('session:ready', expect.anything());
+    await jest.advanceTimersByTimeAsync(2_000);
+    await shutting;
+  });
+
+  it('always logs the shutdown with signal, uptime and memory (so a PM2 memory restart is recognisable) — even with no sessions, where it emits nothing', async () => {
+    const gateway = build();
     await gateway.beforeApplicationShutdown('SIGTERM');
-
     expect(gateway.server.emit).not.toHaveBeenCalled();
+    expect(logs().find((l) => l.includes('event=gateway_shutdown '))).toMatch(/serverBootId=\S+ signal=SIGTERM sessions=0 uptimeMs=\d+ rssMb=\d+ heapMb=\d+/);
+  });
+
+  it('the notice + drain always fit inside PM2\'s kill_timeout for this process (else the process would be SIGKILLed mid-notice)', () => {
+    const cfg = fs.readFileSync(path.resolve(__dirname, '../../../ecosystem.config.js'), 'utf8');
+    const block = cfg.slice(cfg.indexOf("name: 'ai-voice-gateway'"));
+    const killTimeout = Number(block.match(/kill_timeout:\s*(\d+)/)?.[1]);
+    expect(killTimeout).toBeGreaterThan(0);
+    expect(Math.max(SHUTDOWN_NOTICE_MS, SHUTDOWN_DRAIN_MS) + 500).toBeLessThan(killTimeout); // + slack for the rest of Nest's shutdown
+  });
+
+  it('the boot id is stable for the process, distinct between processes, and sent in session:ready', async () => {
+    const a = build();
+    const b = build();
+    expect(a.bootId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(a.bootId).not.toBe(b.bootId);
+    const log = jest.spyOn(Logger.prototype, 'log');
+    a.afterInit();
+    expect(log.mock.calls.map((c) => String(c[0])).find((l) => l.includes('event=gateway_boot'))).toContain(`serverBootId=${a.bootId}`);
   });
 });
 
@@ -2543,6 +2636,9 @@ describe('VoiceGateway lifecycle correlation and terminal reasons', () => {
     expect(ta).toMatch(/^[0-9a-f-]{36}$/);
     expect(tb).toMatch(/^[0-9a-f-]{36}$/);
     expect(ta).not.toBe(tb);
+    // both sessions ran on this process, so they share its boot id (a reconnect that sees a new one knows the server restarted)
+    expect(eventsOf(a, 'session:ready')[0].serverBootId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(eventsOf(a, 'session:ready')[0].serverBootId).toBe(eventsOf(b, 'session:ready')[0].serverBootId);
 
     gateway.handleStreamStart(a, { recordingId: 'rec-1', streamEpoch: 1 });
     expect(eventsOf(a, 'stream:ready')[0].traceId).toBe(ta);
@@ -2665,7 +2761,7 @@ describe('VoiceGateway lifecycle correlation and terminal reasons', () => {
     gateway.server = { emit: jest.fn() };
     jest.useFakeTimers();
     const shutdown = gateway.beforeApplicationShutdown('SIGTERM');
-    await jest.advanceTimersByTimeAsync(600);
+    await jest.advanceTimersByTimeAsync(1_600);
     await shutdown;
     expect(gateway.server.emit).toHaveBeenCalledWith('server:restarting', expect.objectContaining({ reason: 'server_restart' }));
 

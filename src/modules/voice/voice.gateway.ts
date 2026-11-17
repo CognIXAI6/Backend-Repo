@@ -294,6 +294,17 @@ const SUMMARY_FAILURE_MESSAGES: Record<SummaryFailureReason, string> = {
   generation_error: "We couldn't generate your conversation summary.",
 };
 
+/**
+ * Graceful-restart window. PM2 SIGKILLs the gateway kill_timeout (5000 ms, ecosystem.config.js) after
+ * the stop signal, so the notice + drain MUST finish inside it — a guard test enforces this.
+ * Clients get SHUTDOWN_NOTICE_MS to receive the announcement and move into their reconnect path, and
+ * final turns get up to SHUTDOWN_DRAIN_MS to be persisted, in parallel.
+ */
+export const SHUTDOWN_NOTICE_MS = 1_500;
+export const SHUTDOWN_DRAIN_MS = 3_000;
+/** PM2 restart_delay (3 s) + process boot: when a client should expect to be able to reconnect. */
+export const SHUTDOWN_RETRY_AFTER_MS = 8_000;
+
 /** Safety cap on wait→flush→wait rounds at one stop boundary. */
 const MAX_DRAIN_PASSES = 4;
 
@@ -304,6 +315,12 @@ const MAX_DRAIN_PASSES = 4;
   pingInterval: 25_000,
 })
 export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, BeforeApplicationShutdown {
+  /** Identifies this gateway process instance. A client that reconnects and sees a different id knows the server restarted. */
+  private readonly bootId = randomUUID();
+  private readonly bootedAt = Date.now();
+  /** Set once shutdown begins: no NEW sessions are started on a process that is about to exit. */
+  private shuttingDown = false;
+
   @WebSocketServer()
   server: Server;
 
@@ -563,6 +580,24 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
   afterInit(): void {
     this.logger.log('🎙️  VoiceGateway live at ws://…/voice');
+    // One line per process start: restarts (deploys, crashes, PM2 max_memory_restart) are countable from
+    // these, and each live session's logs carry serverBootId so a stop can be tied to a specific boot.
+    const restarts = Number(process.env.restart_time);
+    this.logger.log(
+      `lifecycle event=gateway_boot serverBootId=${this.bootId} pid=${process.pid} startedAt=${new Date(this.bootedAt).toISOString()}` +
+      (Number.isFinite(restarts) ? ` pm2Restarts=${restarts}` : ''),
+    );
+  }
+
+  private restartNotice() {
+    return {
+      reason: 'server_restart' satisfies SessionTerminalReason,
+      message: 'The server is restarting for a brief update. Please reconnect in a few seconds.',
+      serverBootId: this.bootId,
+      // How long this process keeps connections before it exits, and when to expect it back.
+      graceMs: SHUTDOWN_NOTICE_MS,
+      retryAfterMs: SHUTDOWN_RETRY_AFTER_MS,
+    };
   }
 
   /**
@@ -587,19 +622,58 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    * closes (paired with a bumped `kill_timeout` in ecosystem.config.js).
    */
   async beforeApplicationShutdown(signal?: string): Promise<void> {
-    if (this.sessions.size === 0) return;
-
-    this.logger.warn(
-      `beforeApplicationShutdown(${signal}) — notifying ${this.sessions.size} active voice session(s) before restart`,
+    this.shuttingDown = true;
+    const sessionCount = this.sessions.size;
+    const mem = process.memoryUsage();
+    // Always logged (even with no sessions) so a restart caused by memory pressure (PM2 max_memory_restart)
+    // is recognisable: signal, uptime and RSS at the moment of shutdown. Counts only.
+    this.logger.log(
+      `lifecycle event=gateway_shutdown serverBootId=${this.bootId} signal=${signal ?? 'none'} sessions=${sessionCount} ` +
+      `uptimeMs=${Date.now() - this.bootedAt} rssMb=${Math.round(mem.rss / 1048576)} heapMb=${Math.round(mem.heapUsed / 1048576)}`,
     );
+    if (sessionCount === 0) return;
+
+    this.logger.warn(`beforeApplicationShutdown(${signal}) — notifying ${sessionCount} active voice session(s) before restart`);
     for (const active of this.sessions.values()) {
       this.logLifecycle(active, 'session_terminal', { reason: 'server_restart' satisfies SessionTerminalReason });
     }
-    this.server.emit('server:restarting', {
-      reason: 'server_restart' satisfies SessionTerminalReason,
-      message: 'The server is restarting for a brief update. Please reconnect in a few seconds.',
-    });
-    await sleep(500);
+    this.server.emit('server:restarting', this.restartNotice());
+
+    // The notice window and the final-turn drain run TOGETHER, so a restart costs at most
+    // max(notice, drain) — never the sum — and always fits inside PM2's kill_timeout.
+    const startedAt = Date.now();
+    const [, outcome] = await Promise.all([sleep(SHUTDOWN_NOTICE_MS), this.drainSessionsForShutdown()]);
+    this.logger.log(
+      `lifecycle event=gateway_shutdown_done serverBootId=${this.bootId} sessions=${sessionCount} ` +
+      `drained=${outcome.complete} incomplete=${outcome.incomplete} elapsedMs=${Date.now() - startedAt}`,
+    );
+  }
+
+  /**
+   * Gives every live session's final text a bounded chance to be persisted before the process exits, and
+   * marks timing sessions interrupted (a restart is not a clean end). Never throws or exceeds SHUTDOWN_DRAIN_MS.
+   */
+  private async drainSessionsForShutdown(): Promise<{ complete: number; incomplete: number }> {
+    const entries = [...this.sessions.entries()];
+    const sockets = (this.server as { sockets?: { sockets?: Map<string, Socket> } } | undefined)?.sockets?.sockets;
+    const results = await Promise.all(
+      entries.map(async ([socketId, session]) => {
+        const client = sockets?.get(socketId) ?? ({ id: socketId, emit: () => true } as unknown as Socket);
+        if (this.recordingTimingService && !session.isGuest) {
+          void this.enqueueTiming(session, () =>
+            this.recordingTimingService!.closeBySocket({ conversationId: session.conversationId, socketId, status: 'interrupted' }),
+          );
+        }
+        try {
+          return (await this.drainSessionTurns(client, session, 'shutdown', SHUTDOWN_DRAIN_MS)).complete;
+        } catch (err) {
+          this.logger.error(`shutdown drain failed (trace=${session.traceId}): ${describeError(err)}`);
+          return false;
+        }
+      }),
+    );
+    const complete = results.filter(Boolean).length;
+    return { complete, incomplete: results.length - complete };
   }
 
   handleConnection(client: Socket): void {
@@ -698,6 +772,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       audioFormat?: ClientAudioFormatHint;
     },
   ): Promise<void> {
+    if (this.shuttingDown) {
+      // This process is about to exit: starting a session here would just be killed seconds later.
+      client.emit('server:restarting', this.restartNotice());
+      return;
+    }
     try {
       this.cleanupSession(client.id);
 
@@ -1077,6 +1156,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         providerEpoch: session.providerEpoch,
         clientSessionId: session.clientSessionId,
         traceId: session.traceId,
+        serverBootId: this.bootId,
         // Field this conversation lives under. `mismatch`: the client asked for a different
         // field than a resumed conversation's own (start a new conversation to change field);
         // `fallback`: the requested field ID was not usable, so the primary field applies.
@@ -2232,9 +2312,10 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private async drainSessionTurns(
     client: Socket,
     session: ActiveSession,
-    reason: 'audio_stop' | 'session_end' | 'disconnect',
+    reason: 'audio_stop' | 'session_end' | 'disconnect' | 'shutdown',
+    timeoutMs: number = IN_FLIGHT_TURN_WAIT_MS,
   ): Promise<{ complete: boolean; passes: number }> {
-    const deadline = Date.now() + IN_FLIGHT_TURN_WAIT_MS;
+    const deadline = Date.now() + timeoutMs;
     for (let pass = 1; pass <= MAX_DRAIN_PASSES; pass++) {
       if (!(await this.awaitInFlightTurns(session, Math.max(0, deadline - Date.now())))) {
         this.logger.warn(`[${client.id}] turn drain incomplete (${reason}) accepted=${session.acceptedTurnSeq} settled=${session.settledTurnSeq}`);
