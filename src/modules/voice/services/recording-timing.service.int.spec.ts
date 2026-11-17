@@ -88,11 +88,11 @@ d('RecordingTimingService (real Postgres)', () => {
 
   it('start is idempotent; a reconnect resumes the same logical session instead of creating a new one', async () => {
     const c = await newConversation();
-    expect(await sess(c, 'a', 's1')).toEqual({ created: true });
-    expect(await sess(c, 'a', 's1')).toEqual({ created: false });
+    expect(await sess(c, 'a', 's1')).toEqual({ created: true, status: 'active' });
+    expect(await sess(c, 'a', 's1')).toEqual({ created: false, status: 'active' });
     await svc.closeBySocket({ conversationId: c, socketId: 's1', status: 'interrupted' });
     expect((await detail(c)).timing.sessions as any[]).toMatchObject([{ id: 'a', status: 'interrupted', completeness: 'partial' }]);
-    expect(await sess(c, 'a', 's2')).toEqual({ created: false });
+    expect(await sess(c, 'a', 's2')).toEqual({ created: false, status: 'active' });
     const t = (await detail(c)).timing;
     expect(t.sessionCount).toBe(1);
     expect((t.sessions as any[])[0].status).toBe('active');
@@ -111,17 +111,17 @@ d('RecordingTimingService (real Postgres)', () => {
     await sess(c, 'a');
     const rep = (seq: number, intervals: any[], final = false) =>
       svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq, intervals, final } });
-    expect(await rep(2, [{ startMs: 0, endMs: 3000 }])).toEqual({ applied: true });
-    expect(await rep(2, [{ startMs: 0, endMs: 3000 }])).toEqual({ applied: false }); // duplicate
-    expect(await rep(1, [{ startMs: 0, endMs: 9999 }])).toEqual({ applied: false }); // stale
-    expect(await rep(3, [{ startMs: 2000, endMs: 5000 }, { startMs: 0, endMs: 3000 }])).toEqual({ applied: true }); // overlap
+    expect(await rep(2, [{ startMs: 0, endMs: 3000 }])).toMatchObject({ applied: true });
+    expect(await rep(2, [{ startMs: 0, endMs: 3000 }])).toMatchObject({ applied: false }); // duplicate
+    expect(await rep(1, [{ startMs: 0, endMs: 9999 }])).toMatchObject({ applied: false }); // stale
+    expect(await rep(3, [{ startMs: 2000, endMs: 5000 }, { startMs: 0, endMs: 3000 }])).toMatchObject({ applied: true }); // overlap
     const row = await knex('conversation_recording_sessions').where('conversation_id', c).first();
     expect(row.captured_ms).toBe(5000);
     // claiming more than wall-clock allows is clamped (+10s tolerance)
     await rep(4, [{ startMs: 0, endMs: 9_000_000 }]);
     expect((await knex('conversation_recording_sessions').where('conversation_id', c).first()).captured_ms).toBeLessThan(12_000);
     // non-integer seq rejected
-    expect(await rep(1.5 as number, [])).toEqual({ applied: false });
+    expect(await rep(1.5 as number, [])).toMatchObject({ applied: false });
   });
 
   it('a final report completes the session; later reports are ignored; aggregate is complete when nothing predates it', async () => {
@@ -129,7 +129,7 @@ d('RecordingTimingService (real Postgres)', () => {
     await sess(c, 'a');
     await addMessage(c); // after session start
     await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 1, intervals: [{ startMs: 0, endMs: 50 }], final: true } });
-    expect(await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 2, intervals: [{ startMs: 0, endMs: 9000 }] } })).toEqual({ applied: false });
+    expect(await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 2, intervals: [{ startMs: 0, endMs: 9000 }] } })).toMatchObject({ applied: false });
     const { timing } = await detail(c);
     expect(timing).toMatchObject({ completeness: 'complete', recordedDurationMs: 50 });
     expect((timing.sessions as any[])[0]).toMatchObject({ status: 'ended', completeness: 'complete' });
@@ -182,7 +182,7 @@ d('RecordingTimingService (real Postgres)', () => {
     expect(full.timing.sessions).toHaveLength(1);
     await expect(conversations.getConversation(c, otherUserId)).rejects.toBeInstanceOf(NotFoundException);
     // other user cannot report into or see this session
-    expect(await svc.applyReport({ userId: otherUserId, conversationId: c, clientSessionId: 'a', report: { seq: 1, intervals: [] } })).toEqual({ applied: false });
+    expect(await svc.applyReport({ userId: otherUserId, conversationId: c, clientSessionId: 'a', report: { seq: 1, intervals: [] } })).toMatchObject({ applied: false });
   });
 
   it('detail reports partial session coverage when sessions exceed the page limit', async () => {
@@ -203,5 +203,80 @@ d('RecordingTimingService (real Postgres)', () => {
     await sess(c, 'a');
     await knex('conversations').where('id', c).delete();
     expect((await knex('conversation_recording_sessions').where('conversation_id', c)).length).toBe(0);
+  });
+
+  describe('resume after a socket drop', () => {
+    it('clears the provisional disconnect end, so the final report sets the true end and elapsed time', async () => {
+      const c = await newConversation();
+      await sess(c, 'a', 's1');
+      // pretend the session started a minute ago
+      await knex('conversation_recording_sessions').where('conversation_id', c).update({ started_at: new Date(Date.now() - 60_000) });
+      await svc.closeBySocket({ conversationId: c, socketId: 's1', status: 'interrupted' });
+      const dropped = await knex('conversation_recording_sessions').where('conversation_id', c).first();
+      expect(dropped.ended_at).not.toBeNull(); // provisional: when the socket went away
+      expect(dropped.status).toBe('interrupted');
+
+      // resumed on a new socket after the outage
+      await sess(c, 'a', 's2');
+      const resumed = await knex('conversation_recording_sessions').where('conversation_id', c).first();
+      expect([resumed.status, resumed.ended_at, resumed.elapsed_ms]).toEqual(['active', null, null]);
+
+      // capture continued well past the provisional end; the final report closes it at the real boundary
+      const result = await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 1, intervals: [{ startMs: 0, endMs: 55_000 }], final: true } });
+      expect(result).toMatchObject({ applied: true, status: 'ended', completeness: 'complete' });
+      const done = await knex('conversation_recording_sessions').where('conversation_id', c).first();
+      expect(done.captured_ms).toBe(55_000);
+      expect(done.elapsed_ms).toBeGreaterThanOrEqual(59_000); // true end (≈ now), not the earlier disconnect time
+      expect(new Date(done.ended_at).getTime()).toBeGreaterThan(new Date(dropped.ended_at).getTime() - 1);
+    });
+
+    it('a still-active session resumed on a new socket keeps its (empty) end; an ended session is left untouched', async () => {
+      const c = await newConversation();
+      await sess(c, 'a', 's1');
+      expect(await svc.startSession({ userId, conversationId: c, clientSessionId: 'a', socketId: 's2' })).toEqual({ created: false, status: 'active' });
+      await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 1, intervals: [], final: true } });
+      expect(await svc.startSession({ userId, conversationId: c, clientSessionId: 'a', socketId: 's3' })).toEqual({ created: false, status: 'ended' });
+    });
+  });
+
+  describe('interval cap does not lose valid new capture', () => {
+    it('500 stored intervals + a long new one: the new capture counts, and the result is partial rather than complete', async () => {
+      const c = await newConversation();
+      await sess(c, 'a');
+      const stored = Array.from({ length: 500 }, (_, i) => ({ startMs: i * 1_100, endMs: i * 1_100 + 100 }));
+      await knex('conversation_recording_sessions').where('conversation_id', c).update({
+        started_at: new Date(Date.now() - 3_600_000), intervals: JSON.stringify(stored), captured_ms: 500 * 100, report_seq: 1,
+      });
+      const result = await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 2, intervals: [{ startMs: 1_000_000, endMs: 1_060_000 }], final: true } });
+      expect(result).toMatchObject({ applied: true, status: 'ended', completeness: 'partial', reason: 'intervals_truncated' });
+      const row = await knex('conversation_recording_sessions').where('conversation_id', c).first();
+      expect(row.captured_ms).toBe(500 * 100 + 60_000 - 100); // the long interval is in; one 100ms interval was shed
+      expect(row.completeness).toBe('partial'); // a lower bound is never reported as complete
+      expect(row.intervals).toContainEqual({ startMs: 1_000_000, endMs: 1_060_000 });
+    });
+
+    it('a merge that stays under the cap is complete and unchanged in meaning', async () => {
+      const c = await newConversation();
+      await sess(c, 'a');
+      const stored = Array.from({ length: 500 }, (_, i) => ({ startMs: i * 1_100, endMs: i * 1_100 + 100 }));
+      await knex('conversation_recording_sessions').where('conversation_id', c).update({ started_at: new Date(Date.now() - 3_600_000), intervals: JSON.stringify(stored), captured_ms: 50_000, report_seq: 1 });
+      const result = await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 2, intervals: [{ startMs: 50, endMs: 1_150 }], final: true } }); // bridges two
+      expect(result).toMatchObject({ applied: true, completeness: 'complete' });
+      expect(result.reason).toBeUndefined();
+    });
+  });
+
+  describe('report results (acknowledgements)', () => {
+    it('say why a report was not applied, with the session\'s current state, so a client can retry or stop', async () => {
+      const c = await newConversation();
+      await sess(c, 'a');
+      expect(await svc.applyReport({ userId, conversationId: c, clientSessionId: 'nope', report: { seq: 1, intervals: [] } })).toEqual({ applied: false, reason: 'not_found' });
+      expect(await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 0, intervals: [] } })).toEqual({ applied: false, reason: 'invalid_seq' });
+      await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 2, intervals: [{ startMs: 0, endMs: 10 }] } });
+      expect(await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 1, intervals: [] } })).toMatchObject({ applied: false, reason: 'stale', status: 'active', completeness: 'partial' });
+      await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 3, intervals: [], final: true } });
+      // a retried final report is a safe no-op that tells the client it is already complete
+      expect(await svc.applyReport({ userId, conversationId: c, clientSessionId: 'a', report: { seq: 3, intervals: [], final: true } })).toEqual({ applied: false, reason: 'already_complete', status: 'ended', completeness: 'complete' });
+    });
   });
 });

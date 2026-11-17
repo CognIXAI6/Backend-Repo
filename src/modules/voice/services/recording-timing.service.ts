@@ -12,6 +12,15 @@ import {
 export const TIMING_CONTRACT_VERSION = 1;
 export const DETAIL_SESSION_LIMIT = 200;
 
+/** What the server did with a timing report — returned to the client as an acknowledgement. */
+export interface TimingReportResult {
+  applied: boolean;
+  /** Why it was not (fully) applied, or a note on a partial application. Coarse codes only. */
+  reason?: 'invalid_seq' | 'not_found' | 'already_complete' | 'stale' | 'intervals_truncated';
+  status?: 'active' | 'ended' | 'interrupted';
+  completeness?: 'complete' | 'partial';
+}
+
 export interface TimingReport {
   seq: number;
   intervals: unknown;
@@ -135,7 +144,7 @@ export class RecordingTimingService {
     conversationId: string;
     clientSessionId: string;
     socketId: string;
-  }): Promise<{ created: boolean } | null> {
+  }): Promise<{ created: boolean; status: 'active' | 'ended' | 'interrupted' } | null> {
     const { userId, conversationId, clientSessionId, socketId } = params;
     return this.knex.transaction(async (trx) => {
       const owned = await trx('conversations')
@@ -151,12 +160,20 @@ export class RecordingTimingService {
         .first();
 
       if (existing) {
-        if (existing.status === 'ended') return { created: false };
+        if (existing.status === 'ended') return { created: false, status: 'ended' };
+        // Resuming after a drop: the disconnect time was only PROVISIONAL (we recorded when
+        // the socket went away, not when capture really ended). Clear it, so the eventual
+        // final report / close sets the true end and elapsed time.
         await trx('conversation_recording_sessions')
           .where('id', existing.id)
-          .update({ status: 'active', socket_id: socketId, updated_at: trx.fn.now() });
+          .update({
+            status: 'active',
+            socket_id: socketId,
+            ...(existing.status === 'interrupted' ? { ended_at: null, elapsed_ms: null } : {}),
+            updated_at: trx.fn.now(),
+          });
         if (existing.status !== 'active') await this.bumpRevision(trx, conversationId);
-        return { created: false };
+        return { created: false, status: 'active' };
       }
 
       await trx('conversation_recording_sessions').insert({
@@ -169,7 +186,7 @@ export class RecordingTimingService {
         socket_id: socketId,
       });
       await this.bumpRevision(trx, conversationId);
-      return { created: true };
+      return { created: true, status: 'active' };
     });
   }
 
@@ -185,24 +202,25 @@ export class RecordingTimingService {
     conversationId: string;
     clientSessionId: string;
     report: TimingReport;
-  }): Promise<{ applied: boolean }> {
+  }): Promise<TimingReportResult> {
     const { userId, conversationId, clientSessionId, report } = params;
-    if (!Number.isInteger(report.seq) || report.seq < 1) return { applied: false };
+    if (!Number.isInteger(report.seq) || report.seq < 1) return { applied: false, reason: 'invalid_seq' };
 
     return this.knex.transaction(async (trx) => {
       const row = await trx('conversation_recording_sessions')
         .where({ conversation_id: conversationId, client_session_id: clientSessionId, user_id: userId })
         .forUpdate()
         .first();
-      if (!row) return { applied: false };
-      if (row.completeness === 'complete') return { applied: false };
-      if (report.seq <= row.report_seq) return { applied: false };
+      if (!row) return { applied: false, reason: 'not_found' };
+      const state = { status: row.status as TimingReportResult['status'], completeness: row.completeness as TimingReportResult['completeness'] };
+      if (row.completeness === 'complete') return { applied: false, reason: 'already_complete', ...state };
+      if (report.seq <= row.report_seq) return { applied: false, reason: 'stale', ...state };
 
       const now = Date.now();
       const elapsedMs = now - new Date(row.started_at).getTime();
       const existing: CapturedInterval[] = Array.isArray(row.intervals) ? row.intervals : [];
       const incoming = Array.isArray(report.intervals) ? report.intervals : [];
-      const { intervals, totalMs } = normalizeIntervals(
+      const { intervals, totalMs, truncated } = normalizeIntervals(
         [...existing, ...incoming],
         elapsedMs + TIMING_CLOCK_TOLERANCE_MS,
       );
@@ -216,13 +234,19 @@ export class RecordingTimingService {
       if (report.final === true) {
         const endedAt = row.ended_at ? new Date(row.ended_at) : new Date(now);
         update.status = 'ended';
-        update.completeness = 'complete';
+        // A report whose intervals exceeded the storage cap is a lower bound, never "complete".
+        update.completeness = truncated ? 'partial' : 'complete';
         update.ended_at = endedAt;
         update.elapsed_ms = Math.max(0, endedAt.getTime() - new Date(row.started_at).getTime());
       }
       await trx('conversation_recording_sessions').where('id', row.id).update(update);
       await this.bumpRevision(trx, conversationId);
-      return { applied: true };
+      return {
+        applied: true,
+        status: (update.status as TimingReportResult['status']) ?? state.status,
+        completeness: (update.completeness as TimingReportResult['completeness']) ?? state.completeness,
+        ...(truncated ? { reason: 'intervals_truncated' as const } : {}),
+      };
     });
   }
 

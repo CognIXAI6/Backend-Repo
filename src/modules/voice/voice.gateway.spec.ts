@@ -2853,3 +2853,171 @@ describe('VoiceGateway provider delivery outcomes (sent, retained, or explicitly
     expect(settled).toBe(true); // resolved without advancing the timers
   });
 });
+
+describe('VoiceGateway session timing: ordering and acknowledgements', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const deferred = () => { let resolve!: (v?: unknown) => void; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+  const acks = (client: any) => client.emit.mock.calls.filter((c: any[]) => c[0] === 'session:timing:ack').map((c: any[]) => c[1]);
+
+  const build = () => {
+    const order: string[] = [];
+    const startGate = deferred();
+    const timing = {
+      startSession: jest.fn(async () => { order.push('start:begin'); await startGate.promise; order.push('start:commit'); return { created: true, status: 'active' as const }; }),
+      applyReport: jest.fn(async (p: any) => { order.push(`report:${p.report.seq}${p.report.final ? ':final' : ''}`); return { applied: true, status: p.report.final ? 'ended' : 'active', completeness: p.report.final ? 'complete' : 'partial' }; }),
+      closeBySocket: jest.fn(async (p: any) => { order.push(`close:${p.status}`); }),
+    };
+    const noop = {} as any;
+    const gateway = new VoiceGateway(noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, noop, timing as any) as any;
+    const client = createFakeClient('sock-t');
+    const session = createFakeSession({ userId: 'u1', conversationId: 'c1', isGuest: false });
+    gateway.sessions.set(client.id, session);
+    return { gateway, client, session, timing, order, startGate };
+  };
+
+  it('a final report sent immediately after the start waits for the start to commit — it cannot race it and disappear', async () => {
+    const { gateway, client, timing, order, startGate } = build();
+    const start = gateway.handleTimingStart(client, { sessionId: 'logical-1' });
+    const report = gateway.handleTimingReport(client, { sessionId: 'logical-1', seq: 1, intervals: [{ startMs: 0, endMs: 5 }], final: true });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(order).toEqual(['start:begin']); // the report has NOT run ahead of the uncommitted start
+    startGate.resolve();
+    await Promise.all([start, report]);
+    expect(order).toEqual(['start:begin', 'start:commit', 'report:1:final']);
+    expect(timing.applyReport).toHaveBeenCalledTimes(1);
+  });
+
+  it('session:end after a report closes the session only once the report has been applied', async () => {
+    const { gateway, client, order, startGate } = build();
+    jest.spyOn(gateway, 'finalizeSessionOnExit').mockResolvedValue(undefined);
+    jest.spyOn(gateway, 'cleanupSession').mockImplementation(() => undefined);
+    const start = gateway.handleTimingStart(client, { sessionId: 'logical-1' });
+    const report = gateway.handleTimingReport(client, { sessionId: 'logical-1', seq: 1, intervals: [], final: true });
+    const ending = gateway.handleSessionEnd(client);
+    startGate.resolve();
+    await Promise.all([start, report, ending]);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(order).toEqual(['start:begin', 'start:commit', 'report:1:final', 'close:ended']);
+  });
+
+  it('every operation is acknowledged, in order, with the outcome', async () => {
+    const { gateway, client, startGate } = build();
+    startGate.resolve();
+    await gateway.handleTimingStart(client, { sessionId: 'logical-1' });
+    await gateway.handleTimingReport(client, { sessionId: 'logical-1', seq: 1, intervals: [], final: false });
+    await gateway.handleTimingReport(client, { sessionId: 'logical-1', seq: 2, intervals: [], final: true });
+    expect(acks(client)).toEqual([
+      { kind: 'start', sessionId: 'logical-1', applied: true, created: true, status: 'active' },
+      { kind: 'report', sessionId: 'logical-1', seq: 1, applied: true, status: 'active', completeness: 'partial' },
+      { kind: 'report', sessionId: 'logical-1', seq: 2, applied: true, status: 'ended', completeness: 'complete' },
+    ]);
+  });
+
+  it('a rejected report is acknowledged with the reason (not silently dropped), and a malformed id gets an explicit refusal', async () => {
+    const { gateway, client, timing, startGate } = build();
+    startGate.resolve();
+    timing.applyReport.mockResolvedValueOnce({ applied: false, reason: 'stale', status: 'active', completeness: 'partial' } as any);
+    await gateway.handleTimingReport(client, { sessionId: 'logical-1', seq: 1, intervals: [] });
+    await gateway.handleTimingReport(client, { sessionId: 'bad id!', seq: 1, intervals: [] });
+    await gateway.handleTimingStart(client, { sessionId: '' });
+    expect(acks(client)).toEqual([
+      { kind: 'report', sessionId: 'logical-1', seq: 1, applied: false, reason: 'stale', status: 'active', completeness: 'partial' },
+      { kind: 'report', applied: false, reason: 'invalid_session_id' },
+      { kind: 'start', applied: false, reason: 'invalid_session_id' },
+    ]);
+  });
+
+  it('a failure in one operation does not block the ones after it', async () => {
+    const { gateway, client, timing, order, startGate } = build();
+    startGate.resolve();
+    timing.applyReport.mockRejectedValueOnce(new Error('db blip'));
+    await gateway.handleTimingReport(client, { sessionId: 'logical-1', seq: 1, intervals: [] });
+    await gateway.handleTimingReport(client, { sessionId: 'logical-1', seq: 2, intervals: [], final: true });
+    expect(order).toEqual(['report:2:final']);
+    expect(acks(client)).toHaveLength(1); // the failed one produced no ack; the next did
+  });
+});
+
+describe('VoiceGateway explicit audio loss during provider recovery', () => {
+  beforeEach(() => {
+    ['log', 'warn', 'error', 'debug'].forEach((m) => jest.spyOn(Logger.prototype, m as any).mockImplementation(() => undefined));
+  });
+  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
+
+  const eventsOf = (client: any, name: string) => client.emit.mock.calls.filter((c: any[]) => c[0] === name).map((c: any[]) => c[1]);
+  const chunkOf = (gateway: any, client: any, seq: number, bytes = 100_000, rec = 'rec-1') =>
+    gateway.handleAudioChunk(client, { chunk: Buffer.alloc(bytes, seq), sequence: seq, recordingId: rec });
+  const recovering = () => {
+    const t = createGateway();
+    const client = createFakeClient('sock-l');
+    const session: any = createFakeSession({ providerState: 'recovering', traceId: 'trace-loss', activeStreamId: 'rec-1' });
+    t.gateway.sessions.set(client.id, session);
+    return { ...t, client, session };
+  };
+
+  it('a chunk the byte cap rejects is reported IMMEDIATELY as audio:loss (stream, sequence, bytes) — the ack alone no longer hides it', () => {
+    const { gateway, client } = recovering();
+    for (let seq = 0; seq < 3; seq++) chunkOf(gateway, client, seq); // 300k fits the 320k cap
+    expect(eventsOf(client, 'audio:loss')).toHaveLength(0); // everything retained: no loss reported
+
+    chunkOf(gateway, client, 3); // 4th does not fit
+    const [loss] = eventsOf(client, 'audio:loss');
+    expect(loss).toMatchObject({ reason: 'recovery_buffer_bound', streamId: 'rec-1', firstSequence: 3, lastSequence: 3, chunks: 1, bytes: 100_000, correlation: { traceId: 'trace-loss' } });
+    expect(eventsOf(client, 'audio:ack').map((a: any) => a.sequence)).toEqual([0, 1, 2, 3]); // ack = received, as documented
+  });
+
+  it('a sustained overflow is throttled to one event per second and the remainder is flushed before session:recovered', async () => {
+    jest.useFakeTimers();
+    const { gateway, deepgramService, client, session } = recovering();
+    for (let seq = 0; seq < 4; seq++) chunkOf(gateway, client, seq); // 0-2 kept, 3 rejected (first event)
+    chunkOf(gateway, client, 4);
+    chunkOf(gateway, client, 5);
+    expect(eventsOf(client, 'audio:loss')).toHaveLength(1); // 4 and 5 are accumulated, not spammed
+
+    await jest.advanceTimersByTimeAsync(1_100);
+    chunkOf(gateway, client, 6, 100_000);
+    const losses = eventsOf(client, 'audio:loss');
+    expect(losses).toHaveLength(2);
+    expect(losses[1]).toMatchObject({ firstSequence: 4, lastSequence: 6, chunks: 3, bytes: 300_000 });
+
+    chunkOf(gateway, client, 7); // accumulated but not yet emitted…
+    deepgramService.createLiveSession.mockResolvedValue({ emitter: new EventEmitter(), sendAudio: jest.fn().mockReturnValue(true), sendFinalize: jest.fn(), close: jest.fn() });
+    await gateway.recoverProviderSession(client, Object.assign(session, { providerState: 'active' }), 0, 'deepgram_closed', null);
+    const names = client.emit.mock.calls.map((c: any[]) => c[0]).filter((n: string) => n === 'audio:loss' || n === 'session:recovered');
+    expect(names).toEqual(['audio:loss', 'audio:loss', 'audio:loss', 'session:recovered']); // …and flushed first
+    expect(eventsOf(client, 'audio:loss')[2]).toMatchObject({ firstSequence: 7, lastSequence: 7, chunks: 1 });
+  });
+
+  it('age-expired audio is reported as loss with the evicted chunks\' own stream and sequence', async () => {
+    jest.useFakeTimers();
+    const { gateway, client } = recovering();
+    chunkOf(gateway, client, 0, 1_000);
+    chunkOf(gateway, client, 1, 1_000);
+    await jest.advanceTimersByTimeAsync(11_000); // older than the 10s window
+    chunkOf(gateway, client, 2, 1_000); // evicts 0 and 1 to make room
+    const [loss] = eventsOf(client, 'audio:loss');
+    expect(loss).toMatchObject({ reason: 'recovery_buffer_bound', streamId: 'rec-1', firstSequence: 0, lastSequence: 1, chunks: 2, bytes: 2_000 });
+  });
+
+  it('exhausted recovery flushes any unreported loss before the terminal event', async () => {
+    const { gateway, deepgramService, client, session } = recovering();
+    for (let seq = 0; seq < 4; seq++) chunkOf(gateway, client, seq);
+    chunkOf(gateway, client, 4); // accumulated (throttled)
+    deepgramService.createLiveSession.mockRejectedValue(new Error('connect failed'));
+    await gateway.recoverProviderSession(client, Object.assign(session, { providerState: 'active' }), 0, 'transport_failure', null);
+    const names = client.emit.mock.calls.map((c: any[]) => c[0]).filter((n: string) => n === 'audio:loss' || n === 'session:degraded');
+    expect(names).toEqual(['audio:loss', 'audio:loss', 'session:degraded']);
+  }, 10_000);
+
+  it('the loss event carries ids and counts only — no audio or text', () => {
+    const { gateway, client } = recovering();
+    for (let seq = 0; seq < 4; seq++) chunkOf(gateway, client, seq);
+    const [loss] = eventsOf(client, 'audio:loss');
+    expect(Object.keys(loss).sort()).toEqual(['bytes', 'chunks', 'correlation', 'firstSequence', 'lastSequence', 'reason', 'streamId']);
+    expect(JSON.stringify(loss)).not.toMatch(/Buffer|data/);
+  });
+});

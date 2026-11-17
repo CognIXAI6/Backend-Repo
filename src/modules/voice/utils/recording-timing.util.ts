@@ -7,18 +7,29 @@ export const MAX_INTERVALS_PER_SESSION = 500;
 /** Slack for network latency between the client's capture start and the server receiving session:timing:start. */
 export const TIMING_CLOCK_TOLERANCE_MS = 10_000;
 
+/** Upper bound on raw entries examined per report (input abuse guard — not a coverage limit). */
+export const MAX_RAW_INTERVALS_EXAMINED = 5 * MAX_INTERVALS_PER_SESSION;
+
 /**
- * Validates, clamps, sorts and merges client-reported capture intervals
- * (offsets in ms from the logical session start). Overlapping/touching
- * intervals are unioned so overlap can never double-count. Anything past
- * `maxOffsetMs` (server-observed elapsed + tolerance) is clamped away so a
+ * Validates, clamps, sorts and MERGES client-reported capture intervals (offsets in ms
+ * from the logical session start), and only then applies the storage cap. Overlapping or
+ * touching intervals are unioned first, so overlap can never double-count and a cap on the
+ * merged list does not drop valid new capture just because the stored list was long.
+ * Anything past `maxOffsetMs` (server-observed elapsed + tolerance) is clamped away so a
  * client can't claim more capture than wall-clock time allows.
+ *
+ * If, after merging, more than MAX_INTERVALS_PER_SESSION disjoint intervals remain, the
+ * SHORTEST ones are dropped. That can only understate captured time, never overstate it,
+ * and is reported via `truncated` so the caller marks the result partial instead of complete.
  */
-export function normalizeIntervals(raw: unknown, maxOffsetMs: number): { intervals: CapturedInterval[]; totalMs: number } {
-  if (!Array.isArray(raw)) return { intervals: [], totalMs: 0 };
+export function normalizeIntervals(
+  raw: unknown,
+  maxOffsetMs: number,
+): { intervals: CapturedInterval[]; totalMs: number; truncated: boolean } {
+  if (!Array.isArray(raw)) return { intervals: [], totalMs: 0, truncated: false };
 
   const cleaned: CapturedInterval[] = [];
-  for (const item of raw.slice(0, MAX_INTERVALS_PER_SESSION)) {
+  for (const item of raw.slice(0, MAX_RAW_INTERVALS_EXAMINED)) {
     if (!item || typeof item !== 'object') continue;
     const s = Number((item as CapturedInterval).startMs);
     const e = Number((item as CapturedInterval).endMs);
@@ -29,7 +40,7 @@ export function normalizeIntervals(raw: unknown, maxOffsetMs: number): { interva
   }
 
   cleaned.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
-  const merged: CapturedInterval[] = [];
+  let merged: CapturedInterval[] = [];
   for (const iv of cleaned) {
     const last = merged[merged.length - 1];
     if (last && iv.startMs <= last.endMs) {
@@ -38,7 +49,16 @@ export function normalizeIntervals(raw: unknown, maxOffsetMs: number): { interva
       merged.push({ ...iv });
     }
   }
-  return { intervals: merged, totalMs: merged.reduce((sum, iv) => sum + (iv.endMs - iv.startMs), 0) };
+
+  let truncated = false;
+  if (merged.length > MAX_INTERVALS_PER_SESSION) {
+    truncated = true;
+    merged = [...merged]
+      .sort((a, b) => b.endMs - b.startMs - (a.endMs - a.startMs) || a.startMs - b.startMs)
+      .slice(0, MAX_INTERVALS_PER_SESSION)
+      .sort((a, b) => a.startMs - b.startMs);
+  }
+  return { intervals: merged, totalMs: merged.reduce((sum, iv) => sum + (iv.endMs - iv.startMs), 0), truncated };
 }
 
 export type TimingCompleteness = 'complete' | 'partial' | 'unknown';

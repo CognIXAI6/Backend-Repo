@@ -127,6 +127,8 @@ interface ActiveSession {
   lastAckedStreamId: string | null;
   /** Logical recording-session id registered via session:timing:start (authenticated sessions only). */
   timingSessionId?: string;
+  /** Serialises session:timing:* operations and the close on end/disconnect, in arrival order. */
+  timingChain?: Promise<unknown>;
   isGuest: boolean;
   /** Only set for guest sessions */
   guestSessionId?: string;
@@ -265,7 +267,10 @@ interface ActiveSession {
     audioFormat?: DeepgramLiveAudioFormat;
   };
   /** Bounded audio replay buffer used only while providerState === 'recovering'. Separate from the speaker-ID audioBuffer above. */
-  recoveryAudioBuffer: Array<{ chunk: Buffer; enqueuedAt: number }>;
+  recoveryAudioBuffer: Array<{ chunk: Buffer; enqueuedAt: number; streamId?: string; sequence?: number }>;
+  /** Audio the recovery buffer could not keep, accumulated until the next (throttled) audio:loss event. */
+  pendingLoss?: { streamId: string | null; firstSequence: number | null; lastSequence: number | null; chunks: number; bytes: number };
+  lastLossEmitAt?: number;
   recoveryAudioBufferBytes: number;
   /** Wall-clock timestamp when overflow-driven dropping started this recovery cycle; null when not currently dropping. */
   recoveryBufferOverflowStartedAt: number | null;
@@ -633,11 +638,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       this.scheduleDisconnectSummary(client, session, drain.complete);
       // Unexpected drop: close this socket's timing session as interrupted
       // (partial). A reconnect re-registers the same logical id and resumes it.
-      void this.recordingTimingService?.closeBySocket({
-        conversationId: session.conversationId,
-        socketId: client.id,
-        status: 'interrupted',
-      });
+      if (this.recordingTimingService) {
+        void this.enqueueTiming(session, () => this.recordingTimingService!.closeBySocket({
+          conversationId: session.conversationId,
+          socketId: client.id,
+          status: 'interrupted',
+        }));
+      }
     }
 
     this.cleanupSession(client.id);
@@ -1118,6 +1125,22 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   // Billing/usage metering is unaffected.
   private static readonly TIMING_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
+  /**
+   * Timing operations for one socket run strictly in arrival order. Socket.IO dispatches
+   * events without waiting for earlier async handlers, so a final report sent right after
+   * a start (or a session:end right after a report) could otherwise race an uncommitted
+   * write and vanish. Each operation's outcome is also ACKNOWLEDGED to the client, so it can
+   * retry or know the session's state instead of guessing.
+   */
+  private enqueueTiming<T>(session: ActiveSession, work: () => Promise<T>): Promise<T | undefined> {
+    const run = (session.timingChain ?? Promise.resolve()).then(work, work);
+    session.timingChain = run.catch(() => undefined);
+    return run.catch((err) => {
+      this.logger.error(`session timing operation failed (trace=${session.traceId}): ${describeError(err)}`);
+      return undefined;
+    });
+  }
+
   @SubscribeMessage('session:timing:start')
   async handleTimingStart(
     @ConnectedSocket() client: Socket,
@@ -1126,18 +1149,22 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const session = this.sessions.get(client.id);
     const sessionId = payload?.sessionId;
     if (!session || session.isGuest || !this.recordingTimingService) return;
-    if (typeof sessionId !== 'string' || !VoiceGateway.TIMING_ID_PATTERN.test(sessionId)) return;
-    try {
-      const res = await this.recordingTimingService.startSession({
+    if (typeof sessionId !== 'string' || !VoiceGateway.TIMING_ID_PATTERN.test(sessionId)) {
+      client.emit('session:timing:ack', { kind: 'start', applied: false, reason: 'invalid_session_id' });
+      return;
+    }
+    await this.enqueueTiming(session, async () => {
+      const res = await this.recordingTimingService!.startSession({
         userId: session.userId,
         conversationId: session.conversationId,
         clientSessionId: sessionId,
         socketId: client.id,
       });
       if (res) session.timingSessionId = sessionId;
-    } catch (err) {
-      this.logger.error(`session:timing:start failed for conversation ${session.conversationId}`, err as Error);
-    }
+      client.emit('session:timing:ack', res
+        ? { kind: 'start', sessionId, applied: true, created: res.created, status: res.status }
+        : { kind: 'start', sessionId, applied: false, reason: 'not_found' });
+    });
   }
 
   @SubscribeMessage('session:timing:report')
@@ -1148,17 +1175,20 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const session = this.sessions.get(client.id);
     if (!session || session.isGuest || !this.recordingTimingService) return;
     const sessionId = payload?.sessionId;
-    if (typeof sessionId !== 'string' || !VoiceGateway.TIMING_ID_PATTERN.test(sessionId)) return;
-    try {
-      await this.recordingTimingService.applyReport({
+    if (typeof sessionId !== 'string' || !VoiceGateway.TIMING_ID_PATTERN.test(sessionId)) {
+      client.emit('session:timing:ack', { kind: 'report', applied: false, reason: 'invalid_session_id' });
+      return;
+    }
+    const seq = Number(payload.seq);
+    await this.enqueueTiming(session, async () => {
+      const result = await this.recordingTimingService!.applyReport({
         userId: session.userId,
         conversationId: session.conversationId,
         clientSessionId: sessionId,
-        report: { seq: Number(payload.seq), intervals: payload.intervals, final: payload.final === true },
+        report: { seq, intervals: payload.intervals, final: payload.final === true },
       });
-    } catch (err) {
-      this.logger.error(`session:timing:report failed for conversation ${session.conversationId}`, err as Error);
-    }
+      client.emit('session:timing:ack', { kind: 'report', sessionId, seq: Number.isInteger(seq) ? seq : null, ...result });
+    });
   }
 
   // ─── stream:start ───────────────────────────────────────────────────────────
@@ -1237,8 +1267,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // provider, or buffered for replay after recovery). Only held chunks are
     // acknowledged, so the client never frees audio that was silently lost.
     let held = true;
+    const bufferMeta = { streamId: payload.recordingId ?? '__legacy__', sequence: payload.sequence ?? undefined };
+    const admit = () => {
+      const outcome = this.bufferAudioForRecovery(session, buffer, bufferMeta);
+      const lost = [...outcome.evicted];
+      if (!outcome.retained) lost.push({ streamId: bufferMeta.streamId, sequence: payload.sequence ?? null, bytes: buffer.length });
+      this.recordRecoveryLoss(client, session, lost);
+    };
     if (session.providerState === 'recovering') {
-      this.bufferAudioForRecovery(session, buffer);
+      admit();
     } else {
       const accepted = session.sendAudio(buffer) !== false;
       if (!accepted) {
@@ -1246,11 +1283,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         const stateNow = session.providerState as ProviderSessionState;
         if (stateNow === 'active') {
           // Provider socket isn't usable: keep this chunk for replay and start recovery.
-          this.bufferAudioForRecovery(session, buffer);
+          admit();
           this.handleProviderDisruption(client, session, session.providerEpoch, 'transport_failure');
         } else if (stateNow === 'recovering') {
           // sendAudio's own failure signal already started recovery.
-          this.bufferAudioForRecovery(session, buffer);
+          admit();
         } else {
           held = false;
         }
@@ -1894,11 +1931,13 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const drain = session ? await this.drainSessionTurns(client, session, 'session_end') : { complete: true };
 
     if (session && !session.isGuest) {
-      void this.recordingTimingService?.closeBySocket({
-        conversationId: session.conversationId,
-        socketId: client.id,
-        status: 'ended',
-      });
+      if (this.recordingTimingService) {
+        void this.enqueueTiming(session, () => this.recordingTimingService!.closeBySocket({
+          conversationId: session.conversationId,
+          socketId: client.id,
+          status: 'ended',
+        }));
+      }
       this.cancelPendingDisconnectSummary(session.conversationId);
       // Fire-and-forget: the client disconnects its socket immediately after
       // emitting session:end (doesn't wait for any ack), so this routinely
@@ -4564,6 +4603,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           `(epoch=${session.providerEpoch}, droppedDurationMs=${droppedDurationMs})`,
         );
 
+        this.flushRecoveryLoss(client, session);
         this.logLifecycle(session, 'provider_recovered', { recoveryId, attempt, droppedDurationMs, replayedBytes: replay.flushedBytes, droppedBytes: replay.droppedBytes });
         client.emit('session:recovered', {
           recoveryId,
@@ -4603,6 +4643,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       },
     });
 
+    this.flushRecoveryLoss(client, session);
     const lostAudioBytes = (session.recoveryAudioBufferBytes ?? 0) + (session.recoveryDroppedBytes ?? 0);
     this.logLifecycle(session, 'session_terminal', { reason: 'provider_recovery_exhausted' satisfies SessionTerminalReason, cause: providerDisruptionCause(reason), incidentId, lostAudioBytes });
     client.emit('session:degraded', {
@@ -4622,8 +4663,18 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   }
 
   /** Buffers one audio chunk while providerState === 'recovering', bounded by both byte count and age. */
-  private bufferAudioForRecovery(session: ActiveSession, buffer: Buffer): void {
+  /**
+   * Admits one chunk to the bounded recovery buffer and reports exactly what happened:
+   * whether THIS chunk was retained, and which older chunks were evicted (age) to make room.
+   * Nothing is dropped without being returned, so callers can report the loss.
+   */
+  private bufferAudioForRecovery(
+    session: ActiveSession,
+    buffer: Buffer,
+    meta: { streamId?: string; sequence?: number } = {},
+  ): { retained: boolean; evicted: Array<{ streamId: string | null; sequence: number | null; bytes: number }> } {
     const now = Date.now();
+    const evicted: Array<{ streamId: string | null; sequence: number | null; bytes: number }> = [];
 
     while (
       session.recoveryAudioBuffer.length > 0 &&
@@ -4632,6 +4683,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       const dropped = session.recoveryAudioBuffer.shift()!;
       session.recoveryAudioBufferBytes -= dropped.chunk.length;
       session.recoveryDroppedBytes = (session.recoveryDroppedBytes ?? 0) + dropped.chunk.length;
+      evicted.push({ streamId: dropped.streamId ?? null, sequence: dropped.sequence ?? null, bytes: dropped.chunk.length });
       this.noteBoundHit(session, 'recoveryBufferAgeEvict');
     }
 
@@ -4643,12 +4695,58 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       }
       session.recoveryDroppedBytes = (session.recoveryDroppedBytes ?? 0) + buffer.length;
       this.noteBoundHit(session, 'recoveryBufferByteOverflow');
-      return;
+      return { retained: false, evicted };
     }
 
-    session.recoveryAudioBuffer.push({ chunk: buffer, enqueuedAt: now });
+    session.recoveryAudioBuffer.push({ chunk: buffer, enqueuedAt: now, streamId: meta.streamId, sequence: meta.sequence });
     session.recoveryAudioBufferBytes += buffer.length;
     this.sampleSessionMetrics(session);
+    return { retained: true, evicted };
+  }
+
+  /**
+   * Reports audio the recovery buffer could not keep as an explicit, machine-readable
+   * audio:loss event (ids, sequence range and byte/chunk counts only). The audio:ack for such
+   * a chunk still means only "the gateway received it" — this event is what says it was NOT kept.
+   * Throttled to one event per second during a sustained outage; the remainder is flushed
+   * before session:recovered / session:degraded.
+   */
+  private recordRecoveryLoss(
+    client: Socket,
+    session: ActiveSession,
+    lost: Array<{ streamId: string | null; sequence: number | null; bytes: number }>,
+  ): void {
+    if (lost.length === 0) return;
+    const acc = session.pendingLoss ?? { streamId: null, firstSequence: null, lastSequence: null, chunks: 0, bytes: 0 };
+    for (const l of lost) {
+      acc.streamId = acc.streamId ?? l.streamId;
+      if (l.sequence !== null) {
+        acc.firstSequence = acc.firstSequence === null ? l.sequence : Math.min(acc.firstSequence, l.sequence);
+        acc.lastSequence = acc.lastSequence === null ? l.sequence : Math.max(acc.lastSequence, l.sequence);
+      }
+      acc.chunks += 1;
+      acc.bytes += l.bytes;
+    }
+    session.pendingLoss = acc;
+    const now = Date.now();
+    if (!session.lastLossEmitAt || now - session.lastLossEmitAt >= 1_000) this.flushRecoveryLoss(client, session);
+  }
+
+  private flushRecoveryLoss(client: Socket, session: ActiveSession): void {
+    const acc = session.pendingLoss;
+    if (!acc) return;
+    session.pendingLoss = undefined;
+    session.lastLossEmitAt = Date.now();
+    this.logLifecycle(session, 'audio_loss', { reason: 'recovery_buffer_bound', chunks: acc.chunks, bytes: acc.bytes });
+    client.emit('audio:loss', {
+      reason: 'recovery_buffer_bound' satisfies AudioLossReason,
+      streamId: acc.streamId,
+      firstSequence: acc.firstSequence,
+      lastSequence: acc.lastSequence,
+      chunks: acc.chunks,
+      bytes: acc.bytes,
+      correlation: this.correlation(session),
+    });
   }
 
   /**
