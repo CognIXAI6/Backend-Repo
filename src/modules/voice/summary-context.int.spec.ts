@@ -52,15 +52,15 @@ d('summary context (real Postgres)', () => {
 
   const build = (claude: Record<string, jest.Mock>) => {
     const noop = {} as any;
-    const generateAndUpload = jest.fn(async (..._args: any[]) => ({ docId: (await knex('generated_documents').insert({ user_id: userId, title: 'd', download_url: 'https://example.com/d' }).returning('id'))[0].id, downloadUrl: 'https://example.com/d' }));
+    const generateSummaryReport = jest.fn(async (..._args: any[]) => ({ docId: (await knex('generated_documents').insert({ user_id: userId, title: 'd', download_url: 'https://example.com/d' }).returning('id'))[0].id, downloadUrl: 'https://example.com/d' }));
     const gateway: any = new VoiceGateway(
       noop, claude as any, conversations, noop, noop, noop, { findById: jest.fn().mockResolvedValue({ id: userId, email: null }) } as any,
       noop, { sendConversationSummaryEmail: jest.fn() } as any, { log: jest.fn() } as any, noop, noop, noop,
-      { generateAndUpload, buildSummaryPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf')) } as any,
+      { generateSummaryReport, buildSummaryReportPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf')) } as any,
       { sendToUser: jest.fn().mockResolvedValue(undefined) } as any, noop,
       { getStatus: jest.fn().mockResolvedValue({ canUse: true }), tryConsume: jest.fn().mockResolvedValue(undefined) } as any, noop,
     );
-    return { gateway, generateAndUpload };
+    return { gateway, generateSummaryReport };
   };
   const sessionFor = (cid: string): any => ({
     userId, isGuest: false, conversationId: cid, traceId: 'trace-sc', cachedOwnerName: 'Tolu', otherSpeakerName: null, isMultiSpeaker: false,
@@ -77,7 +77,7 @@ d('summary context (real Postgres)', () => {
     const cid = await seed(1_000, 200);
     const before = await digest(cid);
     const claude = goodClaude();
-    const { gateway, generateAndUpload } = build(claude);
+    const { gateway, generateSummaryReport } = build(claude);
 
     await gateway.autoGenerateConversationSummary({ id: 's', emit: jest.fn() }, sessionFor(cid));
 
@@ -97,8 +97,9 @@ d('summary context (real Postgres)', () => {
     const last = await knex('conversation_messages').where('conversation_id', cid).whereNull('document_id').orderBy('created_at', 'desc').first(); // the last ORIGINAL message (the summary adds its own 'ready' message after it)
     expect(new Date(part.covers_from).getTime()).toBe(new Date(first.created_at).getTime());
     expect(new Date(part.covers_to).getTime()).toBe(new Date(last.created_at).getTime()); // coverage == the whole conversation
-    const sections = generateAndUpload.mock.calls[0][0].sections;
-    expect(sections.find((s: any) => s.heading === 'Transcript').content).toContain('m1000:');
+    const items = generateSummaryReport.mock.calls[0][0].report.sessions[0].transcript;
+    const spoken = items.map((i: any) => (i.kind === 'turn' ? i.text : i.bullets.join(' '))).join(' ');
+    expect(spoken).toContain('m1000:');
 
     // the summary added a "ready" message with a document; the ORIGINAL messages are unchanged
     const originals = await knex('conversation_messages').where('conversation_id', cid).whereNull('document_id').orderBy('created_at').orderBy('id').select('id', 'role', 'content');
@@ -111,14 +112,14 @@ d('summary context (real Postgres)', () => {
     const cid = await seed(2_000, 200);
     const before = await digest(cid);
     const claude = goodClaude();
-    const { gateway, generateAndUpload } = build(claude);
+    const { gateway, generateSummaryReport } = build(claude);
 
     await gateway.autoGenerateConversationSummary({ id: 's', emit: jest.fn() }, sessionFor(cid));
 
     const row = await knex('conversations').where('id', cid).first();
     expect([row.summary_status, row.summary_skip_reason]).toEqual(['failed', 'context_too_large']);
     expect(await knex('conversation_summary_parts').where('conversation_id', cid)).toHaveLength(0);
-    expect(generateAndUpload).not.toHaveBeenCalled();
+    expect(generateSummaryReport).not.toHaveBeenCalled();
     expect(claude.summarizeConversationChunk).not.toHaveBeenCalled();
     expect(await digest(cid)).toBe(before);
   }, 60_000);

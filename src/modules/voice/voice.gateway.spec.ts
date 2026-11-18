@@ -625,8 +625,8 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     };
     const claudeService = { generateConversationSummaryDocument: jest.fn() };
     const documentService = {
-      generateAndUpload: jest.fn(),
-      buildSummaryPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf-bytes')),
+      generateSummaryReport: jest.fn(),
+      buildSummaryReportPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf-bytes')),
     };
     const usageService = { getStatus: jest.fn().mockResolvedValue({ canUse: true }), tryConsume: jest.fn().mockResolvedValue(undefined) };
     const pushNotificationService = { sendToUser: jest.fn().mockResolvedValue(undefined) };
@@ -658,7 +658,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     const setup = (turns: Array<Record<string, unknown>>) => {
       const t = createSummaryGateway();
       withHistory(t.conversationService, turns);
-      t.documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/d' });
+      t.documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/d' });
       (t.claudeService as any).summarizeConversationChunk = jest.fn(async (_turns: any[], pos: { index: number }) => `notes-${pos.index}`);
       (t.claudeService as any).generateConversationSummaryFromNotes = jest.fn().mockResolvedValue({ title: 'Whole', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
       t.claudeService.generateConversationSummaryDocument.mockResolvedValue({ title: 'Single', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
@@ -680,11 +680,11 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
 
       // the recorded coverage is the WHOLE range, and the stored transcript section has both ends
-      expect(conversationService.addSummaryPart).toHaveBeenCalledWith(session.conversationId, session.userId, expect.anything(), 'm0', 'm299');
-      const sections = documentService.generateAndUpload.mock.calls[0][0].sections;
-      const transcript = sections.find((x: any) => x.heading === 'Transcript').content;
-      expect(transcript).toContain('m1:');
-      expect(transcript).toContain('m300:');
+      expect(conversationService.addSummaryPart).toHaveBeenCalledWith(session.conversationId, session.userId, expect.anything(), 'm0', 'm299', expect.anything());
+      const items = documentService.generateSummaryReport.mock.calls[0][0].report.sessions[0].transcript;
+      const spoken = items.map((i: any) => (i.kind === 'turn' ? i.text : i.bullets.join(' '))).join(' ');
+      expect(spoken).toContain('m1');
+      expect(spoken).toContain('m300');
       expect(statusCalls(conversationService).at(-1)).toEqual(['ready', null]);
     });
 
@@ -704,7 +704,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
       expect((claudeService as any).summarizeConversationChunk).not.toHaveBeenCalled();
       expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
-      expect(documentService.generateAndUpload).not.toHaveBeenCalled();
+      expect(documentService.generateSummaryReport).not.toHaveBeenCalled();
       expect(conversationService.addSummaryPart).not.toHaveBeenCalled();
       expect(statusCalls(conversationService).at(-1)).toEqual(['failed', 'context_too_large']);
       expect(client.emit).toHaveBeenCalledWith('document:failed', expect.objectContaining({ reasonCode: 'context_too_large', auto: true }));
@@ -718,7 +718,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       await gateway.autoGenerateConversationSummary(client, session);
       expect((claudeService as any).summarizeConversationChunk).toHaveBeenCalledTimes(3); // stops at the failure
       expect((claudeService as any).generateConversationSummaryFromNotes).not.toHaveBeenCalled();
-      expect(documentService.generateAndUpload).not.toHaveBeenCalled();
+      expect(documentService.generateSummaryReport).not.toHaveBeenCalled();
       expect(conversationService.addSummaryPart).not.toHaveBeenCalled();
       expect(statusCalls(conversationService).at(-1)).toEqual(['failed', 'generation_error']);
     });
@@ -772,13 +772,14 @@ describe('VoiceGateway auto-generated conversation summary', () => {
 
   describe('summary email outcome (coarse status only)', () => {
     const ADDRESS = 'owner.sentinel@example.com';
-    const summary = { title: 'Budget Review', sections: [{ heading: 'Summary', content: 'PRIVATE-SUMMARY-CONTENT' }] };
+    const summary = { title: 'Budget Review' };
+    const REPORT = { title: 'Budget Review', generatedAt: new Date('2026-11-18T10:00:00Z'), sessions: [{ number: 1, date: '2026-11-18', title: 'Budget Review', description: '', summary: 'PRIVATE-SUMMARY-CONTENT', transcript: [], keyInsights: [], actionPoints: [] }] } as any;
     const calls = (cs: any) => cs.setSummaryEmailStatus.mock.calls.map((c: any[]) => [c[2].status, c[2].reason ?? null]);
 
     it('accepted by the provider: pending is recorded first, then accepted_by_provider — and nothing identifying is stored', async () => {
       const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
       usersService.findById.mockResolvedValue({ id: 'u', email: ADDRESS });
-      await gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1');
+      await gateway.sendSummaryReadyEmail(createFakeSession(), summary, REPORT, 'doc-1');
       expect(calls(conversationService)).toEqual([['pending', null], ['accepted_by_provider', null]]);
       expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledTimes(1);
       const stored = JSON.stringify(conversationService.setSummaryEmailStatus.mock.calls);
@@ -798,7 +799,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
       usersService.findById.mockResolvedValue({ id: 'u', email: ADDRESS });
       emailService.sendConversationSummaryEmail.mockRejectedValue(Object.assign(new Error((failure as any).message ?? 'x'), failure));
-      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1')).rejects.toThrow();
+      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, REPORT, 'doc-1')).rejects.toThrow();
       expect(calls(conversationService)).toEqual([['pending', null], ['failed', reason]]);
       expect(JSON.stringify(conversationService.setSummaryEmailStatus.mock.calls)).not.toContain(ADDRESS);
     });
@@ -806,8 +807,8 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     it('a PDF attachment failure is recorded as attachment_failed and no email is attempted', async () => {
       const { gateway, conversationService, emailService, documentService, usersService } = createSummaryGateway();
       usersService.findById.mockResolvedValue({ id: 'u', email: ADDRESS });
-      documentService.buildSummaryPdfBuffer.mockRejectedValue(new Error('pdf engine crashed'));
-      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1')).rejects.toThrow();
+      documentService.buildSummaryReportPdfBuffer.mockRejectedValue(new Error('pdf engine crashed'));
+      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, REPORT, 'doc-1')).rejects.toThrow();
       expect(calls(conversationService)).toEqual([['pending', null], ['failed', 'attachment_failed']]);
       expect(emailService.sendConversationSummaryEmail).not.toHaveBeenCalled();
     });
@@ -815,14 +816,14 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     it('an account with no email address is skipped/no_recipient (no pending, nothing sent)', async () => {
       const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
       usersService.findById.mockResolvedValue({ id: 'u', email: null });
-      await gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1');
+      await gateway.sendSummaryReadyEmail(createFakeSession(), summary, REPORT, 'doc-1');
       expect(calls(conversationService)).toEqual([['skipped', 'no_recipient']]);
       expect(emailService.sendConversationSummaryEmail).not.toHaveBeenCalled();
     });
 
     it('a guest session records nothing', async () => {
       const { gateway, conversationService, emailService } = createSummaryGateway();
-      await gateway.sendSummaryReadyEmail(createFakeSession({ isGuest: true }), summary, 'doc-1');
+      await gateway.sendSummaryReadyEmail(createFakeSession({ isGuest: true }), summary, REPORT, 'doc-1');
       expect(conversationService.setSummaryEmailStatus).not.toHaveBeenCalled();
       expect(emailService.sendConversationSummaryEmail).not.toHaveBeenCalled();
     });
@@ -831,7 +832,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       const { gateway, conversationService, emailService, usersService } = createSummaryGateway();
       usersService.findById.mockResolvedValue({ id: 'u', email: ADDRESS });
       conversationService.setSummaryEmailStatus.mockRejectedValue(new Error('column "summary_email_status" does not exist')); // code deployed before the migration
-      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1')).resolves.toBeUndefined();
+      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, REPORT, 'doc-1')).resolves.toBeUndefined();
       expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledTimes(1);
       expect(conversationService.setSummaryStatus).not.toHaveBeenCalled();
     });
@@ -839,7 +840,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     it('a user lookup failure is recorded as failed/unknown_error', async () => {
       const { gateway, conversationService, usersService } = createSummaryGateway();
       usersService.findById.mockRejectedValue(new Error('db down'));
-      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, 'doc-1')).rejects.toThrow();
+      await expect(gateway.sendSummaryReadyEmail(createFakeSession(), summary, REPORT, 'doc-1')).rejects.toThrow();
       expect(calls(conversationService)).toEqual([['failed', 'unknown_error']]);
     });
   });
@@ -884,7 +885,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       claudeService.generateConversationSummaryDocument
         .mockImplementationOnce(async () => { await gate.promise; return { title: 'Part A', topic: 'a', sections: [{ heading: 'Summary', content: 'A' }] }; })
         .mockResolvedValueOnce({ title: 'Part B', topic: 'b', sections: [{ heading: 'Summary', content: 'B' }] });
-      documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/d' });
+      documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/d' });
       const client = createFakeClient('sock-1');
       const session = createFakeSession({ entitlements: entitlementsLocal });
 
@@ -934,34 +935,6 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     });
   });
 
-  describe('buildVerbatimTranscript', () => {
-    it('resolves owner/other labels to the session’s real names and keeps assistant turns attributed to CognIX AI', async () => {
-      const { gateway, conversationService } = createSummaryGateway();
-      const messages = ([
-        { role: 'user', speaker_label: 'owner', content: 'hello there', transcript: 'hello there' },
-        { role: 'user', speaker_label: 'other', content: 'hi back', transcript: 'hi back' },
-        { role: 'assistant', content: 'Nothing to flag.' },
-      ]);
-      const session = createFakeSession({ cachedOwnerName: 'Mr Tolu', otherSpeakerName: 'Dr Amaka' });
-
-      const transcript = gateway.buildVerbatimTranscript(messages, session);
-
-      expect(transcript).toBe('Mr Tolu: hello there\nDr Amaka: hi back\nCognIX AI: Nothing to flag.');
-    });
-
-    it('reformats bracketed multi-speaker lines into "Name: text" without the brackets', async () => {
-      const { gateway, conversationService } = createSummaryGateway();
-      const messages = ([
-        { role: 'user', speaker_label: 'multiple_speakers', content: '[Dr Smith]: first point\n[Dr Jones]: second point', transcript: '[Dr Smith]: first point\n[Dr Jones]: second point' },
-      ]);
-      const session = createFakeSession();
-
-      const transcript = gateway.buildVerbatimTranscript(messages, session);
-
-      expect(transcript).toBe('Dr Smith: first point\nDr Jones: second point');
-    });
-  });
-
   describe('autoGenerateConversationSummary', () => {
     it('marks skipped with a reason and makes no model/document calls when the tier has no document entitlement', async () => {
       const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
@@ -973,7 +946,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       expect(conversationService.claimSummaryGeneration).toHaveBeenCalledWith(session.conversationId, session.userId);
       expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'skipped', { skipReason: 'tier_no_documents' });
       expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
-      expect(documentService.generateAndUpload).not.toHaveBeenCalled();
+      expect(documentService.generateSummaryReport).not.toHaveBeenCalled();
     });
 
     it('marks skipped as too_short only when genuinely nothing was said', async () => {
@@ -997,14 +970,14 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         topic: 'A brief greeting',
         sections: [{ heading: 'Summary', content: 'The user said hello.' }],
       });
-      documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-2', downloadUrl: 'https://example.com/doc-2' });
+      documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-2', downloadUrl: 'https://example.com/doc-2' });
       const client = createFakeClient('sock-1');
       const session = createFakeSession({ entitlements });
 
       await gateway.autoGenerateConversationSummary(client, session);
 
       expect(conversationService.setSummaryStatus).not.toHaveBeenCalledWith(session.conversationId, session.userId, 'skipped', expect.anything());
-      expect(documentService.generateAndUpload).toHaveBeenCalled();
+      expect(documentService.generateSummaryReport).toHaveBeenCalled();
       expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'ready', { documentId: 'doc-2' });
     });
 
@@ -1021,17 +994,17 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         topic: 'A quick factual question',
         sections: [{ heading: 'Summary', content: 'The user asked for the capital of France; the AI answered Paris.' }],
       });
-      documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-3', downloadUrl: 'https://example.com/doc-3' });
+      documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-3', downloadUrl: 'https://example.com/doc-3' });
       const client = createFakeClient('sock-1');
       const session = createFakeSession({ entitlements, cachedOwnerName: 'Mr Tolu' });
 
       await gateway.autoGenerateConversationSummary(client, session);
 
-      const uploadCall = documentService.generateAndUpload.mock.calls[0][0];
-      const headings = uploadCall.sections.map((s: any) => s.heading);
-      expect(headings).not.toContain('Action Points / Next Steps');
-      expect(headings).not.toContain('Key Insights');
-      expect(headings[0]).toBe('Summary');
+      const uploadCall = documentService.generateSummaryReport.mock.calls[0][0];
+      const rs = uploadCall.report.sessions[0];
+      expect(rs.actionPoints).toEqual([]);
+      expect(rs.keyInsights).toEqual([]);
+      expect(rs.summary).not.toBe('');
     });
 
     it('marks skipped as quota_exceeded when the monthly document cap is hit', async () => {
@@ -1064,7 +1037,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'failed', { skipReason: 'generation_error' });
     });
 
-    it('splices a code-built Transcript section after Summary and moves Action Points / Next Steps to the end, landing at exactly 4 sections', async () => {
+    it('builds a structured report: one session with Summary, speaker-by-speaker transcript, Key Insights and Action Points', async () => {
       const { gateway, conversationService, claudeService, documentService, usageService } = createSummaryGateway();
       withHistory(conversationService, [
         { role: 'user', speaker_label: 'owner', content: 'hello', transcript: 'hello' },
@@ -1079,21 +1052,19 @@ describe('VoiceGateway auto-generated conversation summary', () => {
           { heading: 'Follow-up Actions', content: '- Do the thing' },
         ],
       });
-      documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/doc-1' });
+      documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/doc-1' });
       const client = createFakeClient('sock-1');
       const session = createFakeSession({ entitlements, cachedOwnerName: 'Mr Tolu' });
 
       await gateway.autoGenerateConversationSummary(client, session);
 
-      const uploadCall = documentService.generateAndUpload.mock.calls[0][0];
-      expect(uploadCall.sections.map((s: any) => s.heading)).toEqual([
-        'Summary',
-        'Transcript',
-        'Key Insights',
-        'Action Points / Next Steps',
-      ]);
-      expect(uploadCall.sections[1].content).toBe('Mr Tolu: hello');
-      expect(uploadCall.sections[3].content).toBe('- Do the thing');
+      const uploadCall = documentService.generateSummaryReport.mock.calls[0][0];
+      expect(uploadCall.report.sessions).toHaveLength(1);
+      const rs = uploadCall.report.sessions[0];
+      expect(rs.summary).toBe('They synced.');
+      expect(rs.transcript).toEqual([{ kind: 'turn', speaker: 'Mr Tolu', text: 'hello' }]);
+      expect(rs.keyInsights).toEqual(['Insight one']);
+      expect(rs.actionPoints).toEqual(['Do the thing']);
 
       expect(usageService.tryConsume).toHaveBeenCalledWith(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
       expect(conversationService.setSummaryStatus).toHaveBeenLastCalledWith(session.conversationId, session.userId, 'ready', { documentId: 'doc-1' });
@@ -1134,7 +1105,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
           topic: 'Planning Q4',
           sections: [{ heading: 'Summary', content: 'Planned Q4.' }],
         });
-        documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-9', downloadUrl: 'https://example.com/doc-9' });
+        documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-9', downloadUrl: 'https://example.com/doc-9' });
         const client = createFakeClient('sock-1');
         const session = createFakeSession({ entitlements: entitlementsLocal });
 
@@ -1144,22 +1115,20 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         expect(claudeService.generateConversationSummaryDocument.mock.calls[0][0]).toEqual([
           { role: 'user', content: 'now Q4 planning' },
         ]);
-        const upload = documentService.generateAndUpload.mock.calls[0][0];
-        expect(upload.skipSectionLimit).toBe(true);
+        const upload = documentService.generateSummaryReport.mock.calls[0][0];
         expect(upload.title).toBe('My Conversation — 2 sessions');
-        expect(upload.sections.map((x: any) => x.heading)).toEqual([
-          'Session 1 · 3 Nov 2026 — Budget Review',
-          'Summary',
-          'Session 2 · 10 Nov 2026 — Q4 Planning',
-          'Summary',
-          'Transcript',
+        expect(upload.report.sessions.map((x: any) => [x.number, x.title, x.summary])).toEqual([
+          [1, 'Budget Review', 'Reviewed Q3.'],
+          [2, 'Q4 Planning', 'Planned Q4.'],
         ]);
+        expect(upload.report.sessions[0].date.slice(0, 10)).toBe('2026-11-03');
         expect(conversationService.addSummaryPart).toHaveBeenCalledWith(
           session.conversationId,
           session.userId,
           expect.objectContaining({ title: 'Q4 Planning' }),
           'm0',
           'm0',
+          expect.objectContaining({ version: 1, summary: 'Planned Q4.' }),
         );
       });
 
@@ -1184,7 +1153,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
           topic: 'A quick sync',
           sections: [{ heading: 'Summary', content: 'They synced.' }],
         });
-        documentService.generateAndUpload.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/doc-1' });
+        documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/doc-1' });
       }
 
       it('emails the user a PDF attachment of the summary once it is ready', async () => {
@@ -1201,9 +1170,8 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         await new Promise((r) => setImmediate(r)); // fire-and-forget email step
 
         expect(usersService.findById).toHaveBeenCalledWith('user-1');
-        expect(documentService.buildSummaryPdfBuffer).toHaveBeenCalledWith(
-          'Quick Sync',
-          expect.arrayContaining([expect.objectContaining({ heading: 'Summary' })]),
+        expect(documentService.buildSummaryReportPdfBuffer).toHaveBeenCalledWith(
+          expect.objectContaining({ sessions: [expect.objectContaining({ summary: expect.any(String) })] }),
         );
         expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledWith(
           'owner@example.com',
@@ -1279,7 +1247,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
         topic: 'A quick sync',
         sections: [{ heading: 'Summary', content: 'They synced.' }],
       });
-      documentService.generateAndUpload.mockRejectedValue(new Error('upload failed'));
+      documentService.generateSummaryReport.mockRejectedValue(new Error('upload failed'));
       const client = createFakeClient('sock-1');
       const session = createFakeSession({ entitlements });
 

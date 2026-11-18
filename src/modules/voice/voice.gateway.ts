@@ -39,6 +39,7 @@ import { UsageService } from '@/modules/entitlements/usage.service';
 import { RecordingTimingService } from './services/recording-timing.service';
 import { countWords, describeError } from '@/common/utils/log-safe.util';
 import { SummaryEmailReason, classifyEmailError } from './utils/summary-email-status.util';
+import { buildStoredSessionData, buildSummaryReport, buildTranscriptItems } from './utils/summary-report.util';
 import { ContextCoverage, ContextPlan, SUMMARY_CONTEXT_BOUNDS, planSummaryContext, raceDeadline } from './utils/summary-context.util';
 import {
   AudioLossReason,
@@ -2459,8 +2460,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       return; // monthly document cap already hit
     }
 
-    const transcript = this.buildVerbatimTranscript(newMessages, session);
-
     const built = await this.buildInsightSummary(session, plan);
     if (!built.ok) {
       // Truthful failure: no summary is written (or recorded as covering anything), the stored
@@ -2471,12 +2470,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
     const summary = built.summary;
 
-    // Code-built from the stored transcript, not model output — guarantees
-    // the "word for word, who said what" section can't be paraphrased or
-    // hallucinated by the model. Spliced in right after Summary, Teams-style.
-    if (transcript) {
-      summary.sections.splice(1, 0, { heading: 'Transcript', content: transcript });
-    }
+    // The word-for-word transcript is built in code from the stored messages (never from model output),
+    // so who-said-what can't be paraphrased or hallucinated. It is kept as structured turns — each speaker's
+    // words, with the AI's insights shown after the turns that prompted them — and rendered by the report.
+    const transcriptItems = buildTranscriptItems(newMessages, {
+      owner: session.cachedOwnerName,
+      other: session.otherSpeakerName ?? 'Other Speaker',
+    });
+    const sessionData = buildStoredSessionData(summary.sections, transcriptItems);
     // "Action Points / Next Steps" always last, whatever the model named the
     // equivalent section (it's asked for "Follow-up Actions").
     const actionIdx = summary.sections.findIndex((s) => /follow-?up actions?/i.test(s.heading));
@@ -2486,16 +2487,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     }
 
     let combined: { title: string; topic: string; sections: Array<{ heading: string; content: string }> };
+    let report: ReturnType<typeof buildSummaryReport>;
     try {
       const priorParts = await this.conversationService.getSummaryParts(session.conversationId, session.userId);
       const conversationTitle = await this.conversationService.getConversationTitle(session.conversationId, session.userId);
-      combined = buildCombinedSummary(
-        [
-          ...priorParts,
-          { title: summary.title, topic: summary.topic, sections: summary.sections, covers_from: new Date(newMessages[0].created_at) },
-        ],
-        conversationTitle,
-      );
+      const thisPart = { title: summary.title, topic: summary.topic, sections: summary.sections, covers_from: new Date(newMessages[0].created_at), session_data: sessionData };
+      combined = buildCombinedSummary([...priorParts, thisPart], conversationTitle);
+      // One section per conversation/session, oldest first — each earlier session keeps its own date, summary and transcript.
+      report = buildSummaryReport([...priorParts, thisPart], conversationTitle);
     } catch (err) {
       await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'failed', { skipReason: 'generation_error' });
       throw err;
@@ -2504,16 +2503,14 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     client.emit('document:generating', { title: combined.title, topic: combined.topic, auto: true });
 
     try {
-      const result = await this.documentService.generateAndUpload({
+      const result = await this.documentService.generateSummaryReport({
         userId: session.userId,
         conversationId: session.conversationId,
+        report,
         title: combined.title,
         topic: combined.topic,
-        sections: combined.sections,
-        depth: 'brief',
         format: 'docx',
         allowedDepths: entitlements.allowedDocumentDepths,
-        skipSectionLimit: true,
       });
 
       // Recorded only after the document exists, so a failed upload leaves
@@ -2522,6 +2519,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
         { title: summary.title, topic: summary.topic, sections: summary.sections },
         newMessages[0].id,
         newMessages[newMessages.length - 1].id,
+        sessionData,
       );
 
       await this.usageService.tryConsume(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
@@ -2564,7 +2562,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       // Fire-and-forget, same as the push notification above: for a user
       // who's already closed the app, this is the one delivery channel that
       // doesn't depend on a live connection or a notification permission.
-      this.sendSummaryReadyEmail(session, combined, result.docId).catch((err) =>
+      this.sendSummaryReadyEmail(session, { title: combined.title }, report, result.docId).catch((err) =>
         this.logger.warn(`Summary-ready email failed for conversation ${session.conversationId}: ${describeError(err)}`),
       );
 
@@ -2657,7 +2655,8 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
    */
   private async sendSummaryReadyEmail(
     session: ActiveSession,
-    summary: { title: string; sections: Array<{ heading: string; content: string }> },
+    summary: { title: string },
+    report: ReturnType<typeof buildSummaryReport>,
     documentId: string,
   ): Promise<void> {
     if (session.isGuest) return;
@@ -2688,7 +2687,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let stage: 'attachment' | 'send' = 'attachment';
     try {
       const conversationTitle = (await this.conversationService.getConversationTitle(session.conversationId, session.userId)) ?? summary.title;
-      const pdfBuffer = await this.documentService.buildSummaryPdfBuffer(summary.title, summary.sections);
+      const pdfBuffer = await this.documentService.buildSummaryReportPdfBuffer(report);
       const filename = `${summary.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'conversation-summary'}.pdf`;
 
       stage = 'send';
@@ -2702,49 +2701,6 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
       await record('failed', stage === 'attachment' ? 'attachment_failed' : classifyEmailError(err));
       throw err;
     }
-  }
-
-  /**
-   * Word-for-word transcript with real speaker names, Teams-recap style —
-   * built directly from the saved messages (never from a model) so it can't
-   * drift from what was actually said. Resolves 'owner'/'other' against the
-   * session's live display names; multi-speaker messages already carry real
-   * names bracketed per line (see buildMultiSpeakerSegmentDtos) and are
-   * reformatted to match the "Name: text" shape used throughout.
-   */
-  private buildVerbatimTranscript(messages: ConversationMessage[], session: ActiveSession): string {
-    const lines: string[] = [];
-
-    for (const m of messages) {
-      if (m.role === 'assistant') {
-        if (m.content?.trim()) lines.push(`CognIX AI: ${m.content.trim()}`);
-        continue;
-      }
-
-      const text = (m.transcript ?? m.content ?? '').trim();
-      if (!text) continue;
-
-      if (m.speaker_label === 'multiple_speakers') {
-        // Already "[Name]: text" per line — reformat to drop the brackets.
-        for (const rawLine of text.split('\n')) {
-          const match = rawLine.match(/^\[(.+?)\]:\s*(.*)$/);
-          if (match) lines.push(`${match[1]}: ${match[2]}`);
-          else if (rawLine.trim()) lines.push(rawLine.trim());
-        }
-        continue;
-      }
-
-      const speakerName =
-        m.speaker_label === 'owner'
-          ? session.cachedOwnerName
-          : m.speaker_label === 'other'
-            ? (session.otherSpeakerName ?? 'Other Speaker')
-            : session.cachedOwnerName; // single-speaker/text mode — the one human in the conversation
-
-      lines.push(`${speakerName}: ${text}`);
-    }
-
-    return lines.join('\n');
   }
 
   // ─── Multi-speaker prompt processing (Gap 4) ─────────────────────────────────

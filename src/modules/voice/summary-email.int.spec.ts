@@ -124,7 +124,7 @@ d('summary email outcome (real Postgres)', () => {
         conversations, noop, noop, noop, { findById: jest.fn().mockResolvedValue({ id: userId, email: ADDRESS }) } as any,
         noop, { sendConversationSummaryEmail: sendEmail } as any, { log: jest.fn() } as any,
         noop, noop, noop,
-        { generateAndUpload: jest.fn().mockResolvedValue({ docId, downloadUrl: 'https://example.com/d' }), buildSummaryPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf')) } as any,
+        { generateSummaryReport: jest.fn().mockResolvedValue({ docId, downloadUrl: 'https://example.com/d' }), buildSummaryReportPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf')) } as any,
         { sendToUser: jest.fn().mockResolvedValue(undefined) } as any, noop,
         { getStatus: jest.fn().mockResolvedValue({ canUse: true }), tryConsume: jest.fn().mockResolvedValue(undefined) } as any, noop,
       );

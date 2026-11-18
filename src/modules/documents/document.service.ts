@@ -27,6 +27,9 @@ import PDFDocument = require('pdfkit');
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { describeError } from '@/common/utils/log-safe.util';
+import { SummaryReport } from './summary-report/summary-report.types';
+import { renderSummaryReportDocx } from './summary-report/summary-report.docx';
+import { renderSummaryReportPdf } from './summary-report/summary-report.pdf';
 
 export interface DocumentSection {
   heading: string;
@@ -114,6 +117,47 @@ export class DocumentService {
       ? await this.buildPdf(title, enrichedSections)
       : await this.buildDocx(title, enrichedSections);
 
+    return this.storeDocument({ buffer, userId, conversationId, title, topic, sectionCount: enrichedSections.length, depth, format });
+  }
+
+  /**
+   * A conversation's summary report: cover, "sessions at a glance", then one section per session
+   * (summary → speaker-by-speaker transcript with the AI's insights → key insights → action points).
+   * Rendered from one structured model, so the Word and PDF versions have the same content and layout.
+   */
+  async generateSummaryReport(params: {
+    userId: string;
+    conversationId?: string;
+    report: SummaryReport;
+    topic?: string;
+    format?: 'docx' | 'pdf';
+    /** Title stored with the document (defaults to the report's cover title). */
+    title?: string;
+    /** The plan's permitted depths — the report is a 'brief' document and is refused if that isn't allowed. */
+    allowedDepths?: Array<'brief' | 'standard' | 'comprehensive'>;
+  }): Promise<GeneratedDocument> {
+    const { userId, conversationId, report, topic = '', format = 'docx', allowedDepths } = params;
+    if (allowedDepths && !allowedDepths.includes('brief')) {
+      throw new ForbiddenException(`This plan does not permit "brief" depth documents. Allowed depths: ${allowedDepths.join(', ')}.`);
+    }
+    this.logger.log(`Generating summary report (format: ${format}, sessions: ${report.sessions.length})`);
+    const buffer = format === 'pdf' ? await renderSummaryReportPdf(report) : await renderSummaryReportDocx(report);
+    return this.storeDocument({
+      buffer, userId, conversationId, title: params.title ?? report.title, topic,
+      sectionCount: report.sessions.length, depth: 'brief', format,
+    });
+  }
+
+  /** The same report as a PDF buffer — for attaching to the summary email. No upload, no database row. */
+  async buildSummaryReportPdfBuffer(report: SummaryReport): Promise<Buffer> {
+    return renderSummaryReportPdf(report);
+  }
+
+  private async storeDocument(p: {
+    buffer: Buffer; userId: string; conversationId?: string; title: string; topic: string;
+    sectionCount: number; depth: 'brief' | 'standard' | 'comprehensive'; format: 'docx' | 'pdf';
+  }): Promise<GeneratedDocument> {
+    const { buffer, userId, conversationId, title, topic, sectionCount, depth, format } = p;
     // uploadToCloudinary has no timeout of its own (the cloudinary SDK
     // doesn't set one), so a stalled upload — Cloudinary outage, a dropped
     // connection that never fires an error or a close — previously left
@@ -135,7 +179,7 @@ export class DocumentService {
         title,
         topic: topic || null,
         download_url: downloadUrl,
-        section_count: enrichedSections.length,
+        section_count: sectionCount,
         depth,
         format,
       })

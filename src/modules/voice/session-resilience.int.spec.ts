@@ -95,8 +95,8 @@ d('session resilience (real Postgres)', () => {
       };
       const docs = [docA, docB];
       const documentService = {
-        generateAndUpload: jest.fn(async () => ({ docId: docs.shift(), downloadUrl: 'https://example.com/d' })),
-        buildSummaryPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf')),
+        generateSummaryReport: jest.fn(async () => ({ docId: docs.shift(), downloadUrl: 'https://example.com/d' })),
+        buildSummaryReportPdfBuffer: jest.fn().mockResolvedValue(Buffer.from('pdf')),
       };
       const noop = {} as any;
       const gateway: any = new VoiceGateway(
@@ -141,7 +141,7 @@ d('session resilience (real Postgres)', () => {
       expect(new Date(parts[0].covers_from).getTime()).toBe(new Date((await range(m1, m3)).f).getTime());
       expect(new Date(parts[0].covers_to).getTime()).toBe(new Date((await range(m1, m3)).t).getTime());
       expect(new Date(parts[1].covers_from).getTime()).toBe(new Date((await range(m4, m5)).f).getTime());
-      expect(documentService.generateAndUpload).toHaveBeenCalledTimes(2);
+      expect(documentService.generateSummaryReport).toHaveBeenCalledTimes(2);
 
       // a further Stop with nothing new is a no-op: up to date, no duplicate part
       gateway.sessions.set('sock-3', baseSession({ conversationId: cid, entitlements }));

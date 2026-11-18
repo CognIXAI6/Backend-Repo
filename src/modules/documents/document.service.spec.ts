@@ -80,3 +80,46 @@ describe('DocumentService.generateAndUpload — upload timeout wiring', () => {
     expect(knex).toHaveBeenCalledWith('generated_documents');
   });
 });
+
+describe('DocumentService.generateSummaryReport', () => {
+  const report = {
+    title: 'My Conversation',
+    generatedAt: '2026-11-18T10:00:00.000Z',
+    sessions: [
+      { number: 1, date: '2026-11-17T09:00:00.000Z', title: 'Yesterday', description: 'd', summary: 'S1', transcript: [{ kind: 'turn', speaker: 'A', text: 'hi' }], keyInsights: ['k'], actionPoints: ['a'] },
+      { number: 2, date: '2026-11-18T09:00:00.000Z', title: 'Today', description: 'd', summary: 'S2', transcript: [], keyInsights: [], actionPoints: [] },
+    ],
+  } as any;
+
+  beforeEach(() => {
+    (cloudinary.uploader.upload_stream as jest.Mock).mockImplementation((_opts: any, cb: any) => {
+      cb(null, { secure_url: 'https://cloudinary.example/report.docx' });
+      return { on: jest.fn(), end: jest.fn() };
+    });
+  });
+
+  it('stores one Word document with one section per session', async () => {
+    const { service, knex } = createService();
+    const result = await service.generateSummaryReport({ userId: 'user-1', conversationId: 'c-1', report, title: 'My Conversation' });
+    expect(result).toEqual({ docId: 'doc-1', downloadUrl: 'https://cloudinary.example/report.docx' });
+    expect(knex).toHaveBeenCalledWith('generated_documents');
+  });
+
+  it('refuses when the plan does not allow brief documents, before any rendering or upload', async () => {
+    const { service } = createService();
+    (cloudinary.uploader.upload_stream as jest.Mock).mockClear();
+    await expect(
+      service.generateSummaryReport({ userId: 'user-1', report, allowedDepths: ['comprehensive'] }),
+    ).rejects.toThrow(/brief/);
+    expect(cloudinary.uploader.upload_stream).not.toHaveBeenCalled();
+  });
+
+  it('builds the email PDF without uploading or writing a row', async () => {
+    const { service, knex } = createService();
+    (cloudinary.uploader.upload_stream as jest.Mock).mockClear();
+    const pdf: Buffer = await service.buildSummaryReportPdfBuffer(report);
+    expect(pdf.subarray(0, 5).toString()).toBe('%PDF-');
+    expect(cloudinary.uploader.upload_stream).not.toHaveBeenCalled();
+    expect(knex).not.toHaveBeenCalled();
+  });
+});

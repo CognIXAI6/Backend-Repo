@@ -116,6 +116,8 @@ export interface ConversationSummaryPart {
   sections: Array<{ heading: string; content: string }>;
   covers_from: Date;
   covers_to: Date;
+  /** Structured session content (summary, transcript turns with insights, key insights, actions); null for older parts. */
+  session_data?: import('@/modules/documents/summary-report/summary-report.types').StoredSessionData | null;
   created_at: Date;
 }
 
@@ -603,17 +605,18 @@ export class ConversationService {
     part: { title: string; topic: string | null; sections: Array<{ heading: string; content: string }> },
     firstMessageId: string,
     lastMessageId: string,
+    sessionData?: import('@/modules/documents/summary-report/summary-report.types').StoredSessionData | null,
   ): Promise<void> {
     // Only for the owner's conversation, and the covered range is read from messages of THAT
     // conversation: an id from elsewhere yields NULL (rejected by NOT NULL), never a foreign timestamp.
     const result = await this.knex.raw(
-      `INSERT INTO conversation_summary_parts (conversation_id, title, topic, sections, covers_from, covers_to)
-       SELECT c.id, ?, ?, ?::jsonb,
+      `INSERT INTO conversation_summary_parts (conversation_id, title, topic, sections, session_data, covers_from, covers_to)
+       SELECT c.id, ?, ?, ?::jsonb, ?::jsonb,
               (SELECT created_at FROM conversation_messages WHERE id = ? AND conversation_id = c.id),
               (SELECT created_at FROM conversation_messages WHERE id = ? AND conversation_id = c.id)
          FROM conversations c
         WHERE c.id = ? AND c.user_id = ? AND c.deleted_at IS NULL`,
-      [part.title, part.topic, JSON.stringify(part.sections), firstMessageId, lastMessageId, conversationId, userId],
+      [part.title, part.topic, JSON.stringify(part.sections), sessionData ? JSON.stringify(sessionData) : null, firstMessageId, lastMessageId, conversationId, userId],
     );
     if ((result?.rowCount ?? 0) === 0) throw new NotFoundException('Conversation not found');
   }
