@@ -21,6 +21,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { formatGeneratedDate, formatReportDate, formatReportRange } from '@/modules/voice/utils/summary-report.util';
 import { SummaryReport, TranscriptItem } from './summary-report.types';
+import { cleanMarkdown } from './plain-text';
 
 const LOGO_PNG = readFileSync(join(__dirname, '..', '..', '..', 'assets', 'cognix-logo.png'));
 const LOGO_ASPECT = 180 / 600;
@@ -59,7 +60,7 @@ const spacer = (after = 200) => new Paragraph({ spacing: { before: 0, after }, c
 
 const run = (text: string, o: { size?: number; color?: string; bold?: boolean; italics?: boolean; spacing?: number; shade?: string } = {}) =>
   new TextRun({
-    text,
+    text: cleanMarkdown(text),
     font: SERIF,
     size: o.size ?? 22,
     color: o.color ?? BODY,

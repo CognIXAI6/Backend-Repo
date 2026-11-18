@@ -66,3 +66,31 @@ describe('summary report renderers', () => {
     expect(plain).toMatch(/Sessions at a glance/i);
   });
 });
+
+describe('markdown never reaches the document', () => {
+  const md = () => {
+    const r = sampleReport();
+    r.sessions[0].summary = 'Ideas in **Nigeria** and `code`';
+    r.sessions[0].keyInsights = ['**Bold** insight'];
+    r.sessions[0].transcript = [
+      { kind: 'turn', speaker: 'Segun', text: 'DC. Making money.' },
+      { kind: 'insights', bullets: ['Did you mean: "ideas in **DC (Washington D.C.)**"?'] },
+    ];
+    return r;
+  };
+
+  it('PDF has no ** or backticks', async () => {
+    const text = (await renderSummaryReportPdf(md(), { compress: false })).toString('latin1');
+    const decoded = [...text.matchAll(/\[([^\]]*)\]\s*TJ/g)].map((m) => [...m[1].matchAll(/<([0-9a-fA-F]*)>/g)].map((h) => Buffer.from(h[1], 'hex').toString('latin1')).join('')).join('\n');
+    expect(decoded).toContain('Nigeria');
+    expect(decoded).not.toMatch(/\*\*|`/);
+  });
+
+  it('DOCX has no ** or backticks', async () => {
+    const zip = await JSZip.loadAsync(await renderSummaryReportDocx(md()));
+    const xml = await zip.file('word/document.xml')!.async('string');
+    const plain = xml.replace(/<[^>]+>/g, ' ');
+    expect(plain).toContain('Nigeria');
+    expect(plain).not.toMatch(/\*\*|`/);
+  });
+});

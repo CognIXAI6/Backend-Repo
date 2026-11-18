@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { formatGeneratedDate, formatReportDate, formatReportRange } from '@/modules/voice/utils/summary-report.util';
 import { SummaryReport, TranscriptItem } from './summary-report.types';
+import { cleanMarkdown } from './plain-text';
 
 const LOGO_PNG = readFileSync(join(__dirname, '..', '..', '..', 'assets', 'cognix-logo.png'));
 const LOGO_ASPECT = 180 / 600;
@@ -37,7 +38,7 @@ const SERIF_ITALIC = 'Times-Italic';
 export function pdfSafe(text: string): string {
   const keep = /[ -~ -ÿ‘’“”–—•…€™\n]/;
   let out = '';
-  for (const ch of String(text ?? '')) {
+  for (const ch of cleanMarkdown(text)) {
     if (keep.test(ch)) { out += ch; continue; }
     const base = ch.normalize('NFD').replace(/[̀-ͯ]/g, '');
     out += /^[ -~]+$/.test(base) ? base : '?';
