@@ -91,6 +91,15 @@ describe('ConversationService.setSummaryStatus', () => {
     );
   });
 
+  it('clears an earlier failure reason when the summary becomes ready (no stale "ready / generation_error")', async () => {
+    const chain = createFakeUpdateChain();
+    const knexLike: any = jest.fn(() => chain);
+    const service = new ConversationService(knexLike, createFakeConfigService());
+
+    await service.setSummaryStatus('conv-1', 'user-1', 'ready', { documentId: 'doc-1' });
+    expect(chain.update.mock.calls[0][0]).toEqual(expect.objectContaining({ summary_status: 'ready', summary_skip_reason: null }));
+  });
+
   it('writes the generated document id when ready', async () => {
     const chain = createFakeUpdateChain();
     const knexLike: any = jest.fn(() => chain);

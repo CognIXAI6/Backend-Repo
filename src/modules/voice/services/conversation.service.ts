@@ -656,6 +656,8 @@ export class ConversationService {
   ): Promise<void> {
     const update: Record<string, unknown> = { summary_status: status, updated_at: new Date() };
     if ('skipReason' in opts) update.summary_skip_reason = opts.skipReason ?? null;
+    // A success must not keep an earlier attempt's failure reason ("ready / generation_error").
+    else if (status === 'ready') update.summary_skip_reason = null;
     if ('documentId' in opts) update.summary_document_id = opts.documentId ?? null;
 
     // Only the owner's (non-deleted) conversation; anything else updates nothing.
