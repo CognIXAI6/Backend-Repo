@@ -454,3 +454,56 @@ describe('ClaudeService.streamResponse — attachments are analysed one at a tim
     expect(prompt).toMatch(/Only compare or combine files when the user explicitly asks/i);
   });
 });
+
+describe('ClaudeService summary generation — malformed replies never cost a summary', () => {
+  const textResponse = (text: string, stop_reason = 'end_turn') => ({ content: [{ type: 'text', text }], stop_reason });
+  const doc = JSON.stringify({ title: 'Quality Update', topic: 't', sections: [{ heading: 'Summary', content: 'They said "hello".' }] });
+  // the production failure: an unescaped quote inside an array element
+  const broken = '{"title":"Q","topic":"t","sections":[{"heading":"Summary","content":"He said "stop" now"}]}';
+  const turns = [{ role: 'user', content: 'hello' }];
+  const withClient = (create: jest.Mock) => {
+    const service = createService() as any;
+    service.client = { messages: { create } };
+    jest.spyOn(service.logger, 'warn').mockImplementation(() => undefined);
+    return service;
+  };
+
+  it('asks the API for schema-constrained JSON with room for a long recap', async () => {
+    const create = jest.fn().mockResolvedValue(textResponse(doc));
+    await withClient(create).generateConversationSummaryDocument(turns);
+    const req = create.mock.calls[0][0];
+    expect(req.output_config.format.type).toBe('json_schema');
+    expect(req.output_config.format.schema.required).toEqual(['title', 'topic', 'sections']);
+    expect(req.max_tokens).toBeGreaterThanOrEqual(4000);
+  });
+
+  it('a reply with broken JSON is retried once, and the retry is used', async () => {
+    const create = jest.fn().mockResolvedValueOnce(textResponse(broken)).mockResolvedValueOnce(textResponse(doc));
+    const result = await withClient(create).generateConversationSummaryDocument(turns);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ title: 'Quality Update', topic: 't', sections: [{ heading: 'Summary', content: 'They said "hello".' }] });
+  });
+
+  it('a reply cut off at max_tokens is retried, not parsed', async () => {
+    const create = jest.fn().mockResolvedValueOnce(textResponse('{"title":"Q","sec', 'max_tokens')).mockResolvedValueOnce(textResponse(doc));
+    expect(await withClient(create).generateConversationSummaryDocument(turns)).toMatchObject({ title: 'Quality Update' });
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('an API error is retried once too', async () => {
+    const create = jest.fn().mockRejectedValueOnce(new Error('overloaded')).mockResolvedValueOnce(textResponse(doc));
+    expect(await withClient(create).generateConversationSummaryDocument(turns)).toMatchObject({ title: 'Quality Update' });
+  });
+
+  it('gives up (null) after two unusable replies, so the caller records a truthful failure', async () => {
+    const create = jest.fn().mockResolvedValue(textResponse(broken));
+    expect(await withClient(create).generateConversationSummaryDocument(turns)).toBeNull();
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('still accepts a fenced reply and drops empty sections', async () => {
+    const fenced = '```json\n' + JSON.stringify({ title: 'T', topic: 't', sections: [{ heading: 'Summary', content: 'S' }, { heading: 'Key Insights', content: '  ' }] }) + '\n```';
+    const create = jest.fn().mockResolvedValue(textResponse(fenced));
+    expect(await withClient(create).generateConversationSummaryDocument(turns)).toEqual({ title: 'T', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
+  });
+});

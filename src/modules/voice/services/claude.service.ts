@@ -1092,29 +1092,80 @@ Rules:
 - A short or purely informational conversation (a quick question and answer, small talk, a single lookup) is expected to produce ONLY a "Summary" section — that is a correct, complete result, not a failure.
 - Base everything strictly on the ${kind === 'notes' ? 'notes' : 'transcript'} below. Never invent facts, names, or numbers not present in it.${kind === 'notes' ? ' The notes cover the whole conversation in order: represent the beginning, the middle and the end, not only the most recent part.' : ''}`;
 
-    try {
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 1200,
-        system,
-        messages: [{ role: 'user', content: userContent }],
-      });
+    // A free-text "output only JSON" reply broke on a single unescaped quote in production
+    // (JSON.parse: "Expected ',' or ']' after array element") and the whole summary was lost.
+    // Structured outputs make the API return JSON that matches this schema; a reply that is
+    // still unusable (cut off at max_tokens, unparsable, wrong shape) gets one more attempt.
+    for (let attempt = 1; attempt <= ClaudeService.SUMMARY_ATTEMPTS; attempt++) {
+      try {
+        const response = await this.client.messages.create({
+          model: this.model,
+          max_tokens: 4000,
+          system,
+          messages: [{ role: 'user', content: userContent }],
+          output_config: { format: { type: 'json_schema', schema: ClaudeService.SUMMARY_SCHEMA } },
+        });
 
-      const block = response.content[0];
-      if (block.type !== 'text') return null;
-
-      const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
-      const parsed = JSON.parse(cleaned);
-
-      if (typeof parsed.title !== 'string' || !Array.isArray(parsed.sections) || parsed.sections.length === 0) {
-        this.logger.warn('generateConversationSummaryDocument: unexpected shape from model, skipping');
-        return null;
+        if (response.stop_reason === 'max_tokens') {
+          this.logger.warn(`generateConversationSummaryDocument: reply cut off at max_tokens (attempt ${attempt})`);
+          continue;
+        }
+        const parsed = parseSummaryJson(response.content);
+        if (!parsed) {
+          this.logger.warn(`generateConversationSummaryDocument: unexpected shape from model (attempt ${attempt})`);
+          continue;
+        }
+        return parsed;
+      } catch (err) {
+        this.logger.warn(`generateConversationSummaryDocument failed (attempt ${attempt}): ${describeError(err)}`);
       }
-
-      return { title: parsed.title, topic: parsed.topic ?? '', sections: parsed.sections };
-    } catch (err) {
-      this.logger.warn(`generateConversationSummaryDocument failed: ${describeError(err)}`);
-      return null;
     }
+    return null;
   }
+
+  private static readonly SUMMARY_ATTEMPTS = 2;
+
+  /** The recap shape the summary prompt describes, enforced by the API (structured outputs). */
+  private static readonly SUMMARY_SCHEMA = {
+    type: 'object',
+    properties: {
+      title: { type: 'string' },
+      topic: { type: 'string' },
+      sections: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: { heading: { type: 'string' }, content: { type: 'string' } },
+          required: ['heading', 'content'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['title', 'topic', 'sections'],
+    additionalProperties: false,
+  };
+}
+
+/**
+ * Reads the recap out of a model reply. Tolerates a markdown fence around the JSON (older replies),
+ * and rejects anything without a title and at least one section with text.
+ */
+export function parseSummaryJson(
+  content: Array<{ type: string; text?: string }>,
+): { title: string; topic: string; sections: Array<{ heading: string; content: string }> } | null {
+  const text = content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('').trim();
+  if (!text) return null;
+  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed.title !== 'string' || !Array.isArray(parsed.sections)) return null;
+  const sections = parsed.sections
+    .filter((s: any) => s && typeof s.heading === 'string' && typeof s.content === 'string' && s.content.trim())
+    .map((s: any) => ({ heading: s.heading, content: s.content }));
+  if (sections.length === 0) return null;
+  return { title: parsed.title, topic: typeof parsed.topic === 'string' ? parsed.topic : '', sections };
 }
