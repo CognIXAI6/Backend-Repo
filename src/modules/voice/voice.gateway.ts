@@ -2378,6 +2378,51 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly summariesInFlight = new Set<string>();
   private readonly summaryRerunRequests = new Map<string, { client: Socket; session: ActiveSession }>();
 
+  /**
+   * Operator re-run of the auto-summary for one conversation, outside a live session
+   * (scripts/regenerate-summary.ts). Builds the session the same way session:start does
+   * (owner name, plan, field) and then runs the normal path, so the result is identical:
+   * the document, the chat message that links it, the push notification and the email.
+   * Ownership is checked; a summary already up to date or currently running is left alone.
+   */
+  async regenerateSummaryForConversation(
+    conversationId: string,
+    userId: string,
+  ): Promise<{ summaryStatus: string | null; skipReason: string | null; documentId: string | null; events: string[] }> {
+    await this.conversationService.assertOwnership(conversationId, userId);
+    const user = await this.usersService.findById(userId);
+    const { tier, entitlements } = await this.entitlementsService.getUserEntitlements(userId);
+    const fieldId = await this.conversationService.getConversationFieldId(conversationId, userId);
+    const fieldName = fieldId ? (await this.fieldsService.findFieldRecordForUser(userId, fieldId))?.name : undefined;
+
+    const session = {
+      userId,
+      conversationId,
+      isGuest: false,
+      tier,
+      entitlements,
+      fieldId,
+      fieldName,
+      cachedOwnerName: user?.name || user?.email?.split('@')[0] || 'You',
+      otherSpeakerName: null,
+      traceId: `regenerate-${randomUUID()}`,
+      isProcessingAI: false,
+      inFlightTurns: new Map(),
+    } as unknown as ActiveSession;
+    const events: string[] = [];
+    const client = { id: 'operator-regenerate', emit: (event: string) => { events.push(event); return true; } } as unknown as Socket;
+
+    await this.autoGenerateConversationSummary(client, session);
+
+    const conv = (await this.conversationService.getConversation(conversationId, userId)) as Record<string, any> | null;
+    return {
+      summaryStatus: conv?.summary_status ?? null,
+      skipReason: conv?.summary_skip_reason ?? null,
+      documentId: conv?.summary_document_id ?? null,
+      events,
+    };
+  }
+
   private async autoGenerateConversationSummary(client: Socket, session: ActiveSession): Promise<void> {
     const id = session.conversationId;
     if (this.summariesInFlight.has(id)) {

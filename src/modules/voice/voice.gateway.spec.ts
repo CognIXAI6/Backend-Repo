@@ -651,6 +651,55 @@ describe('VoiceGateway auto-generated conversation summary', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
+  describe('regenerateSummaryForConversation (operator re-run script)', () => {
+    const setupRegen = () => {
+      const t = createSummaryGateway() as ReturnType<typeof createSummaryGateway> & { conversationService: any };
+      Object.assign(t.conversationService, {
+        assertOwnership: jest.fn().mockResolvedValue(undefined),
+        getConversationFieldId: jest.fn().mockResolvedValue('field-1'),
+        getConversation: jest.fn().mockResolvedValue({ summary_status: 'ready', summary_skip_reason: null, summary_document_id: 'doc-7' }),
+      });
+      t.gateway.entitlementsService = { getUserEntitlements: jest.fn().mockResolvedValue({ tier: 'xpress', entitlements }) };
+      t.gateway.fieldsService = { findFieldRecordForUser: jest.fn().mockResolvedValue({ name: 'Construction' }) };
+      t.usersService.findById.mockResolvedValue({ id: 'user-1', name: 'Segun', email: 'owner@example.com' });
+      withHistory(t.conversationService, [{ role: 'user', speaker_label: 'owner', content: 'status update', transcript: 'status update' }]);
+      t.claudeService.generateConversationSummaryDocument.mockResolvedValue({ title: 'Quality Update', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
+      t.documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-7', downloadUrl: 'https://example.com/doc-7' });
+      return t;
+    };
+
+    it('runs the normal path for the real owner: document, linking chat message, push and email', async () => {
+      const { gateway, conversationService, documentService, pushNotificationService, emailService } = setupRegen();
+      const result = await gateway.regenerateSummaryForConversation('conv-1', 'user-1');
+      await new Promise((r) => setImmediate(r));
+
+      expect(conversationService.assertOwnership).toHaveBeenCalledWith('conv-1', 'user-1');
+      const call = documentService.generateSummaryReport.mock.calls[0][0];
+      expect(call).toMatchObject({ userId: 'user-1', conversationId: 'conv-1', allowedDepths: ['brief'] });
+      expect(call.report.sessions[0].transcript[0]).toEqual({ kind: 'turn', speaker: 'Segun', text: 'status update' });
+      expect(conversationService.saveMessage).toHaveBeenCalledWith(expect.objectContaining({ conversationId: 'conv-1', role: 'assistant', documentId: 'doc-7' }));
+      expect(pushNotificationService.sendToUser).toHaveBeenCalledWith('user-1', expect.anything());
+      expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ summaryStatus: 'ready', skipReason: null, documentId: 'doc-7', events: expect.arrayContaining(['document:ready']) });
+    });
+
+    it('refuses when the user does not own the conversation, before any work', async () => {
+      const { gateway, conversationService, claudeService } = setupRegen();
+      conversationService.assertOwnership.mockRejectedValue(new Error('not owner'));
+      await expect(gateway.regenerateSummaryForConversation('conv-1', 'someone-else')).rejects.toThrow('not owner');
+      expect(conversationService.claimSummaryGeneration).not.toHaveBeenCalled();
+      expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
+    });
+
+    it('does nothing when the summary is already up to date or running (claim refused)', async () => {
+      const { gateway, conversationService, documentService } = setupRegen();
+      conversationService.claimSummaryGeneration.mockResolvedValue(false);
+      const result = await gateway.regenerateSummaryForConversation('conv-1', 'user-1');
+      expect(documentService.generateSummaryReport).not.toHaveBeenCalled();
+      expect(result.events).not.toContain('document:ready');
+    });
+  });
+
   describe('complete summary context (nothing dropped, truthful failure)', () => {
     const entitlementsLocal = { maxDocumentsPerMonth: 10, allowedDocumentDepths: ['brief'] };
     const longConversation = (n: number, len: number) =>
