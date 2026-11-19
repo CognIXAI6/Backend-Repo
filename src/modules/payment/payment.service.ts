@@ -1,4 +1,5 @@
 import { Injectable, Inject, BadRequestException, NotFoundException, Logger } from '@nestjs/common';
+import { buildDocumentQuota } from '@/modules/entitlements/document-quota';
 import { ConfigService } from '@nestjs/config';
 import Stripe from 'stripe';
 import { Knex } from 'knex';
@@ -627,6 +628,7 @@ export class PaymentService {
         videoAnalyses: usage.video_analyses,
         webSearches: usage.web_searches,
       },
+      documentQuota: buildDocumentQuota(entitlements, usage.documents),
       subscription: subscription ?? null,
     };
   }

@@ -652,6 +652,55 @@ describe('VoiceGateway auto-generated conversation summary', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
+  describe('document quota is surfaced to the client (feature:unavailable, never a capture block)', () => {
+    const docEvents = (client: any) => client.emit.mock.calls.filter((c: any[]) => c[0] === 'feature:unavailable' && c[1].feature === 'documents');
+
+    it('an auto-summary skipped for quota tells the client why, with the reset date', async () => {
+      const { gateway, conversationService, usageService } = createSummaryGateway();
+      withHistory(conversationService, [{ role: 'user', content: 'hi' }]);
+      usageService.getStatus.mockResolvedValue({ used: 5, limit: 5, remaining: 0, canUse: false });
+      const client = createFakeClient('s');
+      await gateway.autoGenerateConversationSummary(client, createFakeSession({ entitlements }));
+      const [[, payload]] = docEvents(client);
+      expect(payload).toMatchObject({ feature: 'documents', reason: 'quota_exhausted', used: 5, limit: 5, context: 'auto_summary_skipped' });
+      expect(payload.resetsAt).toMatch(/^\d{4}-\d{2}-01T00:00:00.000Z$/);
+      expect(client.emit).not.toHaveBeenCalledWith('entitlement:blocked', expect.anything());
+    });
+
+    it('a plan without documents gets plan_excluded when its summary is skipped', async () => {
+      const { gateway, conversationService, usageService } = createSummaryGateway();
+      withHistory(conversationService, [{ role: 'user', content: 'hi' }]);
+      usageService.getStatus.mockResolvedValue({ used: 0, limit: 0, remaining: 0, canUse: false });
+      const client = createFakeClient('s');
+      await gateway.autoGenerateConversationSummary(client, createFakeSession({ entitlements: { maxDocumentsPerMonth: 0, allowedDocumentDepths: [] } as any }));
+      expect(docEvents(client)[0][1]).toMatchObject({ reason: 'plan_excluded', context: 'auto_summary_skipped' });
+    });
+
+    it('the summary that uses the last document of the month emits limit_reached; one that leaves some does not', async () => {
+      for (const [after, expected] of [[{ used: 5, limit: 5, remaining: 0, canUse: false }, 1], [{ used: 3, limit: 5, remaining: 2, canUse: true }, 0]] as const) {
+        const { gateway, conversationService, claudeService, documentService, usageService } = createSummaryGateway();
+        withHistory(conversationService, [{ role: 'user', content: 'hi' }]);
+        claudeService.generateConversationSummaryDocument.mockResolvedValue({ title: 'T', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
+        documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/d' });
+        usageService.getStatus.mockResolvedValueOnce({ used: 4, limit: 5, remaining: 1, canUse: true }).mockResolvedValue(after);
+        const client = createFakeClient('s');
+        await gateway.autoGenerateConversationSummary(client, createFakeSession({ entitlements }));
+        await new Promise((r) => setImmediate(r));
+        const events = docEvents(client);
+        expect(events).toHaveLength(expected);
+        if (expected) expect(events[0][1]).toMatchObject({ reason: 'quota_exhausted', context: 'limit_reached' });
+      }
+    });
+
+    it('guests are never sent a document quota event', async () => {
+      const { gateway, usageService } = createSummaryGateway();
+      const client = createFakeClient('s');
+      expect(await gateway.emitDocumentQuotaIfBlocked(client, createFakeSession({ isGuest: true, entitlements }), 'session_start')).toBeNull();
+      expect(usageService.getStatus).not.toHaveBeenCalled();
+      expect(client.emit).not.toHaveBeenCalled();
+    });
+  });
+
   describe('multi-speaker meetings show every speaker, not only the owner', () => {
     it('the live summary takes who-said-what from the speaker segments', async () => {
       const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();

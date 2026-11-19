@@ -9,12 +9,19 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
+import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
+import { UsageService } from '@/modules/entitlements/usage.service';
+import { buildDocumentQuota } from '@/modules/entitlements/document-quota';
 import { JwtAuthGuard, CurrentUser } from '@/common';
 import { SendOtpDto, VerifyOtpDto, ClerkSyncDto, RefreshTokenDto } from './dto/auth.dto';
 
 @Controller('auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private entitlementsService: EntitlementsService,
+    private usageService: UsageService,
+  ) {}
 
   /**
    * Step 1 — Request an OTP.
@@ -77,7 +84,11 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async profile(@CurrentUser() user: any) {
-    return user;
+    // documentQuota: where the user stands on documents / meeting summaries this month, so the
+    // app can warn before a meeting that no summary will be generated (same shape as my-plan).
+    const { entitlements } = await this.entitlementsService.getUserEntitlements(user.id);
+    const status = await this.usageService.getStatus(user.id, 'documents', entitlements.maxDocumentsPerMonth);
+    return { ...user, documentQuota: buildDocumentQuota(entitlements, status) };
   }
 
   /**

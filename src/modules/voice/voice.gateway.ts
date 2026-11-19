@@ -34,6 +34,7 @@ import { computeBackoffDelayMs, sleep, PROVIDER_RECOVERY_MAX_ATTEMPTS } from './
 import { ToolCallStreamFilter } from './utils/tool-call-stream-filter.util';
 import { wrapPcm16AsWav } from './utils/pcm-wav.util';
 import { buildCombinedSummary } from './utils/combined-summary.util';
+import { buildDocumentQuota, DocumentQuota } from '@/modules/entitlements/document-quota';
 import { EntitlementsService } from '@/modules/entitlements/entitlements.service';
 import { UsageService } from '@/modules/entitlements/usage.service';
 import { RecordingTimingService } from './services/recording-timing.service';
@@ -509,19 +510,56 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private emitFeatureUnavailable(
     client: Socket,
     payload: {
-      feature: 'web_search';
+      feature: 'web_search' | 'documents';
       reason: 'quota_exhausted' | 'plan_excluded';
       message: string;
       used?: number;
       limit?: number | null;
       conversationId: string;
-      turnId: string;
+      turnId?: string;
+      /** documents only: when the monthly allowance resets (ISO). */
+      resetsAt?: string;
+      /** documents only: what prompted it — see emitDocumentQuotaIfBlocked. */
+      context?: 'session_start' | 'limit_reached' | 'auto_summary_skipped';
     },
   ): void {
     this.logger.log(
-      `[${client.id}] feature:unavailable — feature=${payload.feature} reason=${payload.reason} turnId=${payload.turnId}`,
+      `[${client.id}] feature:unavailable — feature=${payload.feature} reason=${payload.reason}` +
+        (payload.turnId ? ` turnId=${payload.turnId}` : '') + (payload.context ? ` context=${payload.context}` : ''),
     );
     client.emit('feature:unavailable', payload);
+  }
+
+  /**
+   * Tells the client, without blocking anything, that documents (meeting summaries and generated
+   * documents) can't be produced right now — the plan has none, or this month's allowance is used
+   * up. Same \`feature:unavailable\` event as web search, so it never stops capture. Emitted:
+   *   session_start         — right after session:ready, so the app can warn before the meeting
+   *   limit_reached         — a summary/document just used the last one of the month
+   *   auto_summary_skipped  — the end-of-session summary was skipped for this reason
+   * Returns the quota so callers can reuse it. Guests and sessions without a plan are ignored.
+   */
+  private async emitDocumentQuotaIfBlocked(
+    client: Socket,
+    session: ActiveSession,
+    context: 'session_start' | 'limit_reached' | 'auto_summary_skipped',
+  ): Promise<DocumentQuota | null> {
+    if (session.isGuest || !session.entitlements) return null;
+    const status = await this.usageService.getStatus(session.userId, 'documents', session.entitlements.maxDocumentsPerMonth);
+    const quota = buildDocumentQuota(session.entitlements, status);
+    if (!quota.canGenerate) {
+      this.emitFeatureUnavailable(client, {
+        feature: 'documents',
+        reason: quota.reason === 'plan_excluded' ? 'plan_excluded' : 'quota_exhausted',
+        message: quota.message ?? '',
+        used: quota.used,
+        limit: quota.limit,
+        resetsAt: quota.resetsAt,
+        conversationId: session.conversationId,
+        context,
+      });
+    }
+    return quota;
   }
 
   /**
@@ -1194,6 +1232,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
           rosterSpeakers: speakerRoster.map((e) => ({ speakerId: e.speakerId, displayName: e.displayName, role: e.role })),
         } : {}),
       });
+
+      // After ready, never before it: session start must not wait on a usage lookup.
+      void this.emitDocumentQuotaIfBlocked(client, session, 'session_start').catch((err) =>
+        this.logger.warn(`Document quota check at session start failed (trace=${session.traceId}): ${describeError(err)}`),
+      );
     } catch (err) {
       this.logger.error('session:start failed', err);
       this.emitError(client, 'SESSION_START_FAILED', (err as Error).message, { clientMessage: 'Failed to start session. Please refresh and try again.' });
@@ -2533,6 +2576,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     if (!entitlements || entitlements.maxDocumentsPerMonth <= 0 || entitlements.allowedDocumentDepths.length === 0) {
       // tier doesn't include document generation — this is a bonus, not an explicit request
       await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'skipped', { skipReason: 'tier_no_documents' });
+      await this.emitDocumentQuotaIfBlocked(client, session, 'auto_summary_skipped').catch(() => undefined);
       return;
     }
 
@@ -2564,6 +2608,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     const docStatus = await this.usageService.getStatus(session.userId, 'documents', entitlements.maxDocumentsPerMonth);
     if (!docStatus.canUse) {
       await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'skipped', { skipReason: 'quota_exceeded' });
+      await this.emitDocumentQuotaIfBlocked(client, session, 'auto_summary_skipped').catch(() => undefined);
       return; // monthly document cap already hit
     }
 
@@ -2640,6 +2685,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
 
       await this.usageService.tryConsume(session.userId, 'documents', 1, entitlements.maxDocumentsPerMonth);
       await this.conversationService.setSummaryStatus(session.conversationId, session.userId, 'ready', { documentId: result.docId });
+      void this.emitDocumentQuotaIfBlocked(client, session, 'limit_reached').catch(() => undefined);
 
       // Persisted, not just live-emitted — the manual "generate a document"
       // chat flow already does this (see processPrompt's onDone), and this
@@ -3407,6 +3453,7 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
               if (generatedDocId && documentUsageLimit !== null) {
                 this.usageService
                   .tryConsume(session.userId, 'documents', 1, documentUsageLimit)
+                  .then(() => this.emitDocumentQuotaIfBlocked(client, session, 'limit_reached'))
                   .catch((err) => this.logger.error(`Failed to record document usage (trace=${session.traceId}): ${describeError(err)}`));
               }
               if (webSearchCalls > 0) {
