@@ -39,7 +39,7 @@ import { UsageService } from '@/modules/entitlements/usage.service';
 import { RecordingTimingService } from './services/recording-timing.service';
 import { countWords, describeError } from '@/common/utils/log-safe.util';
 import { SummaryEmailReason, classifyEmailError } from './utils/summary-email-status.util';
-import { buildStoredSessionData, buildSummaryReport, buildTranscriptItems } from './utils/summary-report.util';
+import { buildStoredSessionData, buildSummaryReport, buildTranscriptItems, withSourceTranscripts } from './utils/summary-report.util';
 import { ContextCoverage, ContextPlan, SUMMARY_CONTEXT_BOUNDS, planSummaryContext, raceDeadline } from './utils/summary-context.util';
 import {
   AudioLossReason,
@@ -2379,6 +2379,68 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
   private readonly summaryRerunRequests = new Map<string, { client: Socket; session: ActiveSession }>();
 
   /**
+   * Operator rebuild of an existing summary document (scripts/regenerate-summary.ts --rebuild):
+   * re-renders every saved session from its stored summary/insights/actions, with each
+   * transcript rebuilt from the messages and speaker segments — no model calls, nothing
+   * re-summarised, no document quota used. Posts the corrected document into the chat and,
+   * only when asked, emails it. Refused while a summary run is in progress.
+   */
+  async rebuildSummaryDocument(
+    conversationId: string,
+    userId: string,
+    opts: { email?: boolean } = {},
+  ): Promise<{ documentId: string; downloadUrl: string; title: string; sessions: number; speakers: string[] }> {
+    await this.conversationService.assertOwnership(conversationId, userId);
+    const conv = (await this.conversationService.getConversation(conversationId, userId)) as Record<string, any>;
+    if (conv?.summary_status === 'pending') throw new Error('A summary is being generated for this conversation right now — try again in a few minutes.');
+    const parts = await this.conversationService.getSummaryParts(conversationId, userId);
+    if (parts.length === 0) throw new Error('This conversation has no saved summary to rebuild — run without --rebuild to generate one.');
+
+    const user = await this.usersService.findById(userId);
+    const { entitlements } = await this.entitlementsService.getUserEntitlements(userId);
+    const names = { owner: user?.name || user?.email?.split('@')[0] || 'You', other: 'Other Speaker' };
+    const rebuilt = withSourceTranscripts(parts, await this.loadTranscriptSource(conversationId, userId), names);
+    const conversationTitle = await this.conversationService.getConversationTitle(conversationId, userId);
+    const combined = buildCombinedSummary(rebuilt, conversationTitle);
+    const report = buildSummaryReport(rebuilt, conversationTitle);
+
+    const result = await this.documentService.generateSummaryReport({
+      userId,
+      conversationId,
+      report,
+      title: combined.title,
+      topic: combined.topic,
+      format: 'docx',
+      allowedDepths: entitlements.allowedDocumentDepths,
+    });
+    await this.conversationService.setSummaryStatus(conversationId, userId, 'ready', { documentId: result.docId });
+    await this.conversationService.saveMessage({
+      conversationId,
+      userId,
+      role: 'assistant',
+      content: `${combined.title} is ready (updated).`,
+      documentId: result.docId,
+    });
+    if (opts.email) {
+      const session = { userId, conversationId, isGuest: false, traceId: `rebuild-${randomUUID()}` } as unknown as ActiveSession;
+      await this.sendSummaryReadyEmail(session, { title: combined.title }, report, result.docId);
+    }
+
+    const speakers = [...new Set(report.sessions.flatMap((s) => s.transcript.filter((t) => t.kind === 'turn').map((t) => (t as { speaker: string }).speaker)))];
+    return { documentId: result.docId, downloadUrl: result.downloadUrl, title: combined.title, sessions: report.sessions.length, speakers };
+  }
+
+  /** Messages with speaker segments for the summary transcript; empty (old behaviour) if the lookup fails. */
+  private async loadTranscriptSource(conversationId: string, userId: string) {
+    try {
+      return await this.conversationService.getMessagesWithSegments(conversationId, userId);
+    } catch (err) {
+      this.logger.warn(`Transcript segments unavailable for ${conversationId}, using message text: ${describeError(err)}`);
+      return [];
+    }
+  }
+
+  /**
    * Operator re-run of the auto-summary for one conversation, outside a live session
    * (scripts/regenerate-summary.ts). Builds the session the same way session:start does
    * (owner name, plan, field) and then runs the normal path, so the result is identical:
@@ -2518,10 +2580,15 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     // The word-for-word transcript is built in code from the stored messages (never from model output),
     // so who-said-what can't be paraphrased or hallucinated. It is kept as structured turns — each speaker's
     // words, with the AI's insights shown after the turns that prompted them — and rendered by the report.
-    const transcriptItems = buildTranscriptItems(newMessages, {
-      owner: session.cachedOwnerName,
-      other: session.otherSpeakerName ?? 'Other Speaker',
-    });
+    const speakerNames = { owner: session.cachedOwnerName, other: session.otherSpeakerName ?? 'Other Speaker' };
+    // Every spoken message with its per-speaker segments: the segments, not the message row,
+    // say who said what in a multi-speaker meeting. Also used to rebuild earlier sessions.
+    const sourceMessages = await this.loadTranscriptSource(session.conversationId, session.userId);
+    const newIds = new Set(newMessages.map((m) => m.id));
+    const transcriptItems = buildTranscriptItems(
+      sourceMessages.length > 0 ? sourceMessages.filter((m) => newIds.has(m.id)) : newMessages,
+      speakerNames,
+    );
     const sessionData = buildStoredSessionData(summary.sections, transcriptItems);
     // "Action Points / Next Steps" always last, whatever the model named the
     // equivalent section (it's asked for "Follow-up Actions").
@@ -2534,7 +2601,11 @@ export class VoiceGateway implements OnGatewayInit, OnGatewayConnection, OnGatew
     let combined: { title: string; topic: string; sections: Array<{ heading: string; content: string }> };
     let report: ReturnType<typeof buildSummaryReport>;
     try {
-      const priorParts = await this.conversationService.getSummaryParts(session.conversationId, session.userId);
+      const priorParts = withSourceTranscripts(
+        await this.conversationService.getSummaryParts(session.conversationId, session.userId),
+        sourceMessages,
+        speakerNames,
+      );
       const conversationTitle = await this.conversationService.getConversationTitle(session.conversationId, session.userId);
       const thisPart = { title: summary.title, topic: summary.topic, sections: summary.sections, covers_from: new Date(newMessages[0].created_at), session_data: sessionData };
       combined = buildCombinedSummary([...priorParts, thisPart], conversationTitle);

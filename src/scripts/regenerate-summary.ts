@@ -2,6 +2,7 @@
  * Re-run the meeting summary for one conversation, outside a live session.
  *
  *   node dist/scripts/regenerate-summary.js --conversation <conversation-id> [--dry-run]
+ *   node dist/scripts/regenerate-summary.js --conversation <conversation-id> --rebuild [--email]
  *
  * Uses the exact path a real session end uses, so the owner gets the same result:
  *   • the summary document (all sessions of the conversation, new format)
@@ -15,6 +16,11 @@
  *
  * --dry-run prints the owner, plan, current status and how many messages would be
  * summarised, and changes nothing.
+ *
+ * --rebuild re-renders the EXISTING summary (all saved sessions) with every transcript rebuilt
+ * from the stored messages and speaker segments — e.g. after a speaker-attribution fix. No AI
+ * calls, nothing re-summarised, no document quota used. The corrected document is posted into
+ * the chat; add --email to also email it to the owner.
  */
 import { NestFactory } from '@nestjs/core';
 import { Knex } from 'knex';
@@ -34,8 +40,10 @@ function arg(name: string): string | undefined {
 async function main(): Promise<number> {
   const conversationId = arg('conversation');
   const dryRun = process.argv.includes('--dry-run');
+  const rebuild = process.argv.includes('--rebuild');
+  const email = process.argv.includes('--email');
   if (!conversationId || !/^[0-9a-f-]{36}$/i.test(conversationId)) {
-    console.error('Usage: node dist/scripts/regenerate-summary.js --conversation <conversation-id> [--dry-run]');
+    console.error('Usage: node dist/scripts/regenerate-summary.js --conversation <conversation-id> [--dry-run | --rebuild [--email]]');
     return 2;
   }
 
@@ -60,8 +68,28 @@ async function main(): Promise<number> {
     console.log(`Status now   : ${conv.summary_status}${conv.summary_skip_reason ? ` / ${conv.summary_skip_reason}` : ''}`);
     console.log(`To summarise : ${pending.length} message(s) not yet covered by a summary`);
 
+    const parts = await app.get(ConversationService).getSummaryParts(conversationId, conv.user_id);
+    const source = await app.get(ConversationService).getMessagesWithSegments(conversationId, conv.user_id);
+    const segSpeakers = [...new Set(source.flatMap((m) => m.segments.map((x) => x.speaker_label)))];
+    console.log(`Saved parts  : ${parts.length} session(s) already summarised`);
+    console.log(`Speakers     : ${segSpeakers.length ? segSpeakers.join(', ') : '(no speaker segments — single-speaker or older messages)'}`);
+
     if (dryRun) {
       console.log('\nDry run — nothing changed.');
+      return 0;
+    }
+
+    if (rebuild) {
+      console.log(`\nRebuilding the existing summary document${email ? ' (and emailing it)' : ''}…`);
+      const r = await app.get(VoiceGateway).rebuildSummaryDocument(conversationId, conv.user_id, { email });
+      console.log(`Document     : ${r.title} — ${r.sessions} session(s)`);
+      console.log(`Speakers     : ${r.speakers.join(', ') || '(none)'}`);
+      console.log(`Download URL : ${r.downloadUrl}`);
+      console.log('Chat message : added — the owner sees the corrected document when they open the conversation');
+      if (email) {
+        const row = await knex('conversations').where({ id: conversationId }).first('summary_email_status', 'summary_email_reason');
+        console.log(`Email        : ${row?.summary_email_status ?? 'unknown'}${row?.summary_email_reason ? ` / ${row.summary_email_reason}` : ''}`);
+      }
       return 0;
     }
 

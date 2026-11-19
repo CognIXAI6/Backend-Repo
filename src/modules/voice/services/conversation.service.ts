@@ -948,6 +948,38 @@ export class ConversationService {
 
   // ── Gap 3: dedicated segment read ─────────────────────────────────────────
 
+  /**
+   * The spoken record for the summary transcript: every non-document message of the owner's
+   * conversation, oldest first, each with its per-speaker transcript segments attached (who said
+   * what, including later guest renames — the message text alone only has the original labels).
+   */
+  async getMessagesWithSegments(
+    conversationId: string,
+    userId: string,
+  ): Promise<Array<ConversationMessage & { segments: Array<Pick<TranscriptSegment, 'speaker_label' | 'transcript' | 'start_ms'>> }>> {
+    await this.assertOwnership(conversationId, userId);
+    const [messages, segments] = await Promise.all([
+      this.knex('conversation_messages')
+        .where('conversation_id', conversationId)
+        .whereNull('document_id')
+        .orderBy('created_at', 'asc')
+        .orderBy('id', 'asc')
+        .select('*'),
+      this.knex('conversation_transcript_segments')
+        .where('conversation_id', conversationId)
+        .whereNotNull('message_id')
+        .orderByRaw('COALESCE(start_ms, 999999999) ASC, created_at ASC')
+        .select('message_id', 'speaker_label', 'transcript', 'start_ms'),
+    ]);
+    const byMessage = new Map<string, Array<Pick<TranscriptSegment, 'speaker_label' | 'transcript' | 'start_ms'>>>();
+    for (const s of segments as Array<TranscriptSegment>) {
+      const list = byMessage.get(s.message_id!) ?? [];
+      list.push({ speaker_label: s.speaker_label, transcript: s.transcript, start_ms: s.start_ms });
+      byMessage.set(s.message_id!, list);
+    }
+    return (messages as ConversationMessage[]).map((m) => ({ ...m, segments: byMessage.get(m.id) ?? [] }));
+  }
+
   async getTranscriptSegments(
     conversationId: string,
     userId: string,

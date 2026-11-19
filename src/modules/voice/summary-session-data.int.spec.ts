@@ -76,6 +76,31 @@ d('summary part session_data (real Postgres)', () => {
     }
   });
 
+  it('getMessagesWithSegments returns each saved multi-speaker turn with its speakers, in spoken order', async () => {
+    const [{ id: cid }] = await knex('conversations').insert({ user_id: userId, total_messages: 0, last_activity_at: new Date() }).returning('id');
+    const msg = await conversations.saveMessageWithTranscriptSegments(
+      { conversationId: cid, userId, role: 'user', content: '[Guest 1]: ready\n[Guest 7]: alright', transcript: 'ready alright', speakerLabel: 'multiple_speakers' },
+      [
+        { conversationId: cid, speakerLabel: 'Guest 7', transcript: 'alright', startMs: 900, identificationMethod: 'diarization' },
+        { conversationId: cid, speakerLabel: 'Guest 1', transcript: 'ready', startMs: 100, identificationMethod: 'diarization' },
+      ],
+    );
+    await conversations.saveMessage({ conversationId: cid, userId, role: 'assistant', content: 'Nothing to flag.' });
+
+    const rows = await conversations.getMessagesWithSegments(cid, userId);
+    expect(rows.map((r) => r.role)).toEqual(['user', 'assistant']);
+    expect(rows[0].id).toBe(msg.id);
+    expect(rows[0].segments.map((x) => [x.speaker_label, x.transcript])).toEqual([['Guest 1', 'ready'], ['Guest 7', 'alright']]);
+    expect(rows[1].segments).toEqual([]);
+
+    const [{ id: other }] = await knex('users').insert({ email: `sd3-${Date.now()}@example.com` }).returning('id');
+    try {
+      await expect(conversations.getMessagesWithSegments(cid, other)).rejects.toThrow();
+    } finally {
+      await knex('users').where('id', other).delete();
+    }
+  });
+
   it('the column is nullable jsonb (additive migration)', async () => {
     const col = await knex('information_schema.columns').where({ table_name: 'conversation_summary_parts', column_name: 'session_data' }).first();
     expect(col.data_type).toBe('jsonb');

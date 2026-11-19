@@ -21,6 +21,8 @@ interface MessageLike {
   content?: string | null;
   transcript?: string | null;
   speaker_label?: string | null;
+  /** Per-speaker segments of this message (multi-speaker recordings) — the most accurate attribution. */
+  segments?: Array<{ speaker_label: string; transcript: string }> | null;
 }
 
 /**
@@ -48,18 +50,26 @@ export function buildTranscriptItems(
       continue;
     }
 
-    const text = (m.transcript ?? m.content ?? '').trim();
-    if (!text) continue;
+    // Multi-speaker turns: the segments say who said what (and carry later guest renames).
+    if (m.segments && m.segments.length > 0) {
+      for (const seg of m.segments) pushTurn(resolveLabel(seg.speaker_label, names), seg.transcript ?? '');
+      continue;
+    }
 
     if (m.speaker_label === 'multiple_speakers') {
-      // Persisted as "[Name]: text" per line.
+      // No segments: `content` is "[Name]: text" per line. Never `transcript` — that is the
+      // raw words with the speaker labels stripped, which put every line on the owner.
+      const text = (m.content ?? m.transcript ?? '').trim();
       for (const rawLine of text.split('\n')) {
         const match = rawLine.match(/^\[(.+?)\]:\s*(.*)$/);
-        if (match) pushTurn(match[1], match[2]);
-        else pushTurn(names.owner, rawLine);
+        if (match) pushTurn(resolveLabel(match[1], names), match[2]);
+        else pushTurn('Unknown speaker', rawLine);
       }
       continue;
     }
+
+    const text = (m.transcript ?? m.content ?? '').trim();
+    if (!text) continue;
 
     const speaker =
       m.speaker_label === 'owner' ? names.owner
@@ -69,6 +79,15 @@ export function buildTranscriptItems(
     pushTurn(speaker, text);
   }
   return items;
+}
+
+/** Segment / bracket labels are display names, except the two role words owner/other. */
+function resolveLabel(label: string | null | undefined, names: { owner: string; other: string }): string {
+  const l = (label ?? '').trim();
+  if (!l || l === 'unknown') return 'Unknown speaker';
+  if (l === 'owner') return names.owner;
+  if (l === 'other') return names.other;
+  return l;
 }
 
 const ACTION_HEADING = /follow-?up actions?|action points?|next steps?/i;
@@ -126,7 +145,33 @@ export interface PartLike {
   topic: string | null;
   sections: Array<{ heading: string; content: string }>;
   covers_from: Date | string;
+  covers_to?: Date | string | null;
   session_data?: StoredSessionData | null;
+  /** Transcript rebuilt from the stored messages at render time — wins over the stored copy. */
+  transcript_override?: TranscriptItem[] | null;
+}
+
+/**
+ * Rebuilds each part's transcript from the conversation's messages in that part's own time range
+ * (covers_from..covers_to), so attribution fixes and guest renames reach every session — not only
+ * the newest. A part whose range has no messages left keeps its stored transcript.
+ */
+export function withSourceTranscripts<P extends PartLike>(
+  parts: P[],
+  messages: Array<MessageLike & { created_at: Date | string }>,
+  names: { owner: string; other: string },
+): P[] {
+  return parts.map((part) => {
+    if (part.transcript_override) return part;
+    const from = new Date(part.covers_from).getTime();
+    const to = part.covers_to ? new Date(part.covers_to).getTime() : Number.POSITIVE_INFINITY;
+    const inRange = messages.filter((m) => {
+      const t = new Date(m.created_at).getTime();
+      return t >= from && t <= to;
+    });
+    const items = buildTranscriptItems(inRange, names);
+    return items.length > 0 ? { ...part, transcript_override: items } : part;
+  });
 }
 
 /**
@@ -144,7 +189,7 @@ export function buildSummaryReport(parts: PartLike[], conversationTitle: string 
       title: part.title,
       description: (part.topic ?? '').trim(),
       summary: data ? data.summary : legacy!.summary,
-      transcript: data ? data.transcript : parseLegacyTranscript(legacyTranscript?.content ?? ''),
+      transcript: part.transcript_override ?? (data ? data.transcript : parseLegacyTranscript(legacyTranscript?.content ?? '')),
       keyInsights: data ? data.keyInsights : legacy!.keyInsights,
       actionPoints: data ? data.actionPoints : legacy!.actionPoints,
     };

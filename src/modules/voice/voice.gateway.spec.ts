@@ -622,6 +622,7 @@ describe('VoiceGateway auto-generated conversation summary', () => {
       setSummaryEmailStatus: jest.fn().mockResolvedValue(true),
       saveMessage: jest.fn().mockResolvedValue({ id: 'msg-1' }),
       getConversationTitle: jest.fn().mockResolvedValue('My Conversation'),
+      getMessagesWithSegments: jest.fn().mockResolvedValue([]),
     };
     const claudeService = { generateConversationSummaryDocument: jest.fn() };
     const documentService = {
@@ -650,6 +651,72 @@ describe('VoiceGateway auto-generated conversation summary', () => {
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
   });
   afterEach(() => jest.restoreAllMocks());
+
+  describe('multi-speaker meetings show every speaker, not only the owner', () => {
+    it('the live summary takes who-said-what from the speaker segments', async () => {
+      const { gateway, conversationService, claudeService, documentService } = createSummaryGateway();
+      const msg = { id: 'm0', role: 'user', speaker_label: 'multiple_speakers', content: '[Guest 1]: ready\n[Guest 7]: alright', transcript: 'ready alright', created_at: new Date(Date.UTC(2026, 10, 19, 9)) };
+      conversationService.getUnsummarizedMessages.mockResolvedValue([msg]);
+      conversationService.getMessagesWithSegments.mockResolvedValue([
+        { ...msg, segments: [{ speaker_label: 'John', transcript: 'ready' }, { speaker_label: 'Guest 7', transcript: 'alright' }] },
+      ]);
+      claudeService.generateConversationSummaryDocument.mockResolvedValue({ title: 'Sync', topic: 't', sections: [{ heading: 'Summary', content: 'S' }] });
+      documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-1', downloadUrl: 'https://example.com/d' });
+
+      await gateway.autoGenerateConversationSummary(createFakeClient('s'), createFakeSession({ entitlements, cachedOwnerName: 'Temi' }));
+
+      const speakers = documentService.generateSummaryReport.mock.calls[0][0].report.sessions[0].transcript.map((t: any) => t.speaker);
+      expect(speakers).toEqual(['John', 'Guest 7']);
+      expect(conversationService.addSummaryPart.mock.calls[0][5].transcript.map((t: any) => t.speaker)).toEqual(['John', 'Guest 7']);
+    });
+
+    describe('rebuildSummaryDocument (script --rebuild)', () => {
+      const setupRebuild = (status = 'ready') => {
+        const t = createSummaryGateway() as ReturnType<typeof createSummaryGateway> & { conversationService: any };
+        const stale = { version: 1, summary: 'Old summary', transcript: [{ kind: 'turn', speaker: 'Temi', text: 'ready' }], keyInsights: ['k'], actionPoints: ['a'] };
+        Object.assign(t.conversationService, {
+          assertOwnership: jest.fn().mockResolvedValue(undefined),
+          getConversation: jest.fn().mockResolvedValue({ summary_status: status }),
+          getSummaryParts: jest.fn().mockResolvedValue([
+            { title: 'Day 1', topic: 't', sections: [], covers_from: new Date(Date.UTC(2026, 10, 18, 9)), covers_to: new Date(Date.UTC(2026, 10, 18, 10)), session_data: stale },
+          ]),
+          getMessagesWithSegments: jest.fn().mockResolvedValue([
+            { id: 'm0', role: 'user', speaker_label: 'multiple_speakers', content: '[Guest 1]: ready', transcript: 'ready', created_at: new Date(Date.UTC(2026, 10, 18, 9, 30)), segments: [{ speaker_label: 'Guest 1', transcript: 'ready' }] },
+          ]),
+        });
+        t.gateway.entitlementsService = { getUserEntitlements: jest.fn().mockResolvedValue({ tier: 'xpress', entitlements }) };
+        t.usersService.findById.mockResolvedValue({ id: 'user-1', name: 'Temi', email: 'owner@example.com' });
+        t.documentService.generateSummaryReport.mockResolvedValue({ docId: 'doc-9', downloadUrl: 'https://example.com/doc-9' });
+        return t;
+      };
+
+      it('re-renders saved sessions with corrected speakers: no AI call, no quota, linked in the chat, no email by default', async () => {
+        const { gateway, conversationService, claudeService, documentService, usageService, emailService } = setupRebuild();
+        const r = await gateway.rebuildSummaryDocument('conv-1', 'user-1');
+        const session0 = documentService.generateSummaryReport.mock.calls[0][0].report.sessions[0];
+        expect(session0.transcript).toEqual([{ kind: 'turn', speaker: 'Guest 1', text: 'ready' }]);
+        expect(session0.summary).toBe('Old summary'); // stored summary kept, not re-summarised
+        expect(claudeService.generateConversationSummaryDocument).not.toHaveBeenCalled();
+        expect(usageService.tryConsume).not.toHaveBeenCalled();
+        expect(conversationService.saveMessage).toHaveBeenCalledWith(expect.objectContaining({ role: 'assistant', documentId: 'doc-9' }));
+        expect(conversationService.setSummaryStatus).toHaveBeenCalledWith('conv-1', 'user-1', 'ready', { documentId: 'doc-9' });
+        expect(emailService.sendConversationSummaryEmail).not.toHaveBeenCalled();
+        expect(r).toMatchObject({ documentId: 'doc-9', sessions: 1, speakers: ['Guest 1'] });
+      });
+
+      it('emails the corrected document only with --email', async () => {
+        const { gateway, emailService } = setupRebuild();
+        await gateway.rebuildSummaryDocument('conv-1', 'user-1', { email: true });
+        expect(emailService.sendConversationSummaryEmail).toHaveBeenCalledTimes(1);
+      });
+
+      it('refuses while a summary run is in progress, before generating anything', async () => {
+        const { gateway, documentService } = setupRebuild('pending');
+        await expect(gateway.rebuildSummaryDocument('conv-1', 'user-1')).rejects.toThrow(/being generated/);
+        expect(documentService.generateSummaryReport).not.toHaveBeenCalled();
+      });
+    });
+  });
 
   describe('regenerateSummaryForConversation (operator re-run script)', () => {
     const setupRegen = () => {
